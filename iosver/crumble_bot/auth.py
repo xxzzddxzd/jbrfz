@@ -37,12 +37,83 @@ def _b64(text: str) -> str:
     return base64.b64encode(text.encode("utf-8")).decode("ascii")
 
 
+# Real iPhone identifier + supported iOS ranges (inclusive-ish pools).
+# model id: Apple productType (utsname.machine).
+_IOS_DEVICE_PROFILES: tuple[dict[str, object], ...] = (
+    # iPhone 12 family — iOS 14.1+ ; common still on 16/17
+    {"model": "iPhone13,2", "name": "iPhone 12", "ios": ("15.7.9", "16.1.1", "16.6.1", "16.7.10", "17.0.3", "17.5.1")},
+    {"model": "iPhone13,3", "name": "iPhone 12 Pro", "ios": ("15.7.9", "16.1.2", "16.6.1", "17.1.1", "17.5.1", "17.6.1")},
+    {"model": "iPhone13,4", "name": "iPhone 12 Pro Max", "ios": ("15.8.2", "16.3.1", "16.7.5", "17.2.1", "17.5.1", "18.0.1")},
+    # iPhone 13 family
+    {"model": "iPhone14,5", "name": "iPhone 13", "ios": ("15.7.1", "16.1.1", "16.5.1", "17.0.3", "17.4.1", "17.6.1", "18.1")},
+    {"model": "iPhone14,2", "name": "iPhone 13 Pro", "ios": ("15.6.1", "16.2", "16.6", "17.1.2", "17.5.1", "18.0", "18.1.1")},
+    {"model": "iPhone14,3", "name": "iPhone 13 Pro Max", "ios": ("15.7.9", "16.1.1", "16.7.2", "17.2", "17.5.1", "17.6.1", "18.1")},
+    {"model": "iPhone14,4", "name": "iPhone 13 mini", "ios": ("15.7.9", "16.3.1", "16.7.8", "17.4.1", "17.6.1", "18.0.1")},
+    # iPhone 14 family
+    {"model": "iPhone14,7", "name": "iPhone 14", "ios": ("16.0.2", "16.3.1", "16.6.1", "17.1.1", "17.5.1", "18.0", "18.1.1")},
+    {"model": "iPhone14,8", "name": "iPhone 14 Plus", "ios": ("16.0.3", "16.5", "17.0.2", "17.4.1", "17.6.1", "18.1")},
+    {"model": "iPhone15,2", "name": "iPhone 14 Pro", "ios": ("16.0.2", "16.4.1", "16.7.1", "17.2.1", "17.5.1", "18.0.1", "18.1.1")},
+    {"model": "iPhone15,3", "name": "iPhone 14 Pro Max", "ios": ("16.1", "16.5.1", "17.0.3", "17.4.1", "17.6.1", "18.1", "18.2")},
+    # iPhone 15 family
+    {"model": "iPhone15,4", "name": "iPhone 15", "ios": ("17.0.2", "17.1.1", "17.4.1", "17.5.1", "17.6.1", "18.0", "18.1.1")},
+    {"model": "iPhone15,5", "name": "iPhone 15 Plus", "ios": ("17.0.3", "17.2.1", "17.5.1", "18.0.1", "18.1", "18.2")},
+    {"model": "iPhone16,1", "name": "iPhone 15 Pro", "ios": ("17.0.3", "17.1.2", "17.4.1", "17.5.1", "17.6.1", "18.0", "18.1.1", "18.2")},
+    {"model": "iPhone16,2", "name": "iPhone 15 Pro Max", "ios": ("17.0.3", "17.2", "17.5.1", "17.6.1", "18.0.1", "18.1.1", "18.2")},
+    # iPhone 16 family
+    {"model": "iPhone17,3", "name": "iPhone 16", "ios": ("18.0", "18.0.1", "18.1", "18.1.1", "18.2", "18.2.1")},
+    {"model": "iPhone17,4", "name": "iPhone 16 Plus", "ios": ("18.0", "18.0.1", "18.1", "18.1.1", "18.2")},
+    {"model": "iPhone17,1", "name": "iPhone 16 Pro", "ios": ("18.0.1", "18.1", "18.1.1", "18.2", "18.2.1")},
+    {"model": "iPhone17,2", "name": "iPhone 16 Pro Max", "ios": ("18.0.1", "18.1", "18.1.1", "18.2", "18.2.1")},
+)
+
+# Darwin version roughly paired with major iOS for UA (not exact patch mapping).
+_IOS_MAJOR_TO_DARWIN = {
+    15: "21.6.0",
+    16: "22.1.0",
+    17: "23.1.0",
+    18: "24.1.0",
+}
+
+
+def _pick_ios_device_profile(
+    *,
+    model: str | None = None,
+    os_version: str | None = None,
+) -> dict[str, str]:
+    """Pick a real iPhone model + compatible real iOS version."""
+    import random
+
+    if model and os_version:
+        return {"model": model, "os_version": os_version, "name": model}
+
+    profiles = list(_IOS_DEVICE_PROFILES)
+    if model:
+        matched = [p for p in profiles if p["model"] == model]
+        if matched:
+            profiles = matched
+    prof = random.choice(profiles)
+    ios_list = list(prof["ios"])  # type: ignore[arg-type]
+    if os_version and os_version in ios_list:
+        ver = os_version
+    elif os_version:
+        # caller forced a version not in pool — still accept
+        ver = os_version
+    else:
+        ver = random.choice(ios_list)
+    return {
+        "model": str(prof["model"]),
+        "os_version": str(ver),
+        "name": str(prof.get("name") or prof["model"]),
+    }
+
+
 def new_device_ids(
     *,
-    model: str = "iPhone14,3",
-    os_version: str = "16.1.1",
+    model: str | None = None,
+    os_version: str | None = None,
 ) -> Dict[str, str]:
-    """Fresh device identity for a brand-new guest."""
+    """Fresh device identity for a brand-new guest (real iPhone model + iOS)."""
+    picked = _pick_ios_device_profile(model=model, os_version=os_version)
     return {
         "fgs_id": str(uuid.uuid4()),
         "anonymous_id": str(uuid.uuid4()),
@@ -50,8 +121,9 @@ def new_device_ids(
         "devsisters_id": str(uuid.uuid4()).upper(),
         "semi_device_id": str(uuid.uuid4()).upper(),
         "device_id": str(uuid.uuid4()),
-        "model": model,
-        "os_version": os_version,
+        "model": picked["model"],
+        "os_version": picked["os_version"],
+        "model_name": picked.get("name", picked["model"]),
         "manufacturer": "apple",
     }
 
@@ -106,6 +178,8 @@ class AccountState:
             "device_id": dev.get("device_id", ""),
             "model": dev.get("model", "iPhone14,3"),
             "os_version": dev.get("os_version", "16.1.1"),
+            "model_name": dev.get("model_name", ""),
+            "manufacturer": dev.get("manufacturer", "apple"),
         }
         return {
             "endpoint": self.endpoint,
@@ -183,12 +257,20 @@ def build_login_headers(
     timezone: str = "Asia/Shanghai",
     country: str = "CN",
 ) -> Dict[str, str]:
+    try:
+        major = int(str(os_version).split(".")[0])
+    except Exception:
+        major = 16
+    darwin = _IOS_MAJOR_TO_DARWIN.get(major, "22.1.0")
+    # CFNetwork train roughly tracks Darwin major
+    cf_map = {15: "1335", 16: "1399", 17: "1490", 18: "1568"}
+    cf = cf_map.get(major, "1399")
     return {
         "Host": "account.devplay.com",
         "Content-Type": "application/json",
         "Accept": "*/*",
         "Accept-Language": "zh-CN,zh-Hans;q=0.9",
-        "User-Agent": f"CookieRunCrumble/{APP_BUILD} CFNetwork/1399 Darwin/22.1.0",
+        "User-Agent": f"CookieRunCrumble/{APP_BUILD} CFNetwork/{cf} Darwin/{darwin}",
         "X-API-Key": API_KEY,
         "X-Env": "prod",
         "X-Bundle-Id": BUNDLE_ID,
