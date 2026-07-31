@@ -1,0 +1,8 @@
+# iosver / crumble_bot runtime deps
+# install: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+httpx[http2]>=0.27,<1
+PyYAML>=6.0,<7
+
+# httpx[http2] pulls (pinned to known-good set from local venv):
+#   httpcore, h2, hpack, hyperframe, anyio, certifi, idna

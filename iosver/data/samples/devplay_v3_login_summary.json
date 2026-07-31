@@ -1,0 +1,63 @@
+{
+  "valid": true,
+  "url": "https://account.devplay.com/v3/login",
+  "method": "POST",
+  "note": "guest_secret empty => create new guest; non-empty => re-login",
+  "request_headers_decoded": {
+    "X-API-Key": "wUsUkXPVSujBcOt4mDJX",
+    "X-Env": "prod",
+    "X-Bundle-Id": "com.devsisters.cc",
+    "X-Os-Name": "IOS",
+    "X-Os-Version": "16.1.1",
+    "X-Timezone": "Asia/Shanghai",
+    "X-LocaleOnGame": "zh-Hant",
+    "X-Location-Country": "CN",
+    "X-App-Version": "1.0.001",
+    "X-App-Build": "16",
+    "X-SDK-Version": "1.6.3-hotfix1"
+  },
+  "request_body_keys": [
+    "lc",
+    "device_id",
+    "device_type",
+    "push_token",
+    "timezone",
+    "lang",
+    "fallback_country_code",
+    "agree_ad_day_push",
+    "agree_ad_night_push",
+    "recall_session_id",
+    "terms_updates",
+    "guest_secret"
+  ],
+  "guest_secret_in_request": "",
+  "response_code": 20000,
+  "response_fields": [
+    "code",
+    "game_access_token",
+    "oven_access_token",
+    "refresh_token",
+    "member",
+    "country_code",
+    "link_status",
+    "friends",
+    "fb_token_invalid",
+    "remote_configs",
+    "device_secret",
+    "allow_ad_push_day",
+    "allow_ad_push_night",
+    "terms_type",
+    "terms_region",
+    "terms_contents",
+    "guest_secret"
+  ],
+  "sample_mid": "HGQGG3371",
+  "noise_hosts_ignore": [
+    "logging.devsisters.cloud",
+    "appsflyersdk.com",
+    "applovin.com",
+    "icloud.com",
+    "google.com",
+    "moloco.com"
+  ]
+}

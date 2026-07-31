@@ -1,0 +1,27 @@
+endpoint: https://cc-gameserver-client.live.prod.devslime.cloud:443
+resource_key: game-data-8319a6-a64b0c
+
+account:
+  mid: ZXPKR2155
+  guest_secret: 0LpYxPRgYLYLTZ0oiiSqkHQzwx34pwqj
+  refresh_token: hep0MbaO8ovGXuGK
+  game_access_token: ""   # 从 capture LOGIN 行粘贴；过期需重登游戏刷新
+
+device:
+  fgs_id: dd8e88b8-d9c0-4be4-bd07-add9255d2c12
+  anonymous_id: 20eb7ac1-7c90-43e4-a3e6-cd2b5e4e1921
+  app_installed_id: BB7E54A7-2995-422E-9697-A4EB655E57DA
+  devsisters_id: 117C42DA-1801-46CC-BE20-54BD5715B732
+  semi_device_id: B4D18487-C13B-4760-B4CE-267EC387BB6C
+
+invite:
+  inviter_mid: GNWPX5251
+
+stage:
+  team_index: 1
+  from_stage: 0  # 0 = probe          # 下一关 stageIndex（当前已打到约 16）
+  to_stage: 30
+  clear_points: [0, 1]    # Wave then Boss
+  sleep_ms: 200
+  samples_dir: data/samples
+  try_start: true
