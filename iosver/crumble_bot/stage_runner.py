@@ -111,7 +111,7 @@ class StageRunner:
     def _unary(self, path: str, body: bytes):
         resp = self.client.unary(path, body, metadata=self._meta())
         if self.session.adopt_resource_key(resp.headers):
-            log.info("resource_key <- %s", self.session.resource_key)
+            log.debug("resource_key <- %s", self.session.resource_key)
         return resp.message
 
     def signup(self) -> bytes:
@@ -182,11 +182,11 @@ class StageRunner:
     def clear_range(self, from_stage: Optional[int], to_stage: int) -> List[StageResult]:
         all_results: List[StageResult] = []
         stage = from_stage if from_stage and from_stage > 0 else self.probe_current_stage()
-        log.info("clear_range from=%s to=%s", stage, to_stage)
+        log.debug("clear_range from=%s to=%s", stage, to_stage)
         guard = 0
         while stage <= to_stage and guard < 200:
             guard += 1
-            log.info("clearing stage %s", stage)
+            log.debug("clearing stage %s", stage)
             rs = self.clear_stage(stage)
             all_results.extend(rs)
             if not rs or not rs[-1].ok:

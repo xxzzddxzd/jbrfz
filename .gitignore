@@ -16,5 +16,10 @@ iosver/configs/*.yaml
 
 # huge local dumps not for git
 10001/
+10101/
 analysis/
 capture_pull/
+
+# Theos build/package outputs
+JBRFZBypass/.theos/
+JBRFZBypass/packages/

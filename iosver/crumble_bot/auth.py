@@ -140,6 +140,7 @@ class AccountState:
     endpoint: str = DEFAULT_ENDPOINT
     inviter_mid: str = ""
     next_stage: int = 1
+    diamond_balance: Optional[int] = None
     email: str = ""
     updated_at: float = 0.0
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -236,6 +237,7 @@ def account_from_config(cfg: Dict[str, Any]) -> AccountState:
         endpoint=cfg.get("endpoint") or DEFAULT_ENDPOINT,
         inviter_mid=inv.get("inviter_mid", ""),
         next_stage=int(st.get("from_stage") or 1),
+        diamond_balance=acc.get("diamond_balance"),
         email=acc.get("email", ""),
     )
 
@@ -419,6 +421,7 @@ def relogin(state: AccountState) -> AccountState:
     # preserve progress fields
     fresh.next_stage = state.next_stage
     fresh.inviter_mid = state.inviter_mid or fresh.inviter_mid
+    fresh.diamond_balance = state.diamond_balance
     return fresh
 
 

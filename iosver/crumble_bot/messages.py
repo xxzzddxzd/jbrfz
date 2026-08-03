@@ -1,4 +1,4 @@
-"""Protobuf request builders for stage / invite RPCs."""
+"""Protobuf request builders for game RPCs."""
 from __future__ import annotations
 
 import random
@@ -179,6 +179,40 @@ def complete_stage_request(
 
 def register_friend_inviter_request(inviter_id: str) -> bytes:
     return pb.encode_string_field(1, inviter_id)
+
+
+def guild_id_request(guild_id: str) -> bytes:
+    """Build a guild request whose only field is ``guild_id`` (field 1)."""
+    return pb.encode_string_field(1, guild_id)
+
+
+def search_guilds_request(query: str) -> bytes:
+    """Build SearchGuildsRequest: field 1 is the name/search query."""
+    return pb.encode_string_field(1, query)
+
+
+def join_guild_request(guild_id: str) -> bytes:
+    return guild_id_request(guild_id)
+
+
+def leave_guild_request(guild_id: str) -> bytes:
+    return guild_id_request(guild_id)
+
+
+def get_guild_request(guild_id: str) -> bytes:
+    return guild_id_request(guild_id)
+
+
+def conduct_free_guild_lab_research_request(guild_id: str) -> bytes:
+    return guild_id_request(guild_id)
+
+
+def conduct_paid_guild_lab_research_request(guild_id: str) -> bytes:
+    return guild_id_request(guild_id)
+
+
+def attend_guild_request(guild_id: str) -> bytes:
+    return guild_id_request(guild_id)
 
 
 def sign_up_request() -> bytes:

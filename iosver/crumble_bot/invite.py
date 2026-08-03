@@ -16,5 +16,5 @@ def register_friend_inviter(client: GrpcClient, session: Session, inviter_mid: s
     body = register_friend_inviter_request(inviter_mid)
     resp = client.unary(REGISTER_PATH, body, metadata=meta)
     if session.adopt_resource_key(resp.headers):
-        log.info("resource_key <- %s", session.resource_key)
+        log.debug("resource_key <- %s", session.resource_key)
     return resp

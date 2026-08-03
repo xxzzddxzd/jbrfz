@@ -12,6 +12,7 @@ from .auth import AccountState
 from .constants import ENDPOINT, FALLBACK_RESOURCE_KEY
 
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "accounts.db"
+GUILD_COOLDOWN_SECONDS = 24 * 60 * 60
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
@@ -26,6 +27,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     device_json TEXT NOT NULL DEFAULT '{}',
     inviter_mid TEXT NOT NULL DEFAULT '',
     next_stage INTEGER NOT NULL DEFAULT 1,
+    diamond_balance INTEGER NOT NULL DEFAULT 0,
+    guild REAL NOT NULL DEFAULT 0,
     used INTEGER NOT NULL DEFAULT 0,
     ready INTEGER NOT NULL DEFAULT 0,
     invalid INTEGER NOT NULL DEFAULT 0,
@@ -35,6 +38,19 @@ CREATE TABLE IF NOT EXISTS accounts (
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_used ON accounts(used);
 CREATE INDEX IF NOT EXISTS idx_accounts_ready ON accounts(ready);
+
+CREATE TABLE IF NOT EXISTS guild_targets (
+    gname TEXT NOT NULL,
+    gmname TEXT NOT NULL,
+    guild_id TEXT NOT NULL,
+    guild_level INTEGER NOT NULL DEFAULT 0,
+    member_count INTEGER NOT NULL DEFAULT 0,
+    master_user_id TEXT NOT NULL DEFAULT '',
+    details_json TEXT NOT NULL DEFAULT '{}',
+    confirmed_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (gname, gmname)
+);
 """
 
 
@@ -51,6 +67,8 @@ class AccountRow:
     device: Dict[str, Any]
     inviter_mid: str
     next_stage: int
+    diamond_balance: int
+    guild: float
     used: bool
     ready: bool
     invalid: bool
@@ -70,9 +88,23 @@ class AccountRow:
             endpoint=self.endpoint or ENDPOINT,
             inviter_mid=self.inviter_mid,
             next_stage=int(self.next_stage or 1),
+            diamond_balance=int(self.diamond_balance),
             email=self.email,
             updated_at=self.updated_at,
         )
+
+
+@dataclass(frozen=True)
+class GuildTargetRow:
+    gname: str
+    gmname: str
+    guild_id: str
+    guild_level: int
+    member_count: int
+    master_user_id: str
+    details: Dict[str, Any]
+    confirmed_at: float
+    updated_at: float
 
 
 class AccountDB:
@@ -87,6 +119,9 @@ class AccountDB:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_accounts_pool ON accounts(used, invalid, ready)"
         )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_accounts_guild ON accounts(guild)"
+        )
         self._conn.commit()
 
     def _migrate(self) -> None:
@@ -94,6 +129,14 @@ class AccountDB:
         if "invalid" not in cols:
             self._conn.execute(
                 "ALTER TABLE accounts ADD COLUMN invalid INTEGER NOT NULL DEFAULT 0"
+            )
+        if "diamond_balance" not in cols:
+            self._conn.execute(
+                "ALTER TABLE accounts ADD COLUMN diamond_balance INTEGER NOT NULL DEFAULT 0"
+            )
+        if "guild" not in cols:
+            self._conn.execute(
+                "ALTER TABLE accounts ADD COLUMN guild REAL NOT NULL DEFAULT 0"
             )
 
     def close(self) -> None:
@@ -133,13 +176,17 @@ class AccountDB:
             created = existing.created_at
 
         device_json = json.dumps(state.device or {}, ensure_ascii=False)
+        if state.diamond_balance is None:
+            diamond_balance = existing.diamond_balance if existing is not None else 0
+        else:
+            diamond_balance = max(0, int(state.diamond_balance))
         self._conn.execute(
             """
             INSERT INTO accounts (
                 mid, guest_secret, refresh_token, game_access_token, oven_access_token,
                 resource_key, endpoint, email, device_json, inviter_mid, next_stage,
-                used, ready, invalid, note, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                diamond_balance, used, ready, invalid, note, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(mid) DO UPDATE SET
                 guest_secret=excluded.guest_secret,
                 refresh_token=excluded.refresh_token,
@@ -151,6 +198,7 @@ class AccountDB:
                 device_json=excluded.device_json,
                 inviter_mid=excluded.inviter_mid,
                 next_stage=excluded.next_stage,
+                diamond_balance=excluded.diamond_balance,
                 used=excluded.used,
                 ready=excluded.ready,
                 invalid=excluded.invalid,
@@ -169,6 +217,7 @@ class AccountDB:
                 device_json,
                 state.inviter_mid or "",
                 int(state.next_stage or 1),
+                diamond_balance,
                 used_v,
                 ready_v,
                 invalid_v,
@@ -233,6 +282,125 @@ class AccountDB:
         )
         self._conn.commit()
 
+    def list_guild_eligible(
+        self,
+        *,
+        now: Optional[float] = None,
+        cooldown_seconds: int = GUILD_COOLDOWN_SECONDS,
+    ) -> List[AccountRow]:
+        """Ready accounts whose last guild exit is outside the cooldown."""
+        current = time.time() if now is None else float(now)
+        cutoff = current - max(0, int(cooldown_seconds))
+        rows = self._conn.execute(
+            """
+            SELECT * FROM accounts
+            WHERE ready=1 AND invalid=0 AND next_stage>30
+              AND (guild<=0 OR guild<=?)
+            ORDER BY
+              CASE WHEN guild<=0 THEN 0 ELSE 1 END,
+              guild ASC,
+              created_at ASC
+            """,
+            (cutoff,),
+        )
+        return [self._row(row) for row in rows]
+
+    def guild_pool_status(
+        self,
+        *,
+        now: Optional[float] = None,
+        cooldown_seconds: int = GUILD_COOLDOWN_SECONDS,
+    ) -> Dict[str, Any]:
+        current = time.time() if now is None else float(now)
+        cutoff = current - max(0, int(cooldown_seconds))
+        eligible = self._conn.execute(
+            """
+            SELECT COUNT(*) FROM accounts
+            WHERE ready=1 AND invalid=0 AND next_stage>30
+              AND (guild<=0 OR guild<=?)
+            """,
+            (cutoff,),
+        ).fetchone()[0]
+        cooling = self._conn.execute(
+            """
+            SELECT COUNT(*) FROM accounts
+            WHERE ready=1 AND invalid=0 AND next_stage>30 AND guild>?
+            """,
+            (cutoff,),
+        ).fetchone()[0]
+        next_row = self._conn.execute(
+            """
+            SELECT MIN(guild + ?) FROM accounts
+            WHERE ready=1 AND invalid=0 AND next_stage>30 AND guild>?
+            """,
+            (max(0, int(cooldown_seconds)), cutoff),
+        ).fetchone()
+        return {
+            "eligible": int(eligible),
+            "cooling": int(cooling),
+            "next_available_at": float(next_row[0]) if next_row and next_row[0] else None,
+        }
+
+    def mark_guild_left(self, mid: str, *, left_at: Optional[float] = None) -> float:
+        timestamp = time.time() if left_at is None else float(left_at)
+        self._conn.execute(
+            "UPDATE accounts SET guild=?, updated_at=? WHERE mid=?",
+            (timestamp, timestamp, mid),
+        )
+        self._conn.commit()
+        return timestamp
+
+    def get_guild_target(self, gname: str, gmname: str) -> Optional[GuildTargetRow]:
+        row = self._conn.execute(
+            "SELECT * FROM guild_targets WHERE gname=? AND gmname=?",
+            (gname, gmname),
+        ).fetchone()
+        return self._guild_target_row(row) if row else None
+
+    def upsert_guild_target(
+        self,
+        *,
+        gname: str,
+        gmname: str,
+        guild_id: str,
+        guild_level: int = 0,
+        member_count: int = 0,
+        master_user_id: str = "",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> GuildTargetRow:
+        now = time.time()
+        self._conn.execute(
+            """
+            INSERT INTO guild_targets (
+                gname, gmname, guild_id, guild_level, member_count,
+                master_user_id, details_json, confirmed_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(gname, gmname) DO UPDATE SET
+                guild_id=excluded.guild_id,
+                guild_level=excluded.guild_level,
+                member_count=excluded.member_count,
+                master_user_id=excluded.master_user_id,
+                details_json=excluded.details_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                gname,
+                gmname,
+                guild_id,
+                max(0, int(guild_level)),
+                max(0, int(member_count)),
+                master_user_id,
+                json.dumps(details or {}, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+        self._conn.commit()
+        row = self.get_guild_target(gname, gmname)
+        if row is None:
+            raise RuntimeError("failed to persist guild target")
+        return row
+
     def get(self, mid: str) -> Optional[AccountRow]:
         cur = self._conn.execute("SELECT * FROM accounts WHERE mid=?", (mid,))
         row = cur.fetchone()
@@ -292,10 +460,30 @@ class AccountDB:
             device=device if isinstance(device, dict) else {},
             inviter_mid=row["inviter_mid"],
             next_stage=int(row["next_stage"] or 1),
+            diamond_balance=int(row["diamond_balance"] or 0),
+            guild=float(row["guild"] or 0),
             used=bool(row["used"]),
             ready=bool(row["ready"]),
             invalid=bool(row["invalid"]) if "invalid" in keys else False,
             note=row["note"] or "",
             created_at=float(row["created_at"] or 0),
+            updated_at=float(row["updated_at"] or 0),
+        )
+
+    @staticmethod
+    def _guild_target_row(row: sqlite3.Row) -> GuildTargetRow:
+        try:
+            details = json.loads(row["details_json"] or "{}")
+        except Exception:
+            details = {}
+        return GuildTargetRow(
+            gname=row["gname"],
+            gmname=row["gmname"],
+            guild_id=row["guild_id"],
+            guild_level=int(row["guild_level"] or 0),
+            member_count=int(row["member_count"] or 0),
+            master_user_id=row["master_user_id"] or "",
+            details=details if isinstance(details, dict) else {},
+            confirmed_at=float(row["confirmed_at"] or 0),
             updated_at=float(row["updated_at"] or 0),
         )

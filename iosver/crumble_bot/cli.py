@@ -3,22 +3,51 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
-from .auth import guest_login, new_device_ids
+from .auth import AccountState, guest_login, new_device_ids
 from .constants import ENDPOINT, FALLBACK_RESOURCE_KEY, TO_STAGE
-from .db import DEFAULT_DB, AccountDB
+from .db import DEFAULT_DB, AccountDB, AccountRow
 from .grpc_client import GrpcClient, GrpcError
+from .guild import Guild, GuildSearchSummary, parse_guild_search_response
+from .guild_runner import GuildRunner
 from .invite import register_friend_inviter
 from .inviter import parse_inviter
 from .stage_runner import StageConfig, StageRunner
 
+log = logging.getLogger(__name__)
 
-def _setup_log(verbose: bool) -> None:
+
+def _setup_log(verbose: bool = False, quiet: bool = False) -> None:
+    """Log levels:
+    - default: INFO  关键进度（建号/通关汇总/邀请结果）
+    - -v:      DEBUG 含每关点位、httpx、可选 StartStage 失败
+    - -q:      WARNING 仅异常 + 最终摘要仍 print
+    """
+    if quiet:
+        level = logging.WARNING
+    elif verbose:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+
+    root = logging.getLogger()
+    root.handlers.clear()
     logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
+        level=level,
         format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
     )
+
+    # 默认关掉 HTTP 库刷屏；-v 时打开
+    noisy = ("httpx", "httpcore", "hpack", "h2")
+    for name in noisy:
+        logging.getLogger(name).setLevel(logging.DEBUG if verbose else logging.WARNING)
+
+    # 业务 logger
+    logging.getLogger("crumble_bot").setLevel(level)
 
 
 def _resolve_inviter(value: str | None, fallback: str = "") -> str:
@@ -31,7 +60,7 @@ def _resolve_inviter(value: str | None, fallback: str = "") -> str:
         raise SystemExit(str(e)) from e
     if raw != mid:
         suffix = "..." if len(raw) > 80 else ""
-        print(f"inviter: {mid}  (from {raw[:80]}{suffix})", flush=True)
+        log.info("inviter=%s (from %s%s)", mid, raw[:80], suffix)
     return mid
 
 
@@ -57,6 +86,67 @@ def _stage_cfg(samples: str | None = None) -> StageConfig:
     )
 
 
+def _local_timestamp(timestamp: float) -> str:
+    if not timestamp:
+        return "-"
+    return datetime.fromtimestamp(timestamp).astimezone().isoformat(timespec="seconds")
+
+
+def _guild_pool_payload(status: dict) -> dict:
+    payload = dict(status)
+    next_available = status.get("next_available_at")
+    payload["next_available_local"] = (
+        _local_timestamp(float(next_available)) if next_available else None
+    )
+    return payload
+
+
+def _login_guild_account(row: AccountRow) -> AccountState:
+    state = row.to_state()
+    if not state.guest_secret:
+        raise RuntimeError("missing guest_secret")
+    fresh = guest_login(
+        guest_secret=state.guest_secret,
+        device=state.device,
+        inviter_mid=state.inviter_mid,
+        resource_key=state.resource_key or FALLBACK_RESOURCE_KEY,
+        endpoint=state.endpoint or ENDPOINT,
+    )
+    if fresh.mid != row.mid:
+        raise RuntimeError(f"re-login mid mismatch: expected {row.mid}, got {fresh.mid}")
+    fresh.next_stage = state.next_stage
+    fresh.inviter_mid = state.inviter_mid
+    fresh.diamond_balance = state.diamond_balance
+    if not fresh.device:
+        fresh.device = state.device
+    return fresh
+
+
+def _guild_confirmation_payload(summary: GuildSearchSummary) -> dict:
+    payload = asdict(summary)
+    payload["join_method_name"] = {
+        0: "immediate",
+        1: "approval",
+    }.get(summary.join_method, f"unknown:{summary.join_method}")
+    payload["member_ids"] = None
+    payload["member_ids_note"] = (
+        "搜索接口只返回成员数；完整成员 ID 列表需账号加入后读取"
+    )
+    return payload
+
+
+def _confirm_guild(payload: dict) -> bool:
+    print(
+        json.dumps({"guild_confirmation": payload}, ensure_ascii=False, indent=2),
+        flush=True,
+    )
+    try:
+        answer = input("确认使用这个公会？[y/N]: ").strip().lower()
+    except EOFError:
+        return False
+    return answer in {"y", "yes", "是", "确认"}
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     with AccountDB(args.db) as db:
         print(json.dumps(db.count(), indent=2))
@@ -73,6 +163,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             print(
                 f"{r.mid}\tused={int(r.used)}\tready={int(r.ready)}\tinvalid={int(r.invalid)}\t"
                 f"next={r.next_stage}\tinviter={inv}\t"
+                f"diamonds={r.diamond_balance}\tguild={_local_timestamp(r.guild)}\t"
                 f"secret={r.guest_secret[:8]}...\temail={r.email}"
             )
     return 0
@@ -83,7 +174,7 @@ def cmd_gen(args: argparse.Namespace) -> int:
     n = args.n
     db_path = Path(args.db) if args.db else DEFAULT_DB
     n_label = "inf" if n is None else str(n)
-    print(f"gen db={db_path} n={n_label} clear=1..{TO_STAGE} invite=no", flush=True)
+    log.info("gen start db=%s n=%s stages=1..%s", db_path, n_label, TO_STAGE)
 
     made = 0
     failures = 0
@@ -92,7 +183,7 @@ def cmd_gen(args: argparse.Namespace) -> int:
             idx = made + 1
             try:
                 device = new_device_ids()
-                print(f"\n[{idx}] creating guest...", flush=True)
+                log.info("[%s] creating guest...", idx)
                 state = guest_login(
                     guest_secret="",
                     device=device,
@@ -102,7 +193,8 @@ def cmd_gen(args: argparse.Namespace) -> int:
                 )
                 state.inviter_mid = ""
                 db.upsert_state(state, used=False, ready=False, note="created")
-                print(f"[{idx}] mid={state.mid} secret={state.guest_secret}", flush=True)
+                log.info("[%s] mid=%s", idx, state.mid)
+                log.debug("[%s] guest_secret=%s", idx, state.guest_secret)
 
                 session = state.to_session()
                 if not session.resource_key or session.resource_key == "dev-0000000000":
@@ -112,28 +204,50 @@ def cmd_gen(args: argparse.Namespace) -> int:
                 scfg = _stage_cfg()
                 with GrpcClient(ENDPOINT) as client:
                     runner = StageRunner(client, session, scfg)
-                    print(f"[{idx}] SignUp...", flush=True)
+                    log.debug("[%s] SignUp...", idx)
                     body = runner.signup()
                     state.resource_key = session.resource_key
                     db.upsert_state(state, used=False, ready=False, note="signed_up")
-                    print(
-                        f"[{idx}] SignUp ok bytes={len(body)} resource_key={session.resource_key}",
-                        flush=True,
+                    log.info(
+                        "[%s] SignUp ok resource_key=%s",
+                        idx,
+                        session.resource_key,
                     )
+                    log.debug("[%s] SignUp bytes=%s", idx, len(body))
 
                     def on_progress(r, _idx=idx, _state=state, _session=session, _db=db):
-                        flag = "OK" if r.ok else "FAIL"
-                        extra = f" current={r.current_after}" if r.current_after is not None else ""
-                        print(
-                            f"[{_idx}][{flag}] stage={r.stage} point={r.start_point}{extra} {r.error}",
-                            flush=True,
-                        )
+                        if r.ok:
+                            # 默认只在 Boss(点位最后) 打一行；DEBUG 打每个点
+                            if r.start_point == 1 or logging.getLogger().isEnabledFor(logging.DEBUG):
+                                log.info(
+                                    "[%s] stage=%s sp=%s -> %s",
+                                    _idx,
+                                    r.stage,
+                                    r.start_point,
+                                    r.current_after,
+                                )
+                            else:
+                                log.debug(
+                                    "[%s] stage=%s sp=%s -> %s",
+                                    _idx,
+                                    r.stage,
+                                    r.start_point,
+                                    r.current_after,
+                                )
+                        else:
+                            log.warning(
+                                "[%s] FAIL stage=%s sp=%s %s",
+                                _idx,
+                                r.stage,
+                                r.start_point,
+                                r.error,
+                            )
                         if r.ok and r.current_after is not None:
                             _state.next_stage = r.current_after
                             _state.resource_key = _session.resource_key
                             _db.upsert_state(_state, used=False, ready=False, note="clearing")
 
-                    print(f"[{idx}] clear 1..{TO_STAGE}...", flush=True)
+                    log.info("[%s] clear 1..%s ...", idx, TO_STAGE)
                     results = StageRunner(
                         client, session, scfg, on_progress=on_progress
                     ).clear_range(None, TO_STAGE)
@@ -156,26 +270,31 @@ def cmd_gen(args: argparse.Namespace) -> int:
                 made += 1
                 if not ok and not ready:
                     failures += 1
-                    print(
-                        f"[{idx}] FAIL mid={state.mid} next={state.next_stage} stored=1",
-                        flush=True,
+                    log.warning(
+                        "[%s] FAIL mid=%s next=%s (stored)",
+                        idx,
+                        state.mid,
+                        state.next_stage,
                     )
                 else:
                     prog = f"{made}/{n}" if n is not None else str(made)
-                    print(
-                        f"[{idx}] DONE mid={state.mid} next={state.next_stage} "
-                        f"ready={int(ready)} progress={prog}",
-                        flush=True,
+                    log.info(
+                        "[%s] DONE mid=%s next=%s ready=%s progress=%s",
+                        idx,
+                        state.mid,
+                        state.next_stage,
+                        int(ready),
+                        prog,
                     )
             except KeyboardInterrupt:
-                print("\ninterrupted", flush=True)
-                print(json.dumps({"made": made, "failures": failures, **db.count()}, indent=2))
+                log.warning("interrupted")
+                print(json.dumps({"made": made, "failures": failures, **db.count()}, indent=2), flush=True)
                 return 130
             except Exception as e:
                 failures += 1
-                print(f"[{idx}] ERROR {type(e).__name__}: {e}", flush=True)
+                log.error("[%s] %s: %s", idx, type(e).__name__, e)
                 if args.stop_on_error:
-                    print(json.dumps({"made": made, "failures": failures, **db.count()}, indent=2))
+                    print(json.dumps({"made": made, "failures": failures, **db.count()}, indent=2), flush=True)
                     return 1
                 continue
 
@@ -201,16 +320,22 @@ def cmd_inv(args: argparse.Namespace) -> int:
         if row is None and require_ready:
             row = db.claim_unused(require_ready=False)
             if row is not None:
-                print(
-                    f"[{idx}] warn: no ready unused, using mid={row.mid} next={row.next_stage}",
-                    flush=True,
+                log.warning(
+                    "[%s] no ready unused, using mid=%s next=%s",
+                    idx,
+                    row.mid,
+                    row.next_stage,
                 )
         if row is None:
             return {"ok": False, "error": "no_unused_account", "idx": idx}
 
-        print(
-            f"[{idx}] claim mid={row.mid} ready={int(row.ready)} next={row.next_stage} inviter={inviter}",
-            flush=True,
+        log.info(
+            "[%s] claim mid=%s ready=%s next=%s inviter=%s",
+            idx,
+            row.mid,
+            int(row.ready),
+            row.next_stage,
+            inviter,
         )
         state = row.to_state()
         state.inviter_mid = inviter
@@ -251,10 +376,10 @@ def cmd_inv(args: argparse.Namespace) -> int:
                 try:
                     StageRunner(client, session, _stage_cfg()).signup()
                 except GrpcError as e:
-                    print(f"[{idx}] signup note: {e}", flush=True)
+                    log.debug("[%s] signup note: %s", idx, e)
                 state.resource_key = session.resource_key
 
-                print(f"[{idx}] RegisterFriendInviter {inviter} as {state.mid}...", flush=True)
+                log.info("[%s] invite %s <- %s ...", idx, inviter, state.mid)
                 resp = register_friend_inviter(client, session, inviter)
                 state.resource_key = session.resource_key
                 state.inviter_mid = inviter
@@ -299,11 +424,13 @@ def cmd_inv(args: argparse.Namespace) -> int:
             results.append(item)
             if item.get("ok"):
                 ok_n += 1
+                log.info("[%s] OK mid=%s inviter=%s", i, item.get("mid"), inviter)
             else:
                 fail_n += 1
                 if item.get("error") == "no_unused_account":
-                    print(f"[{i}] pool empty, stop", flush=True)
+                    log.warning("[%s] pool empty, stop", i)
                     break
+                log.error("[%s] FAIL mid=%s err=%s", i, item.get("mid"), item.get("error"))
 
         summary = {
             "ok": fail_n == 0 and ok_n > 0,
@@ -322,12 +449,303 @@ def cmd_inv(args: argparse.Namespace) -> int:
     return 0 if fail_n == 0 and ok_n > 0 else 1
 
 
+def cmd_guild(args: argparse.Namespace) -> int:
+    """Run the confirmed guild SOP across cooldown-eligible ready accounts."""
+    gname = str(args.gname or "").strip()
+    gmname = str(args.gmname or "").strip()
+    requested = int(args.count)
+    if not gname:
+        raise SystemExit("--gname 不能为空")
+    if not gmname:
+        raise SystemExit("--gmname 不能为空")
+    if requested < 1:
+        raise SystemExit("--count 必须 >= 1")
+
+    results: list[dict] = []
+    completed = 0
+    failures = 0
+    attempted = 0
+    target_source = "cache"
+    prepared_states: dict[str, AccountState] = {}
+
+    with AccountDB(args.db) as db:
+        pool_before = _guild_pool_payload(db.guild_pool_status())
+        eligible_rows = db.list_guild_eligible()
+        if not eligible_rows:
+            summary = {
+                "ok": True,
+                "requested": requested,
+                "count": 0,
+                "attempted": 0,
+                "failed": 0,
+                "stopped_reason": "all_accounts_cooling",
+                "guild": {"name": gname, "master_name": gmname},
+                "pool": pool_before,
+                "results": [],
+            }
+            print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+            return 0
+
+        target = db.get_guild_target(gname, gmname)
+        if target is None:
+            target_source = "search"
+            discovery_row = eligible_rows[0]
+            try:
+                state = _login_guild_account(discovery_row)
+                session = state.to_session()
+
+                def persist_discovery_balance(balance: int) -> None:
+                    state.diamond_balance = balance
+                    state.resource_key = session.resource_key
+                    db.upsert_state(
+                        state,
+                        used=discovery_row.used,
+                        ready=discovery_row.ready,
+                        invalid=discovery_row.invalid,
+                        note=discovery_row.note,
+                    )
+
+                with GrpcClient(state.endpoint or ENDPOINT) as client:
+                    runner = GuildRunner(
+                        client,
+                        session,
+                        on_balance=persist_discovery_balance,
+                    )
+                    runner.sync_diamond_balance()
+                    response = Guild(client, session).search_guilds(gname)
+                    summaries = parse_guild_search_response(response.message)
+
+                state.resource_key = session.resource_key
+                db.upsert_state(
+                    state,
+                    used=discovery_row.used,
+                    ready=discovery_row.ready,
+                    invalid=discovery_row.invalid,
+                    note=discovery_row.note,
+                )
+                prepared_states[discovery_row.mid] = state
+            except Exception as error:
+                summary = {
+                    "ok": False,
+                    "requested": requested,
+                    "count": 0,
+                    "attempted": 0,
+                    "failed": 1,
+                    "stopped_reason": "guild_search_failed",
+                    "error": f"{type(error).__name__}: {error}",
+                    "guild": {"name": gname, "master_name": gmname},
+                    "pool": pool_before,
+                    "results": [],
+                }
+                print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+                return 1
+
+            matches = [
+                item
+                for item in summaries
+                if item.name == gname and item.master_name == gmname
+            ]
+            if len(matches) != 1:
+                summary = {
+                    "ok": False,
+                    "requested": requested,
+                    "count": 0,
+                    "attempted": 0,
+                    "failed": 0,
+                    "stopped_reason": "guild_target_not_unique",
+                    "match_count": len(matches),
+                    "search_result_count": len(summaries),
+                    "guild": {"name": gname, "master_name": gmname},
+                    "pool": pool_before,
+                    "results": [],
+                }
+                print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+                return 1
+
+            matched = matches[0]
+            confirmation = _guild_confirmation_payload(matched)
+            if not _confirm_guild(confirmation):
+                summary = {
+                    "ok": True,
+                    "requested": requested,
+                    "count": 0,
+                    "attempted": 0,
+                    "failed": 0,
+                    "stopped_reason": "not_confirmed",
+                    "guild": {"name": gname, "master_name": gmname},
+                    "pool": pool_before,
+                    "results": [],
+                }
+                print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+                return 0
+
+            target = db.upsert_guild_target(
+                gname=gname,
+                gmname=gmname,
+                guild_id=matched.guild_id,
+                guild_level=matched.guild_level,
+                member_count=matched.member_count,
+                master_user_id=matched.master_user_id,
+                details={"search_summary": confirmation},
+            )
+            log.info("guild target confirmed and cached")
+        else:
+            log.info(
+                "using cached guild target name=%s master=%s confirmed_at=%s",
+                gname,
+                gmname,
+                _local_timestamp(target.confirmed_at),
+            )
+
+        for index, row in enumerate(eligible_rows, start=1):
+            if completed >= requested:
+                break
+            attempted += 1
+            log.info(
+                "[%s] guild SOP mid=%s ready=%s next=%s",
+                index,
+                row.mid,
+                int(row.ready),
+                row.next_stage,
+            )
+
+            try:
+                state = prepared_states.pop(row.mid, None) or _login_guild_account(row)
+                session = state.to_session()
+
+                def persist_balance(
+                    balance: int,
+                    *,
+                    _state=state,
+                    _session=session,
+                    _row=row,
+                ) -> None:
+                    _state.diamond_balance = balance
+                    _state.resource_key = _session.resource_key
+                    db.upsert_state(
+                        _state,
+                        used=_row.used,
+                        ready=_row.ready,
+                        invalid=_row.invalid,
+                        note=_row.note,
+                    )
+
+                db.upsert_state(
+                    state,
+                    used=row.used,
+                    ready=row.ready,
+                    invalid=row.invalid,
+                    note=row.note,
+                )
+                with GrpcClient(state.endpoint or ENDPOINT) as client:
+                    runner = GuildRunner(
+                        client,
+                        session,
+                        on_balance=persist_balance,
+                    )
+                    runner.sync_diamond_balance()
+                    workflow = runner.run(target.guild_id)
+
+                state.resource_key = session.resource_key
+                if workflow.diamond_balance_final is not None:
+                    state.diamond_balance = workflow.diamond_balance_final
+                db.upsert_state(
+                    state,
+                    used=row.used,
+                    ready=row.ready,
+                    invalid=row.invalid,
+                    note=row.note,
+                )
+
+                item = {"mid": row.mid, **workflow.to_dict()}
+                if workflow.left_guild:
+                    left_at = db.mark_guild_left(row.mid)
+                    item["guild_left_at"] = _local_timestamp(left_at)
+
+                if workflow.guild_detail is not None:
+                    details = dict(target.details)
+                    details["member_detail"] = {
+                        "captured_while_runner_was_member": True,
+                        **asdict(workflow.guild_detail),
+                    }
+                    target = db.upsert_guild_target(
+                        gname=gname,
+                        gmname=gmname,
+                        guild_id=target.guild_id,
+                        guild_level=target.guild_level,
+                        member_count=target.member_count,
+                        master_user_id=target.master_user_id,
+                        details=details,
+                    )
+
+                results.append(item)
+                if workflow.ok:
+                    completed += 1
+                    log.info(
+                        "[%s] guild SOP complete mid=%s count=%s/%s",
+                        index,
+                        row.mid,
+                        completed,
+                        requested,
+                    )
+                else:
+                    failures += 1
+                    log.error(
+                        "[%s] guild SOP failed mid=%s error=%s",
+                        index,
+                        row.mid,
+                        workflow.error or workflow.paid_stop_message,
+                    )
+            except Exception as error:
+                failures += 1
+                item = {
+                    "ok": False,
+                    "mid": row.mid,
+                    "error": f"{type(error).__name__}: {error}",
+                }
+                results.append(item)
+                log.error(
+                    "[%s] guild account failed mid=%s error=%s",
+                    index,
+                    row.mid,
+                    item["error"],
+                )
+
+        pool_after = _guild_pool_payload(db.guild_pool_status())
+        stopped_reason = (
+            "count_reached"
+            if completed >= requested
+            else "all_eligible_accounts_attempted"
+        )
+        summary = {
+            "ok": failures == 0,
+            "requested": requested,
+            "count": completed,
+            "attempted": attempted,
+            "failed": failures,
+            "stopped_reason": stopped_reason,
+            "guild": {
+                "name": gname,
+                "master_name": gmname,
+                "source": target_source,
+                "confirmed_at": _local_timestamp(target.confirmed_at),
+            },
+            "pool_before": pool_before,
+            "pool_after": pool_after,
+            "results": results,
+        }
+        print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+
+    return 0 if failures == 0 else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="crumble_bot",
-        description="Crumble bot: gen / inv / list",
+        description="Crumble bot: gen / inv / guild / list",
     )
-    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true", help="DEBUG：每关点位 + HTTP")
+    p.add_argument("-q", "--quiet", action="store_true", help="仅警告/错误 + 最终 JSON")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("inv", help="从 sqlite 取未使用号 -> 登录 -> 邀请")
@@ -343,6 +761,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--stop-on-error", action="store_true")
     sp.set_defaults(func=cmd_gen)
 
+    sp = sub.add_parser("guild", help="批量执行公会签到、研究、捐赠并退出")
+    sp.add_argument("--gname", required=True, help="公会名称")
+    sp.add_argument("--gmname", required=True, help="会长名称")
+    sp.add_argument("--count", required=True, type=int, help="成功执行的账号数量")
+    sp.add_argument("--db", default=str(DEFAULT_DB), help="sqlite 路径")
+    sp.set_defaults(func=cmd_guild)
+
     sp = sub.add_parser("list", help="列出 sqlite 账号")
     sp.add_argument("--db", default=str(DEFAULT_DB))
     sp.add_argument("--all", action="store_true")
@@ -357,7 +782,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    _setup_log(args.verbose)
+    _setup_log(verbose=bool(getattr(args, "verbose", False)), quiet=bool(getattr(args, "quiet", False)))
     return args.func(args)
 
 
