@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""iosver 主入口：承接 gen / inv / list 参数。
+"""iosver 主入口：承接 gen / inv / daily / guild / list 参数。
 
 用法:
   ./main.py gen 5
   ./main.py inv GNWPX5251 -c 3
+  ./main.py daily
+  ./main.py guild --gname ahhhha --gmname absdbld --count 20 --totalcount 200
   ./main.py list --unused --ready
 """
 from __future__ import annotations

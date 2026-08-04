@@ -33,6 +33,14 @@ CREATE TABLE IF NOT EXISTS accounts (
     diamond_balance INTEGER NOT NULL DEFAULT 0,
     guild REAL NOT NULL DEFAULT 0,
     daily REAL NOT NULL DEFAULT 0,
+    guild_last_id TEXT NOT NULL DEFAULT '',
+    guild_joined_at REAL NOT NULL DEFAULT 0,
+    guild_left_at REAL NOT NULL DEFAULT 0,
+    guild_free_research_total INTEGER NOT NULL DEFAULT 0,
+    guild_paid_research_total INTEGER NOT NULL DEFAULT 0,
+    guild_effective_research_total INTEGER NOT NULL DEFAULT 0,
+    guild_super_success_total INTEGER NOT NULL DEFAULT 0,
+    guild_diamond_spent_total INTEGER NOT NULL DEFAULT 0,
     used INTEGER NOT NULL DEFAULT 0,
     ready INTEGER NOT NULL DEFAULT 0,
     invalid INTEGER NOT NULL DEFAULT 0,
@@ -55,6 +63,28 @@ CREATE TABLE IF NOT EXISTS guild_targets (
     updated_at REAL NOT NULL,
     PRIMARY KEY (gname, gmname)
 );
+
+CREATE TABLE IF NOT EXISTS guild_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mid TEXT NOT NULL,
+    guild_id TEXT NOT NULL DEFAULT '',
+    joined_at REAL NOT NULL DEFAULT 0,
+    left_at REAL NOT NULL DEFAULT 0,
+    free_research_count INTEGER NOT NULL DEFAULT 0,
+    paid_research_count INTEGER NOT NULL DEFAULT 0,
+    free_effective_count INTEGER NOT NULL DEFAULT 0,
+    paid_effective_count INTEGER NOT NULL DEFAULT 0,
+    effective_research_count INTEGER NOT NULL DEFAULT 0,
+    free_super_success_count INTEGER NOT NULL DEFAULT 0,
+    paid_super_success_count INTEGER NOT NULL DEFAULT 0,
+    super_success_count INTEGER NOT NULL DEFAULT 0,
+    diamond_spent INTEGER NOT NULL DEFAULT 0,
+    stop_reason TEXT NOT NULL DEFAULT '',
+    ok INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_guild_runs_mid ON guild_runs(mid, id);
 """
 
 
@@ -74,6 +104,14 @@ class AccountRow:
     diamond_balance: int
     guild: float
     daily: float
+    guild_last_id: str
+    guild_joined_at: float
+    guild_left_at: float
+    guild_free_research_total: int
+    guild_paid_research_total: int
+    guild_effective_research_total: int
+    guild_super_success_total: int
+    guild_diamond_spent_total: int
     used: bool
     ready: bool
     invalid: bool
@@ -136,22 +174,32 @@ class AccountDB:
         cols = {
             r[1] for r in self._conn.execute("PRAGMA table_info(accounts)").fetchall()
         }
-        if "invalid" not in cols:
-            self._conn.execute(
-                "ALTER TABLE accounts ADD COLUMN invalid INTEGER NOT NULL DEFAULT 0"
-            )
-        if "diamond_balance" not in cols:
-            self._conn.execute(
-                "ALTER TABLE accounts ADD COLUMN diamond_balance INTEGER NOT NULL DEFAULT 0"
-            )
-        if "guild" not in cols:
-            self._conn.execute(
-                "ALTER TABLE accounts ADD COLUMN guild REAL NOT NULL DEFAULT 0"
-            )
-        if "daily" not in cols:
-            self._conn.execute(
-                "ALTER TABLE accounts ADD COLUMN daily REAL NOT NULL DEFAULT 0"
-            )
+        migrations = {
+            "invalid": "INTEGER NOT NULL DEFAULT 0",
+            "diamond_balance": "INTEGER NOT NULL DEFAULT 0",
+            "guild": "REAL NOT NULL DEFAULT 0",
+            "daily": "REAL NOT NULL DEFAULT 0",
+            "guild_last_id": "TEXT NOT NULL DEFAULT ''",
+            "guild_joined_at": "REAL NOT NULL DEFAULT 0",
+            "guild_left_at": "REAL NOT NULL DEFAULT 0",
+            "guild_free_research_total": "INTEGER NOT NULL DEFAULT 0",
+            "guild_paid_research_total": "INTEGER NOT NULL DEFAULT 0",
+            "guild_effective_research_total": "INTEGER NOT NULL DEFAULT 0",
+            "guild_super_success_total": "INTEGER NOT NULL DEFAULT 0",
+            "guild_diamond_spent_total": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, definition in migrations.items():
+            if column not in cols:
+                self._conn.execute(
+                    f"ALTER TABLE accounts ADD COLUMN {column} {definition}"
+                )
+        self._conn.execute(
+            """
+            UPDATE accounts
+            SET guild_left_at=guild
+            WHERE guild_left_at<=0 AND guild>0
+            """
+        )
 
     def close(self) -> None:
         self._conn.close()
@@ -430,11 +478,119 @@ class AccountDB:
     def mark_guild_left(self, mid: str, *, left_at: Optional[float] = None) -> float:
         timestamp = time.time() if left_at is None else float(left_at)
         self._conn.execute(
-            "UPDATE accounts SET guild=?, updated_at=? WHERE mid=?",
-            (timestamp, timestamp, mid),
+            "UPDATE accounts SET guild=?, guild_left_at=?, updated_at=? WHERE mid=?",
+            (timestamp, timestamp, timestamp, mid),
         )
         self._conn.commit()
         return timestamp
+
+    def record_guild_run(
+        self,
+        mid: str,
+        *,
+        guild_id: str,
+        joined_at: Optional[float],
+        left_at: Optional[float],
+        free_research_count: int,
+        paid_research_count: int,
+        free_effective_count: int,
+        paid_effective_count: int,
+        free_super_success_count: int,
+        paid_super_success_count: int,
+        diamond_spent: int,
+        stop_reason: str,
+        ok: bool,
+        error: str = "",
+    ) -> int:
+        """Persist one guild workflow and update the account's guild totals."""
+        account = self.get(mid)
+        if account is None:
+            raise KeyError(f"account not found: {mid}")
+
+        joined = max(0.0, float(joined_at or 0))
+        left = max(0.0, float(left_at or 0))
+        free_count = max(0, int(free_research_count))
+        paid_count = max(0, int(paid_research_count))
+        free_effective = max(0, int(free_effective_count))
+        paid_effective = max(0, int(paid_effective_count))
+        effective = free_effective + paid_effective
+        free_super = max(0, int(free_super_success_count))
+        paid_super = max(0, int(paid_super_success_count))
+        super_success = free_super + paid_super
+        spent = max(0, int(diamond_spent))
+        now = time.time()
+
+        cursor = self._conn.execute(
+            """
+            INSERT INTO guild_runs (
+                mid, guild_id, joined_at, left_at,
+                free_research_count, paid_research_count,
+                free_effective_count, paid_effective_count,
+                effective_research_count,
+                free_super_success_count, paid_super_success_count,
+                super_success_count, diamond_spent, stop_reason, ok, error,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                mid,
+                guild_id,
+                joined,
+                left,
+                free_count,
+                paid_count,
+                free_effective,
+                paid_effective,
+                effective,
+                free_super,
+                paid_super,
+                super_success,
+                spent,
+                stop_reason,
+                1 if ok else 0,
+                error[:1000],
+                now,
+            ),
+        )
+        self._conn.execute(
+            """
+            UPDATE accounts
+            SET guild_last_id=?,
+                guild_joined_at=?,
+                guild_left_at=?,
+                guild=?,
+                guild_free_research_total=guild_free_research_total+?,
+                guild_paid_research_total=guild_paid_research_total+?,
+                guild_effective_research_total=guild_effective_research_total+?,
+                guild_super_success_total=guild_super_success_total+?,
+                guild_diamond_spent_total=guild_diamond_spent_total+?,
+                updated_at=?
+            WHERE mid=?
+            """,
+            (
+                guild_id or account.guild_last_id,
+                joined or account.guild_joined_at,
+                left or account.guild_left_at,
+                left or account.guild,
+                free_count,
+                paid_count,
+                effective,
+                super_success,
+                spent,
+                now,
+                mid,
+            ),
+        )
+        self._conn.commit()
+        return int(cursor.lastrowid)
+
+    def list_guild_runs(self, mid: str, *, limit: int = 20) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM guild_runs WHERE mid=? ORDER BY id DESC"
+        params: tuple[Any, ...] = (mid,)
+        if limit > 0:
+            sql += " LIMIT ?"
+            params = (mid, int(limit))
+        return [dict(row) for row in self._conn.execute(sql, params)]
 
     @staticmethod
     def _daily_window(now: Optional[float] = None) -> tuple[float, float]:
@@ -561,6 +717,44 @@ class AccountDB:
             diamond_balance=int(row["diamond_balance"] or 0),
             guild=float(row["guild"] or 0),
             daily=float(row["daily"] or 0) if "daily" in keys else 0,
+            guild_last_id=(
+                row["guild_last_id"] or "" if "guild_last_id" in keys else ""
+            ),
+            guild_joined_at=(
+                float(row["guild_joined_at"] or 0)
+                if "guild_joined_at" in keys
+                else 0
+            ),
+            guild_left_at=(
+                float(row["guild_left_at"] or 0)
+                if "guild_left_at" in keys
+                else 0
+            ),
+            guild_free_research_total=(
+                int(row["guild_free_research_total"] or 0)
+                if "guild_free_research_total" in keys
+                else 0
+            ),
+            guild_paid_research_total=(
+                int(row["guild_paid_research_total"] or 0)
+                if "guild_paid_research_total" in keys
+                else 0
+            ),
+            guild_effective_research_total=(
+                int(row["guild_effective_research_total"] or 0)
+                if "guild_effective_research_total" in keys
+                else 0
+            ),
+            guild_super_success_total=(
+                int(row["guild_super_success_total"] or 0)
+                if "guild_super_success_total" in keys
+                else 0
+            ),
+            guild_diamond_spent_total=(
+                int(row["guild_diamond_spent_total"] or 0)
+                if "guild_diamond_spent_total" in keys
+                else 0
+            ),
             used=bool(row["used"]),
             ready=bool(row["ready"]),
             invalid=bool(row["invalid"]) if "invalid" in keys else False,

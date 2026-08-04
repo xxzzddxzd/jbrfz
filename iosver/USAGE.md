@@ -49,7 +49,7 @@ list              查看号池
 ./main.py gen 10
 ./main.py inv GNWPX5251 -c 3
 ./main.py daily
-./main.py guild --gname 'ahhhha' --gmname 'absdbld' --count 20
+./main.py guild --gname 'ahhhha' --gmname 'absdbld' --count 20 --totalcount 200
 ./main.py list --unused --ready
 ```
 
@@ -102,24 +102,29 @@ SOP：重新登录 → `SignUp` 每日登录同步 → 查看邮箱并全部领�
 ### `guild`
 
 ```bash
-./main.py guild --gname 'ahhhha' --gmname 'absdbld' --count 20
+./main.py guild --gname 'ahhhha' --gmname 'absdbld' --count 20 --totalcount 200
 ```
 
 | 参数 | 必填 | 说明 |
 |------|------|------|
 | `--gname` | **是** | 公会名称 |
 | `--gmname` | **是** | 会长名称，用于防止同名公会误匹配 |
-| `--count` | **是** | 需要成功完成 SOP 的账号数 |
+| `--count` | **是** | 每个账号最多执行的钻石捐赠次数，只限制付费次数 |
+| `--totalcount` | **是** | 跨账号累计的免费+付费有效研究次数 |
 | `--db` | 否 | sqlite，默认 `data/accounts.db` |
 
-SOP：登录鉴权 → 加入 → 领取公会签到奖励 → 免费研究 3 次 → 捐赠至钻石不足 → 读取公会变化 → 退出。
+SOP：登录鉴权 → 加入 → 领取公会签到奖励 → 免费研究默认 3 次 → 最多执行 `--count` 次钻石捐赠 → 读取公会变化 → 退出。
 
 - 账号必须 `ready=1`、`next_stage>30`、`invalid=0`；`used` 不影响选择。
-- `accounts.guild` 保存成功退出时间，24 小时内不会再次选择。
+- 普通研究按 1 次计入 `--totalcount`；暴击按服务端返回的实际贡献增量计，当前一次暴击按 3 次计。
+- 每次动作完成后检查全局有效次数，达到 `--totalcount` 后立即停止当前账号的后续研究并退出；由于暴击结果在响应后才知道，最终值最多可能超过目标一个暴击带来的增量差。
+- 单个账号钻石不足时会提前停止其付费捐赠、退出公会并继续下一个可用账号。
+- 所有账号累计达到 `--totalcount` 或可用账号全部尝试完后结束。
+- `accounts.guild` 保留为成功退出时间的兼容字段；明确的最近加入、退出时间分别保存于 `guild_joined_at`、`guild_left_at`。
 - 首次目标搜索会展示公会摘要并要求确认。
 - 确认结果写入 `guild_targets`；相同公会名和会长名后续直接复用 `guild_id`。
-- 账号全部处于冷却或已尝试完时结束；最终 JSON 的 `count` 是实际成功数。
-- `totals.donation_count` 是本次所有账号的总捐献次数，`totals.diamond_spent` 是总钻石消耗。
+- 最终 JSON 的 `count` 是每账号付费上限，`requested_totalcount` 是目标，`totalcount` 是实际累计有效次数，`account_count` 是成功完成流程的账号数。
+- `totals.free_research_count` 与 `totals.donation_count` 是实际 RPC 动作数；`totals.effective_research_count` 包含暴击倍率；`totals.diamond_spent` 是总钻石消耗。
 - 每个账号的 `guild_progress` 记录公会等级、经验、成员贡献、研究点和每日研究次数的前后值及增量；退出前会再次读取公会详情。
 - 顶层 `guild.level_before/after/change` 和 `experience_before/after/gained` 汇总整个批次的公会变化。
 - `guild` 只做登录鉴权，不执行 `SignUp` 每日同步，也不调用邮箱附件或广告奖励接口；这些动作只属于 `daily`。
@@ -139,7 +144,7 @@ SOP：登录鉴权 → 加入 → 领取公会签到奖励 → 免费研究 3 �
 
 ## sqlite 字段
 
-登录全量 + 状态：`mid, guest_secret, refresh_token, game_access_token, oven_access_token, resource_key, endpoint, email, device_json, inviter_mid, next_stage, diamond_balance, guild, daily, used, ready, invalid, note, created_at, updated_at`
+登录全量 + 状态：`mid, guest_secret, refresh_token, game_access_token, oven_access_token, resource_key, endpoint, email, device_json, inviter_mid, next_stage, diamond_balance, guild, daily, guild_last_id, guild_joined_at, guild_left_at, guild_free_research_total, guild_paid_research_total, guild_effective_research_total, guild_super_success_total, guild_diamond_spent_total, used, ready, invalid, note, created_at, updated_at`
 
 | 标志 | 含义 |
 |------|------|
@@ -147,12 +152,22 @@ SOP：登录鉴权 → 加入 → 领取公会签到奖励 → 免费研究 3 �
 | `ready` | 已打完 1–30 |
 | `invalid` | 作废 |
 | `diamond_balance` | 最近一次从服务端同步的钻石余额 |
-| `guild` | 最近一次成功退出公会的 Unix 时间；用于 24 小时冷却 |
+| `guild` | 最近一次成功退出公会的 Unix 时间；兼容字段，用于 24 小时冷却 |
+| `guild_last_id` | 最近一次执行流程的公会 ID |
+| `guild_joined_at` | 最近一次成功加入公会的 Unix 时间 |
+| `guild_left_at` | 最近一次成功退出公会的 Unix 时间 |
+| `guild_free_research_total` | 历史免费研究 RPC 次数 |
+| `guild_paid_research_total` | 历史钻石捐赠 RPC 次数 |
+| `guild_effective_research_total` | 历史有效研究次数，包含暴击倍率 |
+| `guild_super_success_total` | 历史暴击次数 |
+| `guild_diamond_spent_total` | 历史公会捐赠钻石消耗 |
 | `daily` | 最近一次成功完成 daily SOP 的 Unix 时间；用于当天去重 |
 
 `guild_targets` 保存已确认的 `gname + gmname → guild_id` 及公会摘要，避免多账号和后续运行重复搜索、重复确认。
 
-兼容旧版 sqlite：执行 `daily` 或 `guild` 时会先自动、幂等地补齐 `invalid`、`diamond_balance`、`guild`、`daily` 列并创建 `guild_targets`，已有账号和状态数据保持不变。
+`guild_runs` 为每次账号公会流程保存一条历史，包括加入/退出时间、免费/付费动作数、免费/付费有效次数、暴击次数、钻石消耗、停止原因及错误。
+
+兼容旧版 sqlite：执行 `daily`、`guild` 或其他打开账号库的指令时会自动、幂等地补齐上述字段并创建 `guild_targets`、`guild_runs`，已有账号和状态数据保持不变。
 
 ---
 

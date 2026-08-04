@@ -5,8 +5,9 @@ import io
 import json
 import sqlite3
 import tempfile
+import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -130,23 +131,24 @@ def attend_guild_response() -> bytes:
 
 
 def free_research_response(index: int) -> bytes:
-    previous_experience = 20 + index
-    previous_contribution = index
-    previous_point = 90 + index * 10
+    previous_experience = {1: 21, 2: 22, 3: 25}[index]
+    previous_contribution = {1: 1, 2: 2, 3: 5}[index]
+    previous_point = {1: 100, 2: 101, 3: 104}[index]
+    gained = 3 if index == 2 else 1
     return b"".join(
         (
             pb.encode_message_field(
                 2,
                 guild_progression(
                     previous_experience,
-                    previous_experience + 1,
+                    previous_experience + gained,
                     previous_contribution,
-                    previous_contribution + 1,
+                    previous_contribution + gained,
                 ),
             ),
             pb.encode_message_field(
                 3,
-                guild_lab_research(previous_point, previous_point + 10),
+                guild_lab_research(previous_point, previous_point + gained),
             ),
             pb.encode_message_field(
                 4,
@@ -168,8 +170,8 @@ def payment_response(amount: int) -> bytes:
     return b"".join(
         (
             pb.encode_message_field(2, payment),
-            pb.encode_message_field(3, guild_progression(24, 30, 4, 10)),
-            pb.encode_message_field(4, guild_lab_research(130, 150)),
+            pb.encode_message_field(3, guild_progression(26, 29, 6, 9)),
+            pb.encode_message_field(4, guild_lab_research(105, 108)),
             pb.encode_bool_field(5, True),
             pb.encode_message_field(
                 6,
@@ -444,6 +446,49 @@ class AccountDBGuildTests(unittest.TestCase):
                 self.assertEqual(updated.guild_level, 2)
                 self.assertEqual(updated.details["members"], ["A", "B"])
 
+    def test_guild_run_history_and_account_totals_are_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                db.upsert_state(
+                    AccountState(mid="MID", next_stage=31),
+                    used=True,
+                    ready=True,
+                    invalid=False,
+                )
+                run_id = db.record_guild_run(
+                    "MID",
+                    guild_id="G-ID",
+                    joined_at=100,
+                    left_at=200,
+                    free_research_count=3,
+                    paid_research_count=2,
+                    free_effective_count=5,
+                    paid_effective_count=4,
+                    free_super_success_count=1,
+                    paid_super_success_count=1,
+                    diamond_spent=40,
+                    stop_reason="total_count_reached",
+                    ok=True,
+                )
+
+                account = db.get("MID")
+                self.assertEqual(account.guild_last_id, "G-ID")
+                self.assertEqual(account.guild_joined_at, 100)
+                self.assertEqual(account.guild_left_at, 200)
+                self.assertEqual(account.guild, 200)
+                self.assertEqual(account.guild_free_research_total, 3)
+                self.assertEqual(account.guild_paid_research_total, 2)
+                self.assertEqual(account.guild_effective_research_total, 9)
+                self.assertEqual(account.guild_super_success_total, 2)
+                self.assertEqual(account.guild_diamond_spent_total, 40)
+
+                runs = db.list_guild_runs("MID")
+                self.assertEqual(len(runs), 1)
+                self.assertEqual(runs[0]["id"], run_id)
+                self.assertEqual(runs[0]["effective_research_count"], 9)
+                self.assertEqual(runs[0]["super_success_count"], 2)
+
 
 class FakeWorkflowClient:
     def __init__(self) -> None:
@@ -520,7 +565,13 @@ class GuildRunnerTests(unittest.TestCase):
         result = runner.run("G00000000-0000-0000-0000-000000000000")
         self.assertTrue(result.ok)
         self.assertEqual(result.free_research_count, 3)
+        self.assertEqual(result.free_effective_count, 5)
+        self.assertEqual(result.free_super_success_count, 1)
         self.assertEqual(result.paid_research_count, 1)
+        self.assertEqual(result.paid_effective_count, 3)
+        self.assertEqual(result.paid_super_success_count, 1)
+        self.assertEqual(result.effective_research_count, 8)
+        self.assertEqual(result.stop_reason, "insufficient_diamonds")
         self.assertEqual(result.diamond_spent, 40)
         self.assertEqual(result.diamond_balance_before_paid, 900)
         self.assertEqual(result.diamond_balance_final, 860)
@@ -531,17 +582,17 @@ class GuildRunnerTests(unittest.TestCase):
         self.assertEqual(result.guild_progress.experience_before, 20)
         self.assertEqual(result.guild_progress.experience_after, 30)
         self.assertEqual(result.guild_progress.member_contribution_before, 0)
-        self.assertEqual(result.guild_progress.member_contribution_after, 10)
+        self.assertEqual(result.guild_progress.member_contribution_after, 9)
         self.assertEqual(result.guild_progress.research_point_before, 100)
-        self.assertEqual(result.guild_progress.research_point_after, 150)
+        self.assertEqual(result.guild_progress.research_point_after, 108)
         self.assertEqual(result.guild_progress.daily_free_research_count_after, 3)
         self.assertEqual(result.guild_progress.daily_donation_count_after, 1)
         self.assertEqual(result.guild_progress.super_success_count, 2)
         progress = result.to_dict()["guild_progress"]
         self.assertEqual(progress["level_change"], 1)
         self.assertEqual(progress["experience_gained"], 10)
-        self.assertEqual(progress["member_contribution_gained"], 10)
-        self.assertEqual(progress["research_point_gained"], 50)
+        self.assertEqual(progress["member_contribution_gained"], 9)
+        self.assertEqual(progress["research_point_gained"], 8)
         self.assertEqual(client.calls[0], JOIN_GUILD_PATH)
         self.assertNotIn(REFRESH_MAIL_BOX_PATH, client.calls)
         self.assertNotIn(RECEIVE_MAIL_REWARDS_PATH, client.calls)
@@ -553,6 +604,49 @@ class GuildRunnerTests(unittest.TestCase):
         self.assertEqual(client.calls.count(GET_GUILD_PATH), 2)
         self.assertIn(LEAVE_GUILD_PATH, client.calls)
         self.assertEqual(balances, [860, 860])
+
+    def test_paid_count_limit_stops_without_insufficient_probe(self) -> None:
+        client = FakeWorkflowClient()
+        runner = GuildRunner(
+            client,
+            AccountState(mid="MID", game_access_token="token").to_session(),
+            paid_research_limit=1,
+            sleep_seconds=0,
+            initial_diamond_balance=900,
+        )
+
+        result = runner.run("G-ID")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.paid_research_count, 1)
+        self.assertEqual(result.stop_reason, "paid_count_reached")
+        self.assertEqual(result.diamond_balance_final, 860)
+        self.assertEqual(
+            client.calls.count(CONDUCT_PAID_GUILD_LAB_RESEARCH_PATH),
+            1,
+        )
+
+    def test_total_count_stops_during_free_research_and_counts_critical(self) -> None:
+        client = FakeWorkflowClient()
+        runner = GuildRunner(
+            client,
+            AccountState(mid="MID", game_access_token="token").to_session(),
+            paid_research_limit=20,
+            total_count_limit=4,
+            sleep_seconds=0,
+            initial_diamond_balance=900,
+        )
+
+        result = runner.run("G-ID")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.free_research_count, 2)
+        self.assertEqual(result.free_effective_count, 4)
+        self.assertEqual(result.free_super_success_count, 1)
+        self.assertEqual(result.paid_research_count, 0)
+        self.assertEqual(result.effective_research_count, 4)
+        self.assertEqual(result.stop_reason, "total_count_reached")
+        self.assertNotIn(CONDUCT_PAID_GUILD_LAB_RESEARCH_PATH, client.calls)
 
 
 class DummyClient:
@@ -567,8 +661,19 @@ class DummyClient:
 
 
 class FakeRunner:
-    def __init__(self, client, session, *, on_balance=None, **kwargs) -> None:
+    def __init__(
+        self,
+        client,
+        session,
+        *,
+        on_balance=None,
+        paid_research_limit=100,
+        total_count_limit=None,
+        **kwargs,
+    ) -> None:
         self.on_balance = on_balance
+        self.paid_research_limit = paid_research_limit
+        self.total_count_limit = total_count_limit
 
     def sync_diamond_balance(self) -> int:
         if self.on_balance:
@@ -576,33 +681,53 @@ class FakeRunner:
         return 600
 
     def run(self, guild_id: str) -> GuildWorkflowResult:
+        effective_limit = (
+            1_000_000
+            if self.total_count_limit is None
+            else self.total_count_limit
+        )
+        free_count = min(3, effective_limit)
+        paid_count = min(
+            self.paid_research_limit,
+            max(0, effective_limit - free_count),
+        )
+        effective_count = free_count + paid_count
+        diamond_spent = paid_count * 100
+        final_balance = max(0, 600 - diamond_spent)
         if self.on_balance:
-            self.on_balance(100)
+            self.on_balance(final_balance)
+        now = time.time()
         return GuildWorkflowResult(
             joined=True,
+            joined_at=now - 1,
             attendance_claimed=True,
-            free_research_count=3,
-            paid_research_count=1,
+            free_research_count=free_count,
+            free_effective_count=free_count,
+            paid_research_count=paid_count,
+            paid_effective_count=paid_count,
             diamond_balance_before_paid=600,
-            diamond_spent=500,
-            diamond_balance_final=100,
+            diamond_spent=diamond_spent,
+            diamond_balance_final=final_balance,
             left_guild=True,
-            paid_stop_status=9,
-            paid_stop_message="not enough resources 1464007916",
+            left_at=now,
+            stop_reason=(
+                "total_count_reached"
+                if effective_count >= effective_limit
+                else "paid_count_reached"
+            ),
             guild_progress=GuildProgress(
                 level_before=1,
                 level_after=2,
                 experience_before=20,
-                experience_after=30,
+                experience_after=20 + effective_count,
                 member_contribution_before=0,
-                member_contribution_after=10,
+                member_contribution_after=effective_count,
                 research_point_before=100,
-                research_point_after=150,
+                research_point_after=100 + effective_count,
                 daily_free_research_count_before=0,
-                daily_free_research_count_after=3,
+                daily_free_research_count_after=free_count,
                 daily_donation_count_before=0,
-                daily_donation_count_after=1,
-                super_success_count=1,
+                daily_donation_count_after=paid_count,
             ),
         )
 
@@ -619,6 +744,37 @@ class FakeSearchGuild:
 
 
 class GuildCommandTests(unittest.TestCase):
+    def test_guild_parser_requires_paid_and_total_counts(self) -> None:
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "guild",
+                "--gname",
+                "ahhhha",
+                "--gmname",
+                "absdbld",
+                "--count",
+                "20",
+                "--totalcount",
+                "200",
+            ]
+        )
+        self.assertEqual(args.count, 20)
+        self.assertEqual(args.totalcount, 200)
+
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(
+                [
+                    "guild",
+                    "--gname",
+                    "ahhhha",
+                    "--gmname",
+                    "absdbld",
+                    "--count",
+                    "20",
+                ]
+            )
+
     def test_legacy_database_is_migrated_before_guild_pool_query(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "accounts.db"
@@ -656,6 +812,7 @@ class GuildCommandTests(unittest.TestCase):
                 gname="ahhhha",
                 gmname="absdbld",
                 count=1,
+                totalcount=1,
                 db=str(db_path),
             )
             output = io.StringIO()
@@ -671,7 +828,20 @@ class GuildCommandTests(unittest.TestCase):
                     row[1] for row in conn.execute("PRAGMA table_info(accounts)")
                 }
                 self.assertTrue(
-                    {"invalid", "diamond_balance", "guild", "daily"}.issubset(columns)
+                    {
+                        "invalid",
+                        "diamond_balance",
+                        "guild",
+                        "daily",
+                        "guild_last_id",
+                        "guild_joined_at",
+                        "guild_left_at",
+                        "guild_free_research_total",
+                        "guild_paid_research_total",
+                        "guild_effective_research_total",
+                        "guild_super_success_total",
+                        "guild_diamond_spent_total",
+                    }.issubset(columns)
                 )
                 self.assertIsNotNone(
                     conn.execute(
@@ -679,11 +849,22 @@ class GuildCommandTests(unittest.TestCase):
                         "WHERE type='table' AND name='guild_targets'"
                     ).fetchone()
                 )
+                self.assertIsNotNone(
+                    conn.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type='table' AND name='guild_runs'"
+                    ).fetchone()
+                )
                 legacy = conn.execute(
-                    "SELECT note, invalid, diamond_balance, guild, daily "
+                    "SELECT note, invalid, diamond_balance, guild, daily, "
+                    "guild_last_id, guild_joined_at, guild_left_at, "
+                    "guild_paid_research_total, guild_super_success_total "
                     "FROM accounts WHERE mid='LEGACY'"
                 ).fetchone()
-                self.assertEqual(legacy, ("keep-me", 0, 0, 0.0, 0.0))
+                self.assertEqual(
+                    legacy,
+                    ("keep-me", 0, 0, 0.0, 0.0, "", 0.0, 0.0, 0, 0),
+                )
 
     def test_cached_target_reuses_id_and_marks_two_accounts_cooling(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -714,6 +895,7 @@ class GuildCommandTests(unittest.TestCase):
                 gname="ahhhha",
                 gmname="absdbld",
                 count=2,
+                totalcount=9,
                 db=str(db_path),
             )
             output = io.StringIO()
@@ -733,25 +915,41 @@ class GuildCommandTests(unittest.TestCase):
             self.assertEqual(code, 0)
             summary = json.loads(output.getvalue())
             self.assertEqual(summary["count"], 2)
-            self.assertEqual(summary["attempted"], 2)
+            self.assertEqual(summary["requested_totalcount"], 9)
+            self.assertEqual(summary["totalcount"], 9)
+            self.assertTrue(summary["totalcount_reached"])
+            self.assertEqual(summary["account_count"], 2)
+            self.assertEqual(summary["accounts_attempted"], 2)
             self.assertEqual(summary["guild"]["source"], "cache")
             self.assertEqual(summary["guild"]["level_before"], 1)
             self.assertEqual(summary["guild"]["level_after"], 2)
             self.assertEqual(summary["guild"]["level_change"], 1)
-            self.assertEqual(summary["totals"]["donation_count"], 2)
+            self.assertEqual(summary["totals"]["free_research_count"], 6)
+            self.assertEqual(summary["totals"]["donation_count"], 3)
+            self.assertEqual(summary["totals"]["effective_research_count"], 9)
             self.assertNotIn("mailbox_checked_count", summary["totals"])
             self.assertNotIn("mailbox", summary["results"][0])
-            self.assertEqual(summary["totals"]["diamond_spent"], 1000)
-            self.assertEqual(summary["totals"]["guild_experience_gained"], 20)
-            self.assertEqual(summary["totals"]["research_point_gained"], 100)
-            self.assertEqual(summary["results"][0]["donation_count"], 1)
+            self.assertEqual(summary["totals"]["diamond_spent"], 300)
+            self.assertEqual(summary["totals"]["guild_experience_gained"], 9)
+            self.assertEqual(summary["totals"]["research_point_gained"], 9)
+            self.assertEqual(summary["results"][0]["donation_count"], 2)
             self.assertEqual(
                 summary["results"][0]["guild_progress"]["experience_gained"],
-                10,
+                5,
             )
             with AccountDB(db_path) as db:
-                self.assertGreater(db.get("A").guild, 0)
-                self.assertGreater(db.get("B").guild, 0)
+                account_a = db.get("A")
+                account_b = db.get("B")
+                self.assertGreater(account_a.guild, 0)
+                self.assertGreater(account_b.guild, 0)
+                self.assertGreater(account_a.guild_joined_at, 0)
+                self.assertGreater(account_a.guild_left_at, 0)
+                self.assertEqual(account_a.guild_paid_research_total, 2)
+                self.assertEqual(account_a.guild_effective_research_total, 5)
+                self.assertEqual(account_b.guild_paid_research_total, 1)
+                self.assertEqual(account_b.guild_effective_research_total, 4)
+                self.assertEqual(len(db.list_guild_runs("A")), 1)
+                self.assertEqual(len(db.list_guild_runs("B")), 1)
                 self.assertEqual(db.guild_pool_status()["cooling"], 3)
 
     def test_uncached_target_searches_and_confirms_once(self) -> None:
@@ -775,6 +973,7 @@ class GuildCommandTests(unittest.TestCase):
                 gname="ahhhha",
                 gmname="absdbld",
                 count=1,
+                totalcount=4,
                 db=str(db_path),
             )
             output = io.StringIO()

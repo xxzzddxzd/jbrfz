@@ -187,7 +187,16 @@ def _guild_run_totals(workflows: list[GuildWorkflowResult]) -> dict:
         "free_research_count": sum(
             workflow.free_research_count for workflow in workflows
         ),
+        "free_effective_count": sum(
+            workflow.free_effective_count for workflow in workflows
+        ),
         "donation_count": sum(workflow.paid_research_count for workflow in workflows),
+        "paid_effective_count": sum(
+            workflow.paid_effective_count for workflow in workflows
+        ),
+        "effective_research_count": sum(
+            workflow.effective_research_count for workflow in workflows
+        ),
         "diamond_spent": sum(workflow.diamond_spent for workflow in workflows),
         "guild_experience_gained": summed_change(
             "experience_before",
@@ -202,7 +211,13 @@ def _guild_run_totals(workflows: list[GuildWorkflowResult]) -> dict:
             "research_point_after",
         ),
         "super_success_count": sum(
-            workflow.guild_progress.super_success_count for workflow in workflows
+            workflow.super_success_count for workflow in workflows
+        ),
+        "free_super_success_count": sum(
+            workflow.free_super_success_count for workflow in workflows
+        ),
+        "paid_super_success_count": sum(
+            workflow.paid_super_success_count for workflow in workflows
         ),
     }
 
@@ -310,7 +325,11 @@ def cmd_list(args: argparse.Namespace) -> int:
                 f"{r.mid}\tused={int(r.used)}\tready={int(r.ready)}\tinvalid={int(r.invalid)}\t"
                 f"next={r.next_stage}\tinviter={inv}\t"
                 f"diamonds={r.diamond_balance}\tdaily={_local_timestamp(r.daily)}\t"
-                f"guild={_local_timestamp(r.guild)}\t"
+                f"guild_joined={_local_timestamp(r.guild_joined_at)}\t"
+                f"guild_left={_local_timestamp(r.guild_left_at or r.guild)}\t"
+                f"guild_paid={r.guild_paid_research_total}\t"
+                f"guild_effective={r.guild_effective_research_total}\t"
+                f"guild_crit={r.guild_super_success_total}\t"
                 f"secret={r.guest_secret[:8]}...\temail={r.email}"
             )
     return 0
@@ -765,21 +784,25 @@ def cmd_daily(args: argparse.Namespace) -> int:
 
 
 def cmd_guild(args: argparse.Namespace) -> int:
-    """Run the confirmed guild SOP across cooldown-eligible ready accounts."""
+    """Run guild research until the cross-account effective-count target."""
     gname = str(args.gname or "").strip()
     gmname = str(args.gmname or "").strip()
-    requested = int(args.count)
+    paid_count_per_account = int(args.count)
+    requested_total_count = int(args.totalcount)
     if not gname:
         raise SystemExit("--gname 不能为空")
     if not gmname:
         raise SystemExit("--gmname 不能为空")
-    if requested < 1:
+    if paid_count_per_account < 1:
         raise SystemExit("--count 必须 >= 1")
+    if requested_total_count < 1:
+        raise SystemExit("--totalcount 必须 >= 1")
 
     results: list[dict] = []
     completed = 0
     failures = 0
     attempted = 0
+    effective_total = 0
     target_source = "cache"
     prepared_states: dict[str, AccountState] = {}
     workflows: list[GuildWorkflowResult] = []
@@ -790,10 +813,13 @@ def cmd_guild(args: argparse.Namespace) -> int:
         if not eligible_rows:
             summary = {
                 "ok": True,
-                "requested": requested,
-                "count": 0,
-                "attempted": 0,
-                "failed": 0,
+                "count": paid_count_per_account,
+                "requested_totalcount": requested_total_count,
+                "totalcount": 0,
+                "totalcount_reached": False,
+                "account_count": 0,
+                "accounts_attempted": 0,
+                "accounts_failed": 0,
                 "stopped_reason": "all_accounts_cooling",
                 "guild": {"name": gname, "master_name": gmname},
                 "pool": pool_before,
@@ -826,10 +852,13 @@ def cmd_guild(args: argparse.Namespace) -> int:
             except Exception as error:
                 summary = {
                     "ok": False,
-                    "requested": requested,
-                    "count": 0,
-                    "attempted": 0,
-                    "failed": 1,
+                    "count": paid_count_per_account,
+                    "requested_totalcount": requested_total_count,
+                    "totalcount": 0,
+                    "totalcount_reached": False,
+                    "account_count": 0,
+                    "accounts_attempted": 0,
+                    "accounts_failed": 1,
                     "stopped_reason": "guild_search_failed",
                     "error": f"{type(error).__name__}: {error}",
                     "guild": {"name": gname, "master_name": gmname},
@@ -847,10 +876,13 @@ def cmd_guild(args: argparse.Namespace) -> int:
             if len(matches) != 1:
                 summary = {
                     "ok": False,
-                    "requested": requested,
-                    "count": 0,
-                    "attempted": 0,
-                    "failed": 0,
+                    "count": paid_count_per_account,
+                    "requested_totalcount": requested_total_count,
+                    "totalcount": 0,
+                    "totalcount_reached": False,
+                    "account_count": 0,
+                    "accounts_attempted": 0,
+                    "accounts_failed": 0,
                     "stopped_reason": "guild_target_not_unique",
                     "match_count": len(matches),
                     "search_result_count": len(summaries),
@@ -866,10 +898,13 @@ def cmd_guild(args: argparse.Namespace) -> int:
             if not _confirm_guild(confirmation):
                 summary = {
                     "ok": True,
-                    "requested": requested,
-                    "count": 0,
-                    "attempted": 0,
-                    "failed": 0,
+                    "count": paid_count_per_account,
+                    "requested_totalcount": requested_total_count,
+                    "totalcount": 0,
+                    "totalcount_reached": False,
+                    "account_count": 0,
+                    "accounts_attempted": 0,
+                    "accounts_failed": 0,
                     "stopped_reason": "not_confirmed",
                     "guild": {"name": gname, "master_name": gmname},
                     "pool": pool_before,
@@ -897,7 +932,7 @@ def cmd_guild(args: argparse.Namespace) -> int:
             )
 
         for index, row in enumerate(eligible_rows, start=1):
-            if completed >= requested:
+            if effective_total >= requested_total_count:
                 break
             attempted += 1
             log.info(
@@ -940,12 +975,17 @@ def cmd_guild(args: argparse.Namespace) -> int:
                     runner = GuildRunner(
                         client,
                         session,
+                        paid_research_limit=paid_count_per_account,
+                        total_count_limit=(
+                            requested_total_count - effective_total
+                        ),
                         on_balance=persist_balance,
                         initial_guild_level=target.guild_level,
                         initial_diamond_balance=state.diamond_balance,
                     )
                     workflow = runner.run(target.guild_id)
                     workflows.append(workflow)
+                    effective_total += workflow.effective_research_count
 
                 state.resource_key = session.resource_key
                 if workflow.diamond_balance_final is not None:
@@ -958,10 +998,41 @@ def cmd_guild(args: argparse.Namespace) -> int:
                     note=row.note,
                 )
 
-                item = {"mid": row.mid, **workflow.to_dict()}
-                if workflow.left_guild:
-                    left_at = db.mark_guild_left(row.mid)
-                    item["guild_left_at"] = _local_timestamp(left_at)
+                run_id = db.record_guild_run(
+                    row.mid,
+                    guild_id=target.guild_id,
+                    joined_at=workflow.joined_at,
+                    left_at=workflow.left_at,
+                    free_research_count=workflow.free_research_count,
+                    paid_research_count=workflow.paid_research_count,
+                    free_effective_count=workflow.free_effective_count,
+                    paid_effective_count=workflow.paid_effective_count,
+                    free_super_success_count=(
+                        workflow.free_super_success_count
+                    ),
+                    paid_super_success_count=(
+                        workflow.paid_super_success_count
+                    ),
+                    diamond_spent=workflow.diamond_spent,
+                    stop_reason=workflow.stop_reason,
+                    ok=workflow.ok,
+                    error=workflow.error,
+                )
+                item = {
+                    "mid": row.mid,
+                    "guild_run_id": run_id,
+                    **workflow.to_dict(),
+                    "joined_at_local": (
+                        _local_timestamp(workflow.joined_at)
+                        if workflow.joined_at
+                        else None
+                    ),
+                    "left_at_local": (
+                        _local_timestamp(workflow.left_at)
+                        if workflow.left_at
+                        else None
+                    ),
+                }
 
                 if workflow.guild_detail is not None:
                     details = dict(target.details)
@@ -987,11 +1058,13 @@ def cmd_guild(args: argparse.Namespace) -> int:
                 if workflow.ok:
                     completed += 1
                     log.info(
-                        "[%s] guild SOP complete mid=%s count=%s/%s",
+                        "[%s] guild SOP complete mid=%s accounts=%s "
+                        "totalcount=%s/%s",
                         index,
                         row.mid,
                         completed,
-                        requested,
+                        effective_total,
+                        requested_total_count,
                     )
                 else:
                     failures += 1
@@ -1018,16 +1091,19 @@ def cmd_guild(args: argparse.Namespace) -> int:
 
         pool_after = _guild_pool_payload(db.guild_pool_status())
         stopped_reason = (
-            "count_reached"
-            if completed >= requested
+            "totalcount_reached"
+            if effective_total >= requested_total_count
             else "all_eligible_accounts_attempted"
         )
         summary = {
             "ok": failures == 0,
-            "requested": requested,
-            "count": completed,
-            "attempted": attempted,
-            "failed": failures,
+            "count": paid_count_per_account,
+            "requested_totalcount": requested_total_count,
+            "totalcount": effective_total,
+            "totalcount_reached": effective_total >= requested_total_count,
+            "account_count": completed,
+            "accounts_attempted": attempted,
+            "accounts_failed": failures,
             "stopped_reason": stopped_reason,
             "guild": {
                 "name": gname,
@@ -1075,7 +1151,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("guild", help="批量执行公会签到、研究、捐赠、退出")
     sp.add_argument("--gname", required=True, help="公会名称")
     sp.add_argument("--gmname", required=True, help="会长名称")
-    sp.add_argument("--count", required=True, type=int, help="成功执行的账号数量")
+    sp.add_argument(
+        "--count",
+        required=True,
+        type=int,
+        help="每个账号最多执行的钻石捐赠次数",
+    )
+    sp.add_argument(
+        "--totalcount",
+        required=True,
+        type=int,
+        help="跨账号免费+钻石研究的有效总次数；暴击按实际倍率计数",
+    )
     sp.add_argument("--db", default=str(DEFAULT_DB), help="sqlite 路径")
     sp.set_defaults(func=cmd_guild)
 

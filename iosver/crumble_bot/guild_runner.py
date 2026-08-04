@@ -125,13 +125,20 @@ class GuildProgress:
 @dataclass
 class GuildWorkflowResult:
     joined: bool = False
+    joined_at: Optional[float] = None
     attendance_claimed: bool = False
     free_research_count: int = 0
+    free_effective_count: int = 0
+    free_super_success_count: int = 0
     paid_research_count: int = 0
+    paid_effective_count: int = 0
+    paid_super_success_count: int = 0
     diamond_balance_before_paid: Optional[int] = None
     diamond_spent: int = 0
     diamond_balance_final: Optional[int] = None
     left_guild: bool = False
+    left_at: Optional[float] = None
+    stop_reason: str = ""
     paid_stop_status: Optional[int] = None
     paid_stop_message: str = ""
     error: str = ""
@@ -143,16 +150,24 @@ class GuildWorkflowResult:
         return bool(
             self.joined
             and self.attendance_claimed
-            and self.free_research_count == 3
             and self.left_guild
             and self.diamond_balance_final is not None
-            and self.paid_stop_status == 9
             and not self.error
         )
+
+    @property
+    def effective_research_count(self) -> int:
+        return self.free_effective_count + self.paid_effective_count
+
+    @property
+    def super_success_count(self) -> int:
+        return self.free_super_success_count + self.paid_super_success_count
 
     def to_dict(self) -> dict:
         payload = asdict(self)
         payload["donation_count"] = self.paid_research_count
+        payload["effective_research_count"] = self.effective_research_count
+        payload["super_success_count"] = self.super_success_count
         payload["guild_progress"] = self.guild_progress.to_dict()
         return {"ok": self.ok, **payload}
 
@@ -166,7 +181,8 @@ class GuildRunner:
         session: Session,
         *,
         free_research_count: int = 3,
-        paid_guard: int = 100,
+        paid_research_limit: int = 100,
+        total_count_limit: Optional[int] = None,
         sleep_seconds: float = 0.15,
         on_balance: Optional[Callable[[int], None]] = None,
         initial_guild_level: Optional[int] = None,
@@ -175,7 +191,12 @@ class GuildRunner:
         self.client = client
         self.session = session
         self.free_research_count = max(0, int(free_research_count))
-        self.paid_guard = max(1, int(paid_guard))
+        self.paid_research_limit = max(0, int(paid_research_limit))
+        self.total_count_limit = (
+            None
+            if total_count_limit is None
+            else max(0, int(total_count_limit))
+        )
         self.sleep_seconds = max(0.0, float(sleep_seconds))
         self.on_balance = on_balance
         self.initial_guild_level = (
@@ -202,6 +223,7 @@ class GuildRunner:
             join_response = guild.join_guild(guild_id)
             joined = True
             result.joined = True
+            result.joined_at = time.time()
             result.guild_progress.observe_action(
                 parse_join_guild_response(join_response.message),
                 initial=True,
@@ -228,69 +250,103 @@ class GuildRunner:
             log.info("attendance reward claimed")
 
             for index in range(1, self.free_research_count + 1):
+                if self._total_count_reached(result):
+                    result.stop_reason = "total_count_reached"
+                    break
                 response = guild.conduct_free_guild_lab_research(guild_id)
-                result.guild_progress.observe_action(
-                    parse_free_guild_lab_research_response(response.message)
+                action = parse_free_guild_lab_research_response(response.message)
+                result.guild_progress.observe_action(action)
+                effective_count = self._record_research_result(
+                    result,
+                    action,
+                    paid=False,
                 )
                 result.free_research_count = index
-                log.info("free guild research %s/%s", index, self.free_research_count)
+                log.info(
+                    "free guild research %s/%s effective=%s total_effective=%s",
+                    index,
+                    self.free_research_count,
+                    effective_count,
+                    result.effective_research_count,
+                )
                 self._sleep()
 
             result.diamond_balance_before_paid = balance
             log.info("persisted diamond balance before paid research=%s", balance)
 
-            for index in range(1, self.paid_guard + 1):
-                try:
-                    response = guild.conduct_paid_guild_lab_research(guild_id)
-                except GrpcError as error:
-                    if self._is_insufficient_diamonds(error):
-                        result.paid_stop_status = error.status
-                        result.paid_stop_message = error.message
-                        owned_amount = self._owned_amount(error)
-                        if owned_amount is None:
-                            raise RuntimeError(
-                                "insufficient-diamond response missing owned amount"
-                            ) from error
-                        balance = owned_amount
-                        result.diamond_balance_before_paid = (
-                            owned_amount + result.diamond_spent
-                        )
-                        result.diamond_balance_final = owned_amount
-                        self._notify_balance(owned_amount)
-                        log.info(
-                            "paid research exhausted usable diamonds: %s", error.message
-                        )
+            if not self._total_count_reached(result):
+                for index in range(1, self.paid_research_limit + 1):
+                    if self._total_count_reached(result):
+                        result.stop_reason = "total_count_reached"
                         break
-                    raise
+                    try:
+                        response = guild.conduct_paid_guild_lab_research(guild_id)
+                    except GrpcError as error:
+                        if self._is_insufficient_diamonds(error):
+                            result.stop_reason = "insufficient_diamonds"
+                            result.paid_stop_status = error.status
+                            result.paid_stop_message = error.message
+                            owned_amount = self._owned_amount(error)
+                            if owned_amount is None:
+                                raise RuntimeError(
+                                    "insufficient-diamond response missing owned amount"
+                                ) from error
+                            balance = owned_amount
+                            result.diamond_balance_before_paid = (
+                                owned_amount + result.diamond_spent
+                            )
+                            result.diamond_balance_final = owned_amount
+                            self._notify_balance(owned_amount)
+                            log.info(
+                                "paid research exhausted usable diamonds: %s",
+                                error.message,
+                            )
+                            break
+                        raise
 
-                result.guild_progress.observe_action(
-                    parse_paid_guild_lab_research_response(response.message)
-                )
-                charged = sum(
-                    payment.amount
-                    for payment in parse_currency_payments(response.message)
-                    if payment.data_id == DIAMOND_CURRENCY_DATA_ID
-                )
-                if charged <= 0:
-                    raise RuntimeError(
-                        f"paid guild research {index} returned no diamond payment"
+                    action = parse_paid_guild_lab_research_response(response.message)
+                    charged = sum(
+                        payment.amount
+                        for payment in parse_currency_payments(response.message)
+                        if payment.data_id == DIAMOND_CURRENCY_DATA_ID
                     )
-                result.paid_research_count = index
-                result.diamond_spent += charged
-                if balance is not None:
-                    balance = max(0, balance - charged)
-                    self._notify_balance(balance)
-                log.info(
-                    "paid guild research %s charged=%s estimated_balance=%s",
-                    index,
-                    charged,
-                    balance,
-                )
-                self._sleep()
+                    if charged <= 0:
+                        raise RuntimeError(
+                            f"paid guild research {index} returned no diamond payment"
+                        )
+                    result.guild_progress.observe_action(action)
+                    effective_count = self._record_research_result(
+                        result,
+                        action,
+                        paid=True,
+                    )
+                    result.paid_research_count = index
+                    result.diamond_spent += charged
+                    if balance is not None:
+                        balance = max(0, balance - charged)
+                        self._notify_balance(balance)
+                    log.info(
+                        "paid guild research %s/%s charged=%s effective=%s "
+                        "total_effective=%s estimated_balance=%s",
+                        index,
+                        self.paid_research_limit,
+                        charged,
+                        effective_count,
+                        result.effective_research_count,
+                        balance,
+                    )
+                    self._sleep()
+                else:
+                    result.stop_reason = (
+                        "total_count_reached"
+                        if self._total_count_reached(result)
+                        else "paid_count_reached"
+                    )
             else:
-                raise RuntimeError(
-                    f"paid research safety guard reached ({self.paid_guard})"
-                )
+                result.stop_reason = "total_count_reached"
+
+            if result.diamond_balance_final is None:
+                result.diamond_balance_final = balance
 
         except Exception as error:
             result.error = f"{type(error).__name__}: {error}"
@@ -311,6 +367,7 @@ class GuildRunner:
                 try:
                     guild.leave_guild(guild_id)
                     result.left_guild = True
+                    result.left_at = time.time()
                     log.info("left guild")
                 except Exception as error:
                     self._append_error(
@@ -327,6 +384,42 @@ class GuildRunner:
     def _sleep(self) -> None:
         if self.sleep_seconds > 0:
             time.sleep(self.sleep_seconds)
+
+    def _total_count_reached(self, result: GuildWorkflowResult) -> bool:
+        return bool(
+            self.total_count_limit is not None
+            and result.effective_research_count >= self.total_count_limit
+        )
+
+    @staticmethod
+    def _record_research_result(
+        result: GuildWorkflowResult,
+        action: GuildActionResult,
+        *,
+        paid: bool,
+    ) -> int:
+        effective_count = GuildRunner._effective_research_count(action)
+        if paid:
+            result.paid_effective_count += effective_count
+            if action.is_super_success:
+                result.paid_super_success_count += 1
+        else:
+            result.free_effective_count += effective_count
+            if action.is_super_success:
+                result.free_super_success_count += 1
+        return effective_count
+
+    @staticmethod
+    def _effective_research_count(action: GuildActionResult) -> int:
+        progression = action.progression
+        if progression is not None:
+            contribution_gained = (
+                progression.current_contribution
+                - progression.previous_contribution
+            )
+            if contribution_gained > 0:
+                return int(contribution_gained)
+        return 3 if action.is_super_success else 1
 
     @staticmethod
     def _is_insufficient_diamonds(error: GrpcError) -> bool:
