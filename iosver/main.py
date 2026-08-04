@@ -5,7 +5,8 @@
   ./main.py gen 5
   ./main.py inv GNWPX5251 -c 3
   ./main.py daily
-  ./main.py guild --gname ahhhha --gmname absdbld --count 20 --totalcount 200
+  ./main.py guild public --gname ahhhha --gmname absdbld --count 20 --totalcount 200
+  ./main.py guild private --gname ahhhha --gmname absdbld --master-mid RTHLZ8967 --count 20 --totalcount 200
   ./main.py list --unused --ready
 """
 from __future__ import annotations

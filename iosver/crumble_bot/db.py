@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS guild_targets (
     guild_level INTEGER NOT NULL DEFAULT 0,
     member_count INTEGER NOT NULL DEFAULT 0,
     master_user_id TEXT NOT NULL DEFAULT '',
+    original_master_mid TEXT NOT NULL DEFAULT '',
     details_json TEXT NOT NULL DEFAULT '{}',
     confirmed_at REAL NOT NULL,
     updated_at REAL NOT NULL,
@@ -85,6 +86,44 @@ CREATE TABLE IF NOT EXISTS guild_runs (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_guild_runs_mid ON guild_runs(mid, id);
+
+CREATE TABLE IF NOT EXISTS guild_private_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    gname TEXT NOT NULL,
+    gmname TEXT NOT NULL,
+    original_master_mid TEXT NOT NULL DEFAULT '',
+    controller_mid TEXT NOT NULL,
+    application_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'created',
+    paid_count_per_account INTEGER NOT NULL DEFAULT 0,
+    total_count_limit INTEGER NOT NULL DEFAULT 0,
+    effective_count INTEGER NOT NULL DEFAULT 0,
+    master_acquired_at REAL NOT NULL DEFAULT 0,
+    completed_at REAL NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_guild_private_jobs_active
+ON guild_private_jobs(guild_id, controller_mid, status, id);
+
+CREATE TABLE IF NOT EXISTS guild_private_accounts (
+    job_id INTEGER NOT NULL,
+    mid TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'selected',
+    invitation_id TEXT NOT NULL DEFAULT '',
+    member_state_json TEXT NOT NULL DEFAULT '{}',
+    invited_at REAL NOT NULL DEFAULT 0,
+    accepted_at REAL NOT NULL DEFAULT 0,
+    left_at REAL NOT NULL DEFAULT 0,
+    guild_run_id INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (job_id, mid)
+);
+CREATE INDEX IF NOT EXISTS idx_guild_private_accounts_state
+ON guild_private_accounts(job_id, state, mid);
 """
 
 
@@ -145,8 +184,29 @@ class GuildTargetRow:
     guild_level: int
     member_count: int
     master_user_id: str
+    original_master_mid: str
     details: Dict[str, Any]
     confirmed_at: float
+    updated_at: float
+
+
+@dataclass(frozen=True)
+class GuildPrivateJobRow:
+    id: int
+    guild_id: str
+    gname: str
+    gmname: str
+    original_master_mid: str
+    controller_mid: str
+    application_id: str
+    status: str
+    paid_count_per_account: int
+    total_count_limit: int
+    effective_count: int
+    master_acquired_at: float
+    completed_at: float
+    error: str
+    created_at: float
     updated_at: float
 
 
@@ -193,6 +253,38 @@ class AccountDB:
                 self._conn.execute(
                     f"ALTER TABLE accounts ADD COLUMN {column} {definition}"
                 )
+        guild_target_cols = {
+            r[1]
+            for r in self._conn.execute(
+                "PRAGMA table_info(guild_targets)"
+            ).fetchall()
+        }
+        if "original_master_mid" not in guild_target_cols:
+            self._conn.execute(
+                "ALTER TABLE guild_targets ADD COLUMN "
+                "original_master_mid TEXT NOT NULL DEFAULT ''"
+            )
+        self._conn.execute(
+            """
+            UPDATE guild_targets
+            SET original_master_mid=master_user_id
+            WHERE original_master_mid='' AND master_user_id<>''
+            """
+        )
+        private_account_cols = {
+            r[1]
+            for r in self._conn.execute(
+                "PRAGMA table_info(guild_private_accounts)"
+            ).fetchall()
+        }
+        if (
+            private_account_cols
+            and "member_state_json" not in private_account_cols
+        ):
+            self._conn.execute(
+                "ALTER TABLE guild_private_accounts ADD COLUMN "
+                "member_state_json TEXT NOT NULL DEFAULT '{}'"
+            )
         self._conn.execute(
             """
             UPDATE accounts
@@ -365,6 +457,7 @@ class AccountDB:
             """
             SELECT * FROM accounts
             WHERE ready=1 AND invalid=0 AND next_stage>30
+              AND guild_joined_at<=guild_left_at
               AND (guild<=0 OR guild<=?)
             ORDER BY
               CASE WHEN guild<=0 THEN 0 ELSE 1 END,
@@ -449,6 +542,7 @@ class AccountDB:
             """
             SELECT COUNT(*) FROM accounts
             WHERE ready=1 AND invalid=0 AND next_stage>30
+              AND guild_joined_at<=guild_left_at
               AND (guild<=0 OR guild<=?)
             """,
             (cutoff,),
@@ -456,24 +550,55 @@ class AccountDB:
         cooling = self._conn.execute(
             """
             SELECT COUNT(*) FROM accounts
-            WHERE ready=1 AND invalid=0 AND next_stage>30 AND guild>?
+            WHERE ready=1 AND invalid=0 AND next_stage>30
+              AND guild_joined_at<=guild_left_at AND guild>?
             """,
             (cutoff,),
         ).fetchone()[0]
         next_row = self._conn.execute(
             """
             SELECT MIN(guild + ?) FROM accounts
-            WHERE ready=1 AND invalid=0 AND next_stage>30 AND guild>?
+            WHERE ready=1 AND invalid=0 AND next_stage>30
+              AND guild_joined_at<=guild_left_at AND guild>?
             """,
             (max(0, int(cooldown_seconds)), cutoff),
         ).fetchone()
         return {
             "eligible": int(eligible),
             "cooling": int(cooling),
+            "currently_joined": int(
+                self._conn.execute(
+                    """
+                    SELECT COUNT(*) FROM accounts
+                    WHERE ready=1 AND invalid=0 AND next_stage>30
+                      AND guild_joined_at>guild_left_at
+                    """
+                ).fetchone()[0]
+            ),
             "next_available_at": float(next_row[0])
             if next_row and next_row[0]
             else None,
         }
+
+    def mark_guild_joined(
+        self,
+        mid: str,
+        guild_id: str,
+        *,
+        joined_at: Optional[float] = None,
+    ) -> float:
+        """Record an accepted/joined membership without starting exit cooldown."""
+        timestamp = time.time() if joined_at is None else float(joined_at)
+        self._conn.execute(
+            """
+            UPDATE accounts
+            SET guild_last_id=?, guild_joined_at=?, updated_at=?
+            WHERE mid=?
+            """,
+            (guild_id, timestamp, timestamp, mid),
+        )
+        self._conn.commit()
+        return timestamp
 
     def mark_guild_left(self, mid: str, *, left_at: Optional[float] = None) -> float:
         timestamp = time.time() if left_at is None else float(left_at)
@@ -616,6 +741,7 @@ class AccountDB:
         guild_level: int = 0,
         member_count: int = 0,
         master_user_id: str = "",
+        original_master_mid: str = "",
         details: Optional[Dict[str, Any]] = None,
     ) -> GuildTargetRow:
         now = time.time()
@@ -623,13 +749,19 @@ class AccountDB:
             """
             INSERT INTO guild_targets (
                 gname, gmname, guild_id, guild_level, member_count,
-                master_user_id, details_json, confirmed_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                master_user_id, original_master_mid, details_json,
+                confirmed_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(gname, gmname) DO UPDATE SET
                 guild_id=excluded.guild_id,
                 guild_level=excluded.guild_level,
                 member_count=excluded.member_count,
                 master_user_id=excluded.master_user_id,
+                original_master_mid=CASE
+                    WHEN guild_targets.original_master_mid<>''
+                    THEN guild_targets.original_master_mid
+                    ELSE excluded.original_master_mid
+                END,
                 details_json=excluded.details_json,
                 updated_at=excluded.updated_at
             """,
@@ -640,6 +772,7 @@ class AccountDB:
                 max(0, int(guild_level)),
                 max(0, int(member_count)),
                 master_user_id,
+                original_master_mid or master_user_id,
                 json.dumps(details or {}, ensure_ascii=False),
                 now,
                 now,
@@ -650,6 +783,186 @@ class AccountDB:
         if row is None:
             raise RuntimeError("failed to persist guild target")
         return row
+
+    def get_private_job(self, job_id: int) -> Optional[GuildPrivateJobRow]:
+        row = self._conn.execute(
+            "SELECT * FROM guild_private_jobs WHERE id=?",
+            (int(job_id),),
+        ).fetchone()
+        return self._private_job_row(row) if row else None
+
+    def get_active_private_job(
+        self,
+        guild_id: str,
+        controller_mid: str,
+    ) -> Optional[GuildPrivateJobRow]:
+        row = self._conn.execute(
+            """
+            SELECT * FROM guild_private_jobs
+            WHERE guild_id=? AND controller_mid=?
+              AND status NOT IN ('complete', 'cancelled')
+            ORDER BY id DESC LIMIT 1
+            """,
+            (guild_id, controller_mid),
+        ).fetchone()
+        return self._private_job_row(row) if row else None
+
+    def create_private_job(
+        self,
+        *,
+        guild_id: str,
+        gname: str,
+        gmname: str,
+        original_master_mid: str,
+        controller_mid: str,
+        paid_count_per_account: int,
+        total_count_limit: int,
+    ) -> GuildPrivateJobRow:
+        existing = self.get_active_private_job(guild_id, controller_mid)
+        if existing is not None:
+            return existing
+        now = time.time()
+        cursor = self._conn.execute(
+            """
+            INSERT INTO guild_private_jobs (
+                guild_id, gname, gmname, original_master_mid, controller_mid,
+                paid_count_per_account, total_count_limit,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                guild_id,
+                gname,
+                gmname,
+                original_master_mid,
+                controller_mid,
+                max(0, int(paid_count_per_account)),
+                max(0, int(total_count_limit)),
+                now,
+                now,
+            ),
+        )
+        self._conn.commit()
+        job = self.get_private_job(int(cursor.lastrowid))
+        if job is None:
+            raise RuntimeError("failed to create private guild job")
+        return job
+
+    def update_private_job(self, job_id: int, **changes: Any) -> GuildPrivateJobRow:
+        allowed = {
+            "application_id",
+            "status",
+            "effective_count",
+            "master_acquired_at",
+            "completed_at",
+            "error",
+        }
+        fields = {key: value for key, value in changes.items() if key in allowed}
+        if not fields:
+            job = self.get_private_job(job_id)
+            if job is None:
+                raise KeyError(f"private guild job not found: {job_id}")
+            return job
+        fields["updated_at"] = time.time()
+        assignments = ", ".join(f"{key}=?" for key in fields)
+        values = list(fields.values()) + [int(job_id)]
+        self._conn.execute(
+            f"UPDATE guild_private_jobs SET {assignments} WHERE id=?",
+            values,
+        )
+        self._conn.commit()
+        job = self.get_private_job(job_id)
+        if job is None:
+            raise KeyError(f"private guild job not found: {job_id}")
+        return job
+
+    def reserve_private_account(self, job_id: int, mid: str) -> Dict[str, Any]:
+        now = time.time()
+        self._conn.execute(
+            """
+            INSERT INTO guild_private_accounts (job_id, mid, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(job_id, mid) DO NOTHING
+            """,
+            (int(job_id), mid, now),
+        )
+        self._conn.commit()
+        row = self.get_private_account(job_id, mid)
+        if row is None:
+            raise RuntimeError("failed to reserve private guild account")
+        return row
+
+    def get_private_account(
+        self,
+        job_id: int,
+        mid: str,
+    ) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT * FROM guild_private_accounts WHERE job_id=? AND mid=?",
+            (int(job_id), mid),
+        ).fetchone()
+        return self._private_account_dict(row) if row else None
+
+    def list_private_accounts(self, job_id: int) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT * FROM guild_private_accounts
+            WHERE job_id=? ORDER BY updated_at, mid
+            """,
+            (int(job_id),),
+        )
+        return [self._private_account_dict(row) for row in rows]
+
+    def update_private_account(
+        self,
+        job_id: int,
+        mid: str,
+        **changes: Any,
+    ) -> Dict[str, Any]:
+        self.reserve_private_account(job_id, mid)
+        allowed = {
+            "state",
+            "invitation_id",
+            "member_state_json",
+            "invited_at",
+            "accepted_at",
+            "left_at",
+            "guild_run_id",
+            "error",
+        }
+        fields = {key: value for key, value in changes.items() if key in allowed}
+        if "member_state" in changes:
+            fields["member_state_json"] = json.dumps(
+                changes["member_state"] or {},
+                ensure_ascii=False,
+            )
+        fields["updated_at"] = time.time()
+        assignments = ", ".join(f"{key}=?" for key in fields)
+        values = list(fields.values()) + [int(job_id), mid]
+        self._conn.execute(
+            f"""
+            UPDATE guild_private_accounts SET {assignments}
+            WHERE job_id=? AND mid=?
+            """,
+            values,
+        )
+        self._conn.commit()
+        row = self.get_private_account(job_id, mid)
+        if row is None:
+            raise RuntimeError("failed to update private guild account")
+        return row
+
+    def active_private_account_mids(self) -> set[str]:
+        rows = self._conn.execute(
+            """
+            SELECT DISTINCT a.mid
+            FROM guild_private_accounts AS a
+            JOIN guild_private_jobs AS j ON j.id=a.job_id
+            WHERE j.status NOT IN ('complete', 'cancelled')
+              AND a.state NOT IN ('complete', 'failed')
+            """
+        )
+        return {str(row[0]) for row in rows}
 
     def get(self, mid: str) -> Optional[AccountRow]:
         cur = self._conn.execute("SELECT * FROM accounts WHERE mid=?", (mid,))
@@ -776,7 +1089,45 @@ class AccountDB:
             guild_level=int(row["guild_level"] or 0),
             member_count=int(row["member_count"] or 0),
             master_user_id=row["master_user_id"] or "",
+            original_master_mid=(
+                row["original_master_mid"] or ""
+                if "original_master_mid" in row.keys()
+                else row["master_user_id"] or ""
+            ),
             details=details if isinstance(details, dict) else {},
             confirmed_at=float(row["confirmed_at"] or 0),
             updated_at=float(row["updated_at"] or 0),
         )
+
+    @staticmethod
+    def _private_job_row(row: sqlite3.Row) -> GuildPrivateJobRow:
+        return GuildPrivateJobRow(
+            id=int(row["id"]),
+            guild_id=row["guild_id"] or "",
+            gname=row["gname"] or "",
+            gmname=row["gmname"] or "",
+            original_master_mid=row["original_master_mid"] or "",
+            controller_mid=row["controller_mid"] or "",
+            application_id=row["application_id"] or "",
+            status=row["status"] or "",
+            paid_count_per_account=int(row["paid_count_per_account"] or 0),
+            total_count_limit=int(row["total_count_limit"] or 0),
+            effective_count=int(row["effective_count"] or 0),
+            master_acquired_at=float(row["master_acquired_at"] or 0),
+            completed_at=float(row["completed_at"] or 0),
+            error=row["error"] or "",
+            created_at=float(row["created_at"] or 0),
+            updated_at=float(row["updated_at"] or 0),
+        )
+
+    @staticmethod
+    def _private_account_dict(row: sqlite3.Row) -> Dict[str, Any]:
+        payload = dict(row)
+        try:
+            member_state = json.loads(payload.pop("member_state_json") or "{}")
+        except Exception:
+            member_state = {}
+        payload["member_state"] = (
+            member_state if isinstance(member_state, dict) else {}
+        )
+        return payload

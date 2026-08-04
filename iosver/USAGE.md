@@ -41,7 +41,8 @@ python3 -m venv .venv
 gen [n]           建号 + 推 1-30 + 入 sqlite（不邀请）
 inv 目标 [-c N]   取未使用号登录并邀请
 daily            批量执行每日登录、邮箱领取和邮箱广告
-guild             批量执行公会签到、研究、捐赠并退出
+guild public      公开公会：直接加入后批量签到、研究、捐赠并退出
+guild private     审批公会：等待临时会长、邀请账号入会捐赠并退出
 list              查看号池
 ```
 
@@ -49,7 +50,9 @@ list              查看号池
 ./main.py gen 10
 ./main.py inv GNWPX5251 -c 3
 ./main.py daily
-./main.py guild --gname 'ahhhha' --gmname 'absdbld' --count 20 --totalcount 200
+./main.py guild public --gname 'ahhhha' --gmname 'absdbld' --count 20 --totalcount 200
+./main.py guild private --gname 'ahhhha' --gmname 'absdbld' \
+  --master-mid RTHLZ8967 --count 20 --totalcount 200
 ./main.py list --unused --ready
 ```
 
@@ -99,10 +102,10 @@ SOP：重新登录 → `SignUp` 每日登录同步 → 查看邮箱并全部领�
 - 广告领取使用 `CrumbleService/ReceiveMailAdvertisementReward`。成员函数暴露 `advertisement_data_id` 和可选 `skip_count`；SOP 按正常客户端行为不发送 `skip_count`。
 - 最新资源密钥、登录令牌和钻石余额会回写 SQLite。`totals` 汇总登录、普通邮件、广告及钻石变化。
 
-### `guild`
+### `guild public`
 
 ```bash
-./main.py guild --gname 'ahhhha' --gmname 'absdbld' --count 20 --totalcount 200
+./main.py guild public --gname 'ahhhha' --gmname 'absdbld' --count 20 --totalcount 200
 ```
 
 | 参数 | 必填 | 说明 |
@@ -113,10 +116,14 @@ SOP：重新登录 → `SignUp` 每日登录同步 → 查看邮箱并全部领�
 | `--totalcount` | **是** | 跨账号累计的免费+付费有效研究次数 |
 | `--db` | 否 | sqlite，默认 `data/accounts.db` |
 
-SOP：登录鉴权 → 加入 → 领取公会签到奖励 → 免费研究默认 3 次 → 最多执行 `--count` 次钻石捐赠 → 读取公会变化 → 退出。
+SOP：登录鉴权 → 直接加入公开公会 → 领取公会签到奖励 → 动态执行当前公会等级剩余的免费研究 → 最多执行 `--count` 次钻石捐赠 → 读取公会变化 → 退出。
 
+- 仅接受搜索结果 `join_method=immediate` 的公开公会；审批制公会会停止并提示使用 `guild private`。
 - 账号必须 `ready=1`、`next_stage>30`、`invalid=0`；`used` 不影响选择。
 - 普通研究按 1 次计入 `--totalcount`；暴击按服务端返回的实际贡献增量计，当前一次暴击按 3 次计。
+- 10101 的免费研究上限由公会等级决定：1–3 级 3 次、4–6 级 4 次、7–9 级 5 次、10–11 级 6 次、12–13 级 7 次、14–15 级 8 次。
+- 每次免费或钻石研究后都读取服务端返回的公会等级和今日已用次数；若本次研究使公会升级并新增免费次数，会先把新增的免费次数用完，再继续钻石捐赠。
+- 钻石捐赠没有从 10101 客户端发现固定每日次数上限；27 是价格表最后一档而不是次数上限，第 27 次及以后均按 10000 钻石。实际钻石 RPC 次数仍只由 `--count` 限制。
 - 每次动作完成后检查全局有效次数，达到 `--totalcount` 后立即停止当前账号的后续研究并退出；由于暴击结果在响应后才知道，最终值最多可能超过目标一个暴击带来的增量差。
 - 单个账号钻石不足时会提前停止其付费捐赠、退出公会并继续下一个可用账号。
 - 所有账号累计达到 `--totalcount` 或可用账号全部尝试完后结束。
@@ -125,10 +132,39 @@ SOP：登录鉴权 → 加入 → 领取公会签到奖励 → 免费研究默�
 - 确认结果写入 `guild_targets`；相同公会名和会长名后续直接复用 `guild_id`。
 - 最终 JSON 的 `count` 是每账号付费上限，`requested_totalcount` 是目标，`totalcount` 是实际累计有效次数，`account_count` 是成功完成流程的账号数。
 - `totals.free_research_count` 与 `totals.donation_count` 是实际 RPC 动作数；`totals.effective_research_count` 包含暴击倍率；`totals.diamond_spent` 是总钻石消耗。
-- 每个账号的 `guild_progress` 记录公会等级、经验、成员贡献、研究点和每日研究次数的前后值及增量；退出前会再次读取公会详情。
+- 每个账号的 `guild_progress` 记录公会等级、经验、成员贡献、研究点、免费上限/已用/剩余次数、今日钻石捐赠次数及下一次钻石价格；退出前会再次读取公会详情。
 - 顶层 `guild.level_before/after/change` 和 `experience_before/after/gained` 汇总整个批次的公会变化。
 - `guild` 只做登录鉴权，不执行 `SignUp` 每日同步，也不调用邮箱附件或广告奖励接口；这些动作只属于 `daily`。
 - 捐赠停止响应中的 `Owned amount` 用于记录最终钻石，并以“最终钻石 + 本次消耗”计算捐赠前余额后回写 SQLite。
+
+#### `guild private`
+
+```bash
+./main.py guild private \
+  --gname 'ahhhha' --gmname 'absdbld' \
+  --master-mid RTHLZ8967 \
+  --count 20 --totalcount 200
+```
+
+| 参数 | 必填 | 默认 | 说明 |
+|------|------|------|------|
+| `--gname` | **是** | — | 公会名称 |
+| `--gmname` | **是** | — | 首次确认时的原会长名称 |
+| `--master-mid` | **是** | — | 临时接管会长并负责发送邀请的自控账号 A |
+| `--count` | **是** | — | 每个 B 最多执行的钻石捐赠次数 |
+| `--totalcount` | **是** | — | 所有 B 的免费+付费有效研究总目标 |
+| `--wait-timeout` | 否 | `300` | 单阶段等待人工审批或转让的秒数；`0` 只检查一次 |
+| `--poll-interval` | 否 | `5` | 等待期间的轮询间隔秒数 |
+| `--db` | 否 | `data/accounts.db` | sqlite |
+
+状态流程：A 发送入会申请 → 等待原会长人工审批 → 等待原会长人工将会长转给 A → A 逐个邀请 B → B 接受邀请后直接入会 → 复用与 public 相同的签到/研究/捐赠/退出 SOP。
+
+- 每次只邀请并处理一个 B，退出后才处理下一个，避免占满公会或遗留批量邀请。
+- `--count`、`--totalcount`、暴击计数、动态免费次数和钻石统计与 public 完全一致。
+- 等待超时不是失败；任务状态保存在 SQLite，再次执行相同命令会从申请、转让或账号步骤继续。
+- private 批次结束后状态为 `awaiting_master_return`，JSON 会输出 `original_master_mid`。程序**不会自动交还会长**，需要手动执行；再次运行相同命令会验证交还结果并将任务标记为完成。
+- A 只负责审批流程和邀请，不参与捐赠，也不会自动退出公会。
+- `TransferGuildMaster`、`ApplyGuild`、邀请和接受邀请等接口均作为 `Guild` 成员函数提供，由 private 流程内部调用，不单独暴露 CLI 命令；private 不自动调用最终交还委任。
 
 ### `list`
 
@@ -163,11 +199,13 @@ SOP：登录鉴权 → 加入 → 领取公会签到奖励 → 免费研究默�
 | `guild_diamond_spent_total` | 历史公会捐赠钻石消耗 |
 | `daily` | 最近一次成功完成 daily SOP 的 Unix 时间；用于当天去重 |
 
-`guild_targets` 保存已确认的 `gname + gmname → guild_id` 及公会摘要，避免多账号和后续运行重复搜索、重复确认。
+`guild_targets` 保存已确认的 `gname + gmname → guild_id` 及公会摘要，避免多账号和后续运行重复搜索、重复确认。`original_master_mid` 在首次确认时固定记录原会长 MID，后续会长变化不会覆盖。
 
 `guild_runs` 为每次账号公会流程保存一条历史，包括加入/退出时间、免费/付费动作数、免费/付费有效次数、暴击次数、钻石消耗、停止原因及错误。
 
-兼容旧版 sqlite：执行 `daily`、`guild` 或其他打开账号库的指令时会自动、幂等地补齐上述字段并创建 `guild_targets`、`guild_runs`，已有账号和状态数据保持不变。
+`guild_private_jobs` 保存审批、等待临时会长、批量执行和等待手动交还等可恢复状态；`guild_private_accounts` 保存每个 B 的邀请 ID、接受状态和对应 `guild_run_id`。
+
+兼容旧版 sqlite：执行 `daily`、`guild` 或其他打开账号库的指令时会自动、幂等地补齐上述字段并创建 `guild_targets`、`guild_runs`、`guild_private_jobs`、`guild_private_accounts`，已有账号和状态数据保持不变。
 
 ---
 

@@ -10,19 +10,26 @@ from . import pbutil as pb
 from .grpc_client import GrpcClient, GrpcResponse
 from .headers import Session, build_metadata
 from .messages import (
+    accept_guild_invitation_request,
+    apply_guild_request,
     attend_guild_request,
     conduct_free_guild_lab_research_request,
     conduct_paid_guild_lab_research_request,
+    get_guild_applications_for_user_request,
+    get_guild_invitations_for_user_request,
     get_guild_request,
+    invite_user_to_guild_request,
     join_guild_request,
     leave_guild_request,
     search_guilds_request,
+    transfer_guild_master_request,
 )
 
 log = logging.getLogger(__name__)
 
 SEARCH_GUILDS_PATH = "/cc.public.game.GuildDiscoveryService/SearchGuilds"
 JOIN_GUILD_PATH = "/cc.public.game.GuildDiscoveryService/JoinGuild"
+APPLY_GUILD_PATH = "/cc.public.game.GuildDiscoveryService/ApplyGuild"
 LEAVE_GUILD_PATH = "/cc.public.game.GuildMemberService/LeaveGuild"
 GET_GUILD_PATH = "/cc.public.game.GuildMemberService/GetGuild"
 CONDUCT_FREE_GUILD_LAB_RESEARCH_PATH = (
@@ -32,6 +39,21 @@ CONDUCT_PAID_GUILD_LAB_RESEARCH_PATH = (
     "/cc.public.game.GuildMemberService/ConductPaidGuildLabResearch"
 )
 ATTEND_GUILD_PATH = "/cc.public.game.GuildMemberService/AttendGuild"
+INVITE_USER_TO_GUILD_PATH = (
+    "/cc.public.game.GuildMemberService/InviteUserToGuild"
+)
+GET_GUILD_INVITATIONS_FOR_USER_PATH = (
+    "/cc.public.game.GuildDiscoveryService/GetGuildInvitationsForUser"
+)
+ACCEPT_GUILD_INVITATION_PATH = (
+    "/cc.public.game.GuildDiscoveryService/AcceptGuildInvitation"
+)
+GET_GUILD_APPLICATIONS_FOR_USER_PATH = (
+    "/cc.public.game.GuildDiscoveryService/GetGuildApplicationsForUser"
+)
+TRANSFER_GUILD_MASTER_PATH = (
+    "/cc.public.game.GuildMemberService/TransferGuildMaster"
+)
 
 GuildIdRequestBuilder = Callable[[str], bytes]
 
@@ -57,6 +79,20 @@ class GuildSearchSummary:
 
 
 @dataclass(frozen=True)
+class GuildInvitationSummary:
+    invitation_id: str
+    invited_at_millis: int
+    guild: GuildSearchSummary
+
+
+@dataclass(frozen=True)
+class GuildApplicationSummary:
+    application_id: str
+    applied_at_millis: int
+    guild: GuildSearchSummary
+
+
+@dataclass(frozen=True)
 class GuildDetail:
     name: str
     master_name: str
@@ -73,6 +109,9 @@ class GuildMemberStateSnapshot:
     guild_level: int
     daily_free_research_count: int
     daily_paid_research_count: int
+    role: int | None = None
+    guild_id: str = ""
+    guild_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -103,36 +142,111 @@ def parse_guild_search_response(body: bytes) -> list[GuildSearchSummary]:
     for field_number, wire_type, value in pb.decode_fields(body):
         if field_number != 1 or wire_type != 2:
             continue
-        fields = pb.decode_fields(bytes(value))
-        master = _message_value(fields, 5)
-        master_fields = pb.decode_fields(master) if master is not None else []
-        settings = _message_value(fields, 3)
-        settings_fields = pb.decode_fields(settings) if settings is not None else []
-        guild_id = _string_value(fields, 1)
-        name = _string_value(fields, 2)
-        if not guild_id:
+        summary = _parse_guild_summary(bytes(value))
+        if summary is not None:
+            summaries.append(summary)
+    return summaries
+
+
+def parse_invite_user_to_guild_response(body: bytes) -> str:
+    """Return the server-created invitation id (response field 1)."""
+    return _string_value(pb.decode_fields(body), 1)
+
+
+def parse_apply_guild_response(body: bytes) -> str:
+    """Return the server-created guild application id (response field 1)."""
+    return _string_value(pb.decode_fields(body), 1)
+
+
+def parse_guild_invitations_for_user_response(
+    body: bytes,
+) -> list[GuildInvitationSummary]:
+    """Parse all pending invitations visible to the authenticated user."""
+    invitations: list[GuildInvitationSummary] = []
+    for field_number, wire_type, value in pb.decode_fields(body):
+        if field_number != 1 or wire_type != 2:
             continue
-        summaries.append(
-            GuildSearchSummary(
-                guild_id=guild_id,
-                name=name,
-                master_user_id=_string_value(master_fields, 1),
-                master_name=_string_value(master_fields, 2),
-                guild_level=_int_value(fields, 4),
-                member_count=_int_value(fields, 6),
-                description=_string_value(settings_fields, 3),
-                join_method=_int_value(settings_fields, 4),
-                total_combat_power=_double_value(fields, 7),
-                master_crumble_level=_int_value(master_fields, 7),
-                master_profile_image_data_id=_int_value(master_fields, 3),
-                master_profile_frame_data_id=_int_value(master_fields, 4),
-                master_profile_title_data_id=_int_value(master_fields, 5),
-                master_channel_id=_int_value(master_fields, 6),
-                emblem_symbol_data_id=_int_value(settings_fields, 1),
-                emblem_badge_data_id=_int_value(settings_fields, 2),
+        fields = pb.decode_fields(bytes(value))
+        guild_body = _message_value(fields, 3)
+        guild = _parse_guild_summary(guild_body) if guild_body is not None else None
+        invitation_id = _string_value(fields, 1)
+        if not invitation_id or guild is None:
+            continue
+        invited_at = _message_value(fields, 2)
+        invited_at_fields = pb.decode_fields(invited_at) if invited_at else []
+        invitations.append(
+            GuildInvitationSummary(
+                invitation_id=invitation_id,
+                invited_at_millis=_int_value(invited_at_fields, 1),
+                guild=guild,
             )
         )
-    return summaries
+    return invitations
+
+
+def parse_accept_guild_invitation_response(body: bytes) -> GuildActionResult:
+    """Parse AcceptGuildInvitationResponse.member_state (field 2)."""
+    return _parse_guild_action_response(body, member_state_field=2)
+
+
+def parse_guild_applications_for_user_response(
+    body: bytes,
+) -> list[GuildApplicationSummary]:
+    """Parse pending guild applications visible to the applicant."""
+    applications: list[GuildApplicationSummary] = []
+    for field_number, wire_type, value in pb.decode_fields(body):
+        if field_number != 1 or wire_type != 2:
+            continue
+        fields = pb.decode_fields(bytes(value))
+        guild_body = _message_value(fields, 3)
+        guild = _parse_guild_summary(guild_body) if guild_body is not None else None
+        application_id = _string_value(fields, 1)
+        if not application_id or guild is None:
+            continue
+        applied_at = _message_value(fields, 2)
+        applied_at_fields = pb.decode_fields(applied_at) if applied_at else []
+        applications.append(
+            GuildApplicationSummary(
+                application_id=application_id,
+                applied_at_millis=_int_value(applied_at_fields, 1),
+                guild=guild,
+            )
+        )
+    return applications
+
+
+def parse_transfer_guild_master_response(body: bytes) -> GuildActionResult:
+    """Parse the former master's member state after transferring ownership."""
+    return _parse_guild_action_response(body, member_state_field=2)
+
+
+def _parse_guild_summary(body: bytes) -> GuildSearchSummary | None:
+    fields = pb.decode_fields(body)
+    master = _message_value(fields, 5)
+    master_fields = pb.decode_fields(master) if master is not None else []
+    settings = _message_value(fields, 3)
+    settings_fields = pb.decode_fields(settings) if settings is not None else []
+    guild_id = _string_value(fields, 1)
+    if not guild_id:
+        return None
+    return GuildSearchSummary(
+        guild_id=guild_id,
+        name=_string_value(fields, 2),
+        master_user_id=_string_value(master_fields, 1),
+        master_name=_string_value(master_fields, 2),
+        guild_level=_int_value(fields, 4),
+        member_count=_int_value(fields, 6),
+        description=_string_value(settings_fields, 3),
+        join_method=_int_value(settings_fields, 4),
+        total_combat_power=_double_value(fields, 7),
+        master_crumble_level=_int_value(master_fields, 7),
+        master_profile_image_data_id=_int_value(master_fields, 3),
+        master_profile_frame_data_id=_int_value(master_fields, 4),
+        master_profile_title_data_id=_int_value(master_fields, 5),
+        master_channel_id=_int_value(master_fields, 6),
+        emblem_symbol_data_id=_int_value(settings_fields, 1),
+        emblem_badge_data_id=_int_value(settings_fields, 2),
+    )
 
 
 def parse_guild_detail_response(body: bytes) -> GuildDetail:
@@ -229,6 +343,9 @@ def _parse_guild_action_response(
             guild_level=_int_value(member_fields, 7),
             daily_free_research_count=_int_value(member_fields, 10),
             daily_paid_research_count=_int_value(member_fields, 12),
+            role=_optional_int_value(member_fields, 4),
+            guild_id=_string_value(member_fields, 1),
+            guild_name=_string_value(member_fields, 2),
         )
 
     progression = None
@@ -297,6 +414,13 @@ def _optional_bool_value(fields, target: int) -> bool | None:
     return None
 
 
+def _optional_int_value(fields, target: int) -> int | None:
+    for field_number, wire_type, value in fields:
+        if field_number == target and wire_type == 0:
+            return int(value)
+    return None
+
+
 def _double_value(fields, target: int) -> float:
     for field_number, wire_type, value in fields:
         if field_number == target and wire_type == 1:
@@ -352,6 +476,10 @@ class Guild:
         """
         return self._guild_id_rpc(JOIN_GUILD_PATH, join_guild_request, guild_id)
 
+    def apply_guild(self, guild_id: str) -> GrpcResponse:
+        """Apply to an approval-required guild as the authenticated user."""
+        return self._guild_id_rpc(APPLY_GUILD_PATH, apply_guild_request, guild_id)
+
     def leave_guild(self, guild_id: str) -> GrpcResponse:
         """Leave the guild identified by ``guild_id``.
 
@@ -397,19 +525,72 @@ class Guild:
         """
         return self._guild_id_rpc(ATTEND_GUILD_PATH, attend_guild_request, guild_id)
 
+    def invite_user_to_guild(self, guild_id: str, invitee_id: str) -> GrpcResponse:
+        """Invite ``invitee_id`` to the authenticated member's guild."""
+        guild_id = self._validated_string(guild_id, "guild_id")
+        invitee_id = self._validated_string(invitee_id, "invitee_id")
+        return self._unary(
+            INVITE_USER_TO_GUILD_PATH,
+            invite_user_to_guild_request(guild_id, invitee_id),
+        )
+
+    def get_guild_invitations_for_user(self) -> GrpcResponse:
+        """List pending guild invitations for the authenticated user."""
+        return self._unary(
+            GET_GUILD_INVITATIONS_FOR_USER_PATH,
+            get_guild_invitations_for_user_request(),
+        )
+
+    def get_guild_applications_for_user(self) -> GrpcResponse:
+        """List pending guild applications for the authenticated applicant."""
+        return self._unary(
+            GET_GUILD_APPLICATIONS_FOR_USER_PATH,
+            get_guild_applications_for_user_request(),
+        )
+
+    def accept_guild_invitation(
+        self,
+        guild_id: str,
+        invitation_id: str,
+    ) -> GrpcResponse:
+        """Accept a pending guild invitation by guild and invitation ids."""
+        guild_id = self._validated_string(guild_id, "guild_id")
+        invitation_id = self._validated_string(invitation_id, "invitation_id")
+        return self._unary(
+            ACCEPT_GUILD_INVITATION_PATH,
+            accept_guild_invitation_request(guild_id, invitation_id),
+        )
+
+    def transfer_guild_master(
+        self,
+        guild_id: str,
+        member_id: str,
+    ) -> GrpcResponse:
+        """Transfer the sole guild-master role to an existing member."""
+        guild_id = self._validated_string(guild_id, "guild_id")
+        member_id = self._validated_string(member_id, "member_id")
+        return self._unary(
+            TRANSFER_GUILD_MASTER_PATH,
+            transfer_guild_master_request(guild_id, member_id),
+        )
+
     def _guild_id_rpc(
         self,
         path: str,
         request_builder: GuildIdRequestBuilder,
         guild_id: str,
     ) -> GrpcResponse:
-        if not isinstance(guild_id, str):
-            raise ValueError("guild_id must be a string")
-        guild_id = guild_id.strip()
-        if not guild_id:
-            raise ValueError("guild_id must not be empty")
-
+        guild_id = self._validated_string(guild_id, "guild_id")
         return self._unary(path, request_builder(guild_id))
+
+    @staticmethod
+    def _validated_string(value: str, name: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{name} must be a string")
+        value = value.strip()
+        if not value:
+            raise ValueError(f"{name} must not be empty")
+        return value
 
     def _unary(self, path: str, body: bytes) -> GrpcResponse:
         response = self.client.unary(

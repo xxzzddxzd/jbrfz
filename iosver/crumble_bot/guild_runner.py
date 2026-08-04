@@ -22,6 +22,10 @@ from .guild import (
     parse_join_guild_response,
     parse_paid_guild_lab_research_response,
 )
+from .guild_limits import (
+    guild_daily_free_research_limit,
+    guild_paid_research_cost,
+)
 from .headers import Session
 
 log = logging.getLogger(__name__)
@@ -39,8 +43,14 @@ class GuildProgress:
     research_point_after: Optional[int] = None
     daily_free_research_count_before: Optional[int] = None
     daily_free_research_count_after: Optional[int] = None
+    daily_free_research_limit_before: Optional[int] = None
+    daily_free_research_limit_after: Optional[int] = None
+    daily_free_research_remaining_before: Optional[int] = None
+    daily_free_research_remaining_after: Optional[int] = None
     daily_donation_count_before: Optional[int] = None
     daily_donation_count_after: Optional[int] = None
+    next_donation_diamond_cost_before: Optional[int] = None
+    next_donation_diamond_cost_after: Optional[int] = None
     super_success_count: int = 0
 
     def observe_action(
@@ -48,19 +58,34 @@ class GuildProgress:
     ) -> None:
         member_state = action.member_state
         if member_state is not None:
+            free_limit = guild_daily_free_research_limit(member_state.guild_level)
+            free_remaining = (
+                max(0, free_limit - member_state.daily_free_research_count)
+                if free_limit is not None
+                else None
+            )
+            next_paid_cost = guild_paid_research_cost(
+                member_state.daily_paid_research_count + 1
+            )
             if initial:
                 self.level_before = member_state.guild_level
                 self.daily_free_research_count_before = (
                     member_state.daily_free_research_count
                 )
+                self.daily_free_research_limit_before = free_limit
+                self.daily_free_research_remaining_before = free_remaining
                 self.daily_donation_count_before = (
                     member_state.daily_paid_research_count
                 )
+                self.next_donation_diamond_cost_before = next_paid_cost
             self.level_after = member_state.guild_level
             self.daily_free_research_count_after = (
                 member_state.daily_free_research_count
             )
+            self.daily_free_research_limit_after = free_limit
+            self.daily_free_research_remaining_after = free_remaining
             self.daily_donation_count_after = member_state.daily_paid_research_count
+            self.next_donation_diamond_cost_after = next_paid_cost
 
         progression = action.progression
         if progression is not None:
@@ -110,8 +135,22 @@ class GuildProgress:
             ),
             "daily_free_research_count_before": (self.daily_free_research_count_before),
             "daily_free_research_count_after": self.daily_free_research_count_after,
+            "daily_free_research_limit_before": self.daily_free_research_limit_before,
+            "daily_free_research_limit_after": self.daily_free_research_limit_after,
+            "daily_free_research_remaining_before": (
+                self.daily_free_research_remaining_before
+            ),
+            "daily_free_research_remaining_after": (
+                self.daily_free_research_remaining_after
+            ),
             "daily_donation_count_before": self.daily_donation_count_before,
             "daily_donation_count_after": self.daily_donation_count_after,
+            "next_donation_diamond_cost_before": (
+                self.next_donation_diamond_cost_before
+            ),
+            "next_donation_diamond_cost_after": (
+                self.next_donation_diamond_cost_after
+            ),
             "super_success_count": self.super_success_count,
         }
 
@@ -190,7 +229,7 @@ class GuildRunner:
     ) -> None:
         self.client = client
         self.session = session
-        self.free_research_count = max(0, int(free_research_count))
+        self.fallback_free_research_count = max(0, int(free_research_count))
         self.paid_research_limit = max(0, int(paid_research_limit))
         self.total_count_limit = (
             None
@@ -211,25 +250,48 @@ class GuildRunner:
         )
 
     def run(self, guild_id: str) -> GuildWorkflowResult:
+        """Directly join a public guild, run the shared member SOP, then leave."""
+        guild = Guild(self.client, self.session)
+        try:
+            join_response = guild.join_guild(guild_id)
+            initial_action = parse_join_guild_response(join_response.message)
+        except Exception as error:
+            result = GuildWorkflowResult()
+            result.error = f"{type(error).__name__}: {error}"
+            log.error("guild join failed: %s", result.error)
+            return result
+
+        log.info("joined guild")
+        return self.run_joined(
+            guild_id,
+            initial_action=initial_action,
+            joined_at=time.time(),
+        )
+
+    def run_joined(
+        self,
+        guild_id: str,
+        *,
+        initial_action: GuildActionResult,
+        joined_at: Optional[float] = None,
+    ) -> GuildWorkflowResult:
+        """Run the shared SOP for an account that is already a guild member.
+
+        ``initial_action`` normally comes from either ``JoinGuild`` (public)
+        or ``AcceptGuildInvitation`` (private), both of which expose the
+        authoritative member state needed for dynamic daily limits.
+        """
         result = GuildWorkflowResult()
         if self.initial_guild_level is not None:
             result.guild_progress.level_before = self.initial_guild_level
             result.guild_progress.level_after = self.initial_guild_level
         guild = Guild(self.client, self.session)
-        joined = False
         balance = self.initial_diamond_balance
+        result.joined = True
+        result.joined_at = time.time() if joined_at is None else float(joined_at)
+        result.guild_progress.observe_action(initial_action, initial=True)
 
         try:
-            join_response = guild.join_guild(guild_id)
-            joined = True
-            result.joined = True
-            result.joined_at = time.time()
-            result.guild_progress.observe_action(
-                parse_join_guild_response(join_response.message),
-                initial=True,
-            )
-            log.info("joined guild")
-
             try:
                 detail_response = guild.get_guild(guild_id)
                 result.guild_detail = parse_guild_detail_response(
@@ -249,101 +311,102 @@ class GuildRunner:
             result.attendance_claimed = True
             log.info("attendance reward claimed")
 
-            for index in range(1, self.free_research_count + 1):
-                if self._total_count_reached(result):
-                    result.stop_reason = "total_count_reached"
-                    break
-                response = guild.conduct_free_guild_lab_research(guild_id)
-                action = parse_free_guild_lab_research_response(response.message)
-                result.guild_progress.observe_action(action)
-                effective_count = self._record_research_result(
-                    result,
-                    action,
-                    paid=False,
-                )
-                result.free_research_count = index
-                log.info(
-                    "free guild research %s/%s effective=%s total_effective=%s",
-                    index,
-                    self.free_research_count,
-                    effective_count,
-                    result.effective_research_count,
-                )
-                self._sleep()
-
             result.diamond_balance_before_paid = balance
             log.info("persisted diamond balance before paid research=%s", balance)
 
-            if not self._total_count_reached(result):
-                for index in range(1, self.paid_research_limit + 1):
-                    if self._total_count_reached(result):
-                        result.stop_reason = "total_count_reached"
-                        break
-                    try:
-                        response = guild.conduct_paid_guild_lab_research(guild_id)
-                    except GrpcError as error:
-                        if self._is_insufficient_diamonds(error):
-                            result.stop_reason = "insufficient_diamonds"
-                            result.paid_stop_status = error.status
-                            result.paid_stop_message = error.message
-                            owned_amount = self._owned_amount(error)
-                            if owned_amount is None:
-                                raise RuntimeError(
-                                    "insufficient-diamond response missing owned amount"
-                                ) from error
-                            balance = owned_amount
-                            result.diamond_balance_before_paid = (
-                                owned_amount + result.diamond_spent
-                            )
-                            result.diamond_balance_final = owned_amount
-                            self._notify_balance(owned_amount)
-                            log.info(
-                                "paid research exhausted usable diamonds: %s",
-                                error.message,
-                            )
-                            break
-                        raise
+            # Always consume newly available free actions first.  A paid action
+            # can level the guild and unlock another free slot, so the allowance
+            # is recalculated from every returned GuildMemberState.
+            while True:
+                if self._total_count_reached(result):
+                    result.stop_reason = "total_count_reached"
+                    break
 
-                    action = parse_paid_guild_lab_research_response(response.message)
-                    charged = sum(
-                        payment.amount
-                        for payment in parse_currency_payments(response.message)
-                        if payment.data_id == DIAMOND_CURRENCY_DATA_ID
-                    )
-                    if charged <= 0:
-                        raise RuntimeError(
-                            f"paid guild research {index} returned no diamond payment"
-                        )
+                free_remaining = self._free_research_remaining(result)
+                if free_remaining > 0:
+                    response = guild.conduct_free_guild_lab_research(guild_id)
+                    action = parse_free_guild_lab_research_response(response.message)
                     result.guild_progress.observe_action(action)
+                    result.free_research_count += 1
                     effective_count = self._record_research_result(
                         result,
                         action,
-                        paid=True,
+                        paid=False,
                     )
-                    result.paid_research_count = index
-                    result.diamond_spent += charged
-                    if balance is not None:
-                        balance = max(0, balance - charged)
-                        self._notify_balance(balance)
                     log.info(
-                        "paid guild research %s/%s charged=%s effective=%s "
-                        "total_effective=%s estimated_balance=%s",
-                        index,
-                        self.paid_research_limit,
-                        charged,
+                        "free guild research actions=%s remaining=%s "
+                        "effective=%s total_effective=%s",
+                        result.free_research_count,
+                        self._free_research_remaining(result),
                         effective_count,
                         result.effective_research_count,
-                        balance,
                     )
                     self._sleep()
-                else:
-                    result.stop_reason = (
-                        "total_count_reached"
-                        if self._total_count_reached(result)
-                        else "paid_count_reached"
+                    continue
+
+                if result.paid_research_count >= self.paid_research_limit:
+                    result.stop_reason = "paid_count_reached"
+                    break
+
+                index = result.paid_research_count + 1
+                try:
+                    response = guild.conduct_paid_guild_lab_research(guild_id)
+                except GrpcError as error:
+                    if self._is_insufficient_diamonds(error):
+                        result.stop_reason = "insufficient_diamonds"
+                        result.paid_stop_status = error.status
+                        result.paid_stop_message = error.message
+                        owned_amount = self._owned_amount(error)
+                        if owned_amount is None:
+                            raise RuntimeError(
+                                "insufficient-diamond response missing owned amount"
+                            ) from error
+                        balance = owned_amount
+                        result.diamond_balance_before_paid = (
+                            owned_amount + result.diamond_spent
+                        )
+                        result.diamond_balance_final = owned_amount
+                        self._notify_balance(owned_amount)
+                        log.info(
+                            "paid research exhausted usable diamonds: %s",
+                            error.message,
+                        )
+                        break
+                    raise
+
+                action = parse_paid_guild_lab_research_response(response.message)
+                charged = sum(
+                    payment.amount
+                    for payment in parse_currency_payments(response.message)
+                    if payment.data_id == DIAMOND_CURRENCY_DATA_ID
+                )
+                if charged <= 0:
+                    raise RuntimeError(
+                        f"paid guild research {index} returned no diamond payment"
                     )
-            else:
-                result.stop_reason = "total_count_reached"
+                result.guild_progress.observe_action(action)
+                result.paid_research_count += 1
+                effective_count = self._record_research_result(
+                    result,
+                    action,
+                    paid=True,
+                )
+                result.diamond_spent += charged
+                if balance is not None:
+                    balance = max(0, balance - charged)
+                    self._notify_balance(balance)
+                log.info(
+                    "paid guild research %s/%s next_cost=%s charged=%s "
+                    "effective=%s total_effective=%s estimated_balance=%s",
+                    result.paid_research_count,
+                    self.paid_research_limit,
+                    result.guild_progress.next_donation_diamond_cost_after,
+                    charged,
+                    effective_count,
+                    result.effective_research_count,
+                    balance,
+                )
+                self._sleep()
 
             if result.diamond_balance_final is None:
                 result.diamond_balance_final = balance
@@ -352,28 +415,27 @@ class GuildRunner:
             result.error = f"{type(error).__name__}: {error}"
             log.error("guild workflow failed: %s", result.error)
         finally:
-            if joined:
-                try:
-                    detail_response = guild.get_guild(guild_id)
-                    result.guild_detail = parse_guild_detail_response(
-                        detail_response.message
-                    )
-                    result.guild_progress.observe_detail(result.guild_detail)
-                except Exception as error:
-                    log.warning(
-                        "final guild detail unavailable before leave: %s", error
-                    )
+            try:
+                detail_response = guild.get_guild(guild_id)
+                result.guild_detail = parse_guild_detail_response(
+                    detail_response.message
+                )
+                result.guild_progress.observe_detail(result.guild_detail)
+            except Exception as error:
+                log.warning(
+                    "final guild detail unavailable before leave: %s", error
+                )
 
-                try:
-                    guild.leave_guild(guild_id)
-                    result.left_guild = True
-                    result.left_at = time.time()
-                    log.info("left guild")
-                except Exception as error:
-                    self._append_error(
-                        result,
-                        f"leave failed: {type(error).__name__}: {error}",
-                    )
+            try:
+                guild.leave_guild(guild_id)
+                result.left_guild = True
+                result.left_at = time.time()
+                log.info("left guild")
+            except Exception as error:
+                self._append_error(
+                    result,
+                    f"leave failed: {type(error).__name__}: {error}",
+                )
 
         return result
 
@@ -390,6 +452,19 @@ class GuildRunner:
             self.total_count_limit is not None
             and result.effective_research_count >= self.total_count_limit
         )
+
+    def _free_research_remaining(self, result: GuildWorkflowResult) -> int:
+        progress = result.guild_progress
+        limit = progress.daily_free_research_limit_after
+        if limit is None:
+            limit = self.fallback_free_research_count
+        initial_used = progress.daily_free_research_count_before or 0
+        reported_used = progress.daily_free_research_count_after
+        effective_used = max(
+            int(reported_used or 0),
+            int(initial_used) + result.free_research_count,
+        )
+        return max(0, int(limit) - effective_used)
 
     @staticmethod
     def _record_research_result(

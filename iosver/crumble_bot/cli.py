@@ -12,8 +12,13 @@ from .constants import ENDPOINT, FALLBACK_RESOURCE_KEY, TO_STAGE
 from .daily_runner import DailyRunner, DailyWorkflowResult
 from .db import DEFAULT_DB, AccountDB, AccountRow
 from .grpc_client import GrpcClient, GrpcError
-from .guild import Guild, GuildSearchSummary, parse_guild_search_response
+from .guild import (
+    Guild,
+    GuildSearchSummary,
+    parse_guild_search_response,
+)
 from .guild_runner import GuildRunner, GuildWorkflowResult
+from .guild_private_runner import PrivateGuildRunner
 from .invite import register_friend_inviter
 from .inviter import parse_inviter
 from .stage_runner import StageConfig, StageRunner
@@ -306,6 +311,29 @@ def _confirm_guild(payload: dict) -> bool:
     except EOFError:
         return False
     return answer in {"y", "yes", "是", "确认"}
+
+
+def _guild_actor_mid(value: str | None, argument: str = "--mid") -> str:
+    mid = str(value or "").strip().upper()
+    if not mid:
+        raise SystemExit(f"{argument} 不能为空")
+    return mid
+
+
+def _persist_logged_in_actor(
+    db: AccountDB,
+    row: AccountRow,
+    state: AccountState,
+    session,
+) -> None:
+    state.resource_key = session.resource_key
+    db.upsert_state(
+        state,
+        used=row.used,
+        ready=row.ready,
+        invalid=row.invalid,
+        note=row.note,
+    )
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -784,9 +812,208 @@ def cmd_daily(args: argparse.Namespace) -> int:
 
 
 def cmd_guild(args: argparse.Namespace) -> int:
-    """Run guild research until the cross-account effective-count target."""
+    """Dispatch the public or private guild SOP."""
+    action = str(getattr(args, "guild_action", "") or "")
+    if action == "private":
+        return _cmd_guild_private(args)
+    if action == "public":
+        return _cmd_guild_run(args)
+    raise SystemExit(f"未知 guild 动作: {action}")
+
+
+def _guild_target_join_method(details: dict) -> int | None:
+    candidates = [
+        details.get("search_summary"),
+        (details.get("accepted_invitation") or {}).get("guild"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, dict) and "join_method" in candidate:
+            try:
+                return int(candidate["join_method"])
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _cmd_guild_private(args: argparse.Namespace) -> int:
+    """Run or resume an approval-guild job using a temporary controlled master."""
+    gname = str(getattr(args, "gname", "") or "").strip()
+    gmname = str(getattr(args, "gmname", "") or "").strip()
+    controller_mid = _guild_actor_mid(
+        getattr(args, "master_mid", None),
+        "--master-mid",
+    )
+    if getattr(args, "count", None) is None:
+        raise SystemExit("guild private 必须提供 --count")
+    if getattr(args, "totalcount", None) is None:
+        raise SystemExit("guild private 必须提供 --totalcount")
+    count = int(args.count)
+    totalcount = int(args.totalcount)
+    if not gname:
+        raise SystemExit("--gname 不能为空")
+    if not gmname:
+        raise SystemExit("--gmname 不能为空")
+    if count < 1:
+        raise SystemExit("--count 必须 >= 1")
+    if totalcount < 1:
+        raise SystemExit("--totalcount 必须 >= 1")
+
+    with AccountDB(args.db) as db:
+        controller_row = db.get(controller_mid)
+        if controller_row is None:
+            raise SystemExit(f"sqlite 中没有自控会长账号: {controller_mid}")
+
+        target = db.get_guild_target(gname, gmname)
+        if target is None:
+            state = _login_account(controller_row)
+            session = state.to_session()
+            with GrpcClient(state.endpoint or ENDPOINT) as client:
+                summaries = parse_guild_search_response(
+                    Guild(client, session).search_guilds(gname).message
+                )
+            _persist_logged_in_actor(
+                db,
+                controller_row,
+                state,
+                session,
+            )
+            matches = [
+                item
+                for item in summaries
+                if item.name == gname and item.master_name == gmname
+            ]
+            if len(matches) != 1:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "mode": "private",
+                            "stopped_reason": "guild_target_not_unique",
+                            "match_count": len(matches),
+                            "search_result_count": len(summaries),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    flush=True,
+                )
+                return 1
+            matched = matches[0]
+            confirmation = _guild_confirmation_payload(matched)
+            if not _confirm_guild(confirmation):
+                print(
+                    json.dumps(
+                        {
+                            "ok": True,
+                            "mode": "private",
+                            "stopped_reason": "not_confirmed",
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    flush=True,
+                )
+                return 0
+            if matched.join_method != 1:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "mode": "private",
+                            "stopped_reason": "guild_is_public",
+                            "join_method": matched.join_method,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    flush=True,
+                )
+                return 1
+            target = db.upsert_guild_target(
+                gname=gname,
+                gmname=gmname,
+                guild_id=matched.guild_id,
+                guild_level=matched.guild_level,
+                member_count=matched.member_count,
+                master_user_id=matched.master_user_id,
+                original_master_mid=matched.master_user_id,
+                details={"search_summary": confirmation},
+            )
+        else:
+            join_method = _guild_target_join_method(target.details)
+            if join_method == 0:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "mode": "private",
+                            "stopped_reason": "guild_is_public",
+                            "join_method": join_method,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    flush=True,
+                )
+                return 1
+
+        original_master_mid = (
+            target.original_master_mid or target.master_user_id
+        )
+        if not original_master_mid:
+            raise SystemExit("目标公会缺少原会长 MID，无法建立 private 任务")
+        job = db.get_active_private_job(target.guild_id, controller_mid)
+        if job is not None and (
+            job.paid_count_per_account != count
+            or job.total_count_limit != totalcount
+        ):
+            raise SystemExit(
+                "已有未完成 private 任务，--count/--totalcount 必须与原任务一致"
+            )
+        if job is None:
+            job = db.create_private_job(
+                guild_id=target.guild_id,
+                gname=gname,
+                gmname=gmname,
+                original_master_mid=original_master_mid,
+                controller_mid=controller_mid,
+                paid_count_per_account=count,
+                total_count_limit=totalcount,
+            )
+
+        runner = PrivateGuildRunner(
+            db,
+            _login_account,
+            client_factory=GrpcClient,
+            wait_timeout=float(getattr(args, "wait_timeout", 300)),
+            poll_interval=float(getattr(args, "poll_interval", 5)),
+        )
+        try:
+            payload = runner.run(job)
+        except Exception as error:
+            message = f"{type(error).__name__}: {error}"
+            db.update_private_job(job.id, error=message)
+            payload = {
+                "ok": False,
+                "complete": False,
+                "mode": "private",
+                "stopped_reason": "private_job_failed",
+                "job_id": job.id,
+                "error": message,
+            }
+
+    print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+    return 0 if payload.get("ok") else 1
+
+
+def _cmd_guild_run(args: argparse.Namespace) -> int:
+    """Run the direct-join public-guild workflow."""
     gname = str(args.gname or "").strip()
     gmname = str(args.gmname or "").strip()
+    if getattr(args, "count", None) is None:
+        raise SystemExit("guild public 必须提供 --count")
+    if getattr(args, "totalcount", None) is None:
+        raise SystemExit("guild public 必须提供 --totalcount")
     paid_count_per_account = int(args.count)
     requested_total_count = int(args.totalcount)
     if not gname:
@@ -813,6 +1040,7 @@ def cmd_guild(args: argparse.Namespace) -> int:
         if not eligible_rows:
             summary = {
                 "ok": True,
+                "mode": "public",
                 "count": paid_count_per_account,
                 "requested_totalcount": requested_total_count,
                 "totalcount": 0,
@@ -894,6 +1122,25 @@ def cmd_guild(args: argparse.Namespace) -> int:
                 return 1
 
             matched = matches[0]
+            if matched.join_method != 0:
+                summary = {
+                    "ok": False,
+                    "mode": "public",
+                    "count": paid_count_per_account,
+                    "requested_totalcount": requested_total_count,
+                    "totalcount": 0,
+                    "totalcount_reached": False,
+                    "account_count": 0,
+                    "accounts_attempted": 0,
+                    "accounts_failed": 0,
+                    "stopped_reason": "guild_requires_approval",
+                    "join_method": matched.join_method,
+                    "guild": {"name": gname, "master_name": gmname},
+                    "pool": pool_before,
+                    "results": [],
+                }
+                print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+                return 1
             confirmation = _guild_confirmation_payload(matched)
             if not _confirm_guild(confirmation):
                 summary = {
@@ -924,6 +1171,26 @@ def cmd_guild(args: argparse.Namespace) -> int:
             )
             log.info("guild target confirmed and cached")
         else:
+            join_method = _guild_target_join_method(target.details)
+            if join_method == 1:
+                summary = {
+                    "ok": False,
+                    "mode": "public",
+                    "count": paid_count_per_account,
+                    "requested_totalcount": requested_total_count,
+                    "totalcount": 0,
+                    "totalcount_reached": False,
+                    "account_count": 0,
+                    "accounts_attempted": 0,
+                    "accounts_failed": 0,
+                    "stopped_reason": "guild_requires_approval",
+                    "join_method": join_method,
+                    "guild": {"name": gname, "master_name": gmname},
+                    "pool": pool_before,
+                    "results": [],
+                }
+                print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+                return 1
             log.info(
                 "using cached guild target name=%s master=%s confirmed_at=%s",
                 gname,
@@ -1097,6 +1364,7 @@ def cmd_guild(args: argparse.Namespace) -> int:
         )
         summary = {
             "ok": failures == 0,
+            "mode": "public",
             "count": paid_count_per_account,
             "requested_totalcount": requested_total_count,
             "totalcount": effective_total,
@@ -1148,20 +1416,39 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--db", default=str(DEFAULT_DB), help="sqlite 路径")
     sp.set_defaults(func=cmd_daily)
 
-    sp = sub.add_parser("guild", help="批量执行公会签到、研究、捐赠、退出")
-    sp.add_argument("--gname", required=True, help="公会名称")
-    sp.add_argument("--gmname", required=True, help="会长名称")
+    sp = sub.add_parser("guild", help="公开或审批公会 SOP")
+    sp.add_argument(
+        "guild_action",
+        choices=("public", "private"),
+        help="公会流程类型",
+    )
+    sp.add_argument("--gname", help="公会名称")
+    sp.add_argument("--gmname", help="会长名称")
     sp.add_argument(
         "--count",
-        required=True,
         type=int,
-        help="每个账号最多执行的钻石捐赠次数",
+        help="public/private：每个账号最多执行的钻石捐赠次数",
     )
     sp.add_argument(
         "--totalcount",
-        required=True,
         type=int,
-        help="跨账号免费+钻石研究的有效总次数；暴击按实际倍率计数",
+        help="public/private：跨账号免费+钻石研究有效总次数；暴击按倍率计数",
+    )
+    sp.add_argument(
+        "--master-mid",
+        help="private：临时接管会长并负责发送邀请的 sqlite 账号 MID",
+    )
+    sp.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=300,
+        help="private：等待审批或人工转让的秒数，默认 300；0 为仅检查一次",
+    )
+    sp.add_argument(
+        "--poll-interval",
+        type=float,
+        default=5,
+        help="private：等待状态轮询间隔秒数，默认 5",
     )
     sp.add_argument("--db", default=str(DEFAULT_DB), help="sqlite 路径")
     sp.set_defaults(func=cmd_guild)

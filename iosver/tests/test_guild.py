@@ -17,14 +17,33 @@ from crumble_bot.currency import DIAMOND_CURRENCY_DATA_ID
 from crumble_bot.db import AccountDB
 from crumble_bot.grpc_client import GrpcError, GrpcResponse
 from crumble_bot.guild import (
+    ACCEPT_GUILD_INVITATION_PATH,
+    APPLY_GUILD_PATH,
     ATTEND_GUILD_PATH,
     CONDUCT_FREE_GUILD_LAB_RESEARCH_PATH,
     CONDUCT_PAID_GUILD_LAB_RESEARCH_PATH,
+    GET_GUILD_APPLICATIONS_FOR_USER_PATH,
+    GET_GUILD_INVITATIONS_FOR_USER_PATH,
     GET_GUILD_PATH,
+    INVITE_USER_TO_GUILD_PATH,
     JOIN_GUILD_PATH,
     LEAVE_GUILD_PATH,
+    SEARCH_GUILDS_PATH,
+    TRANSFER_GUILD_MASTER_PATH,
+    Guild,
+    parse_accept_guild_invitation_response,
+    parse_apply_guild_response,
     parse_guild_detail_response,
+    parse_guild_applications_for_user_response,
+    parse_guild_invitations_for_user_response,
     parse_guild_search_response,
+    parse_invite_user_to_guild_response,
+    parse_transfer_guild_master_response,
+)
+from crumble_bot.guild_limits import (
+    GUILD_PAID_RESEARCH_PRICE_TIER_COUNT,
+    guild_daily_free_research_limit,
+    guild_paid_research_cost,
 )
 from crumble_bot.guild_runner import (
     GuildProgress,
@@ -42,7 +61,14 @@ from crumble_bot.mailbox import (
     parse_refresh_mail_box_response,
     parse_signup_mail_advertisement_view_count,
 )
-from crumble_bot.messages import receive_mail_advertisement_reward_request
+from crumble_bot.messages import (
+    accept_guild_invitation_request,
+    apply_guild_request,
+    get_guild_applications_for_user_request,
+    invite_user_to_guild_request,
+    receive_mail_advertisement_reward_request,
+    transfer_guild_master_request,
+)
 from crumble_bot.stage_runner import SIGNUP_PATH
 
 
@@ -76,14 +102,22 @@ def guild_member_state(
     level: int,
     free_count: int,
     paid_count: int,
+    role: int | None = None,
+    guild_id: str = "",
+    guild_name: str = "",
 ) -> bytes:
-    return b"".join(
-        (
-            pb.encode_int32_field(7, level),
-            pb.encode_int32_field(10, free_count),
-            pb.encode_int32_field(12, paid_count),
-        )
-    )
+    parts = [
+        pb.encode_int32_field(7, level),
+        pb.encode_int32_field(10, free_count),
+        pb.encode_int32_field(12, paid_count),
+    ]
+    if role is not None:
+        parts.append(pb.encode_int32_field(4, role))
+    if guild_id:
+        parts.append(pb.encode_string_field(1, guild_id))
+    if guild_name:
+        parts.append(pb.encode_string_field(2, guild_name))
+    return b"".join(parts)
 
 
 def guild_progression(
@@ -181,6 +215,57 @@ def payment_response(amount: int) -> bytes:
     )
 
 
+def dynamic_free_research_response(*, level: int, free_count: int) -> bytes:
+    return b"".join(
+        (
+            pb.encode_message_field(
+                2,
+                guild_progression(
+                    free_count,
+                    free_count + 1,
+                    free_count,
+                    free_count + 1,
+                ),
+            ),
+            pb.encode_message_field(
+                3,
+                guild_lab_research(free_count, free_count + 1),
+            ),
+            pb.encode_message_field(
+                4,
+                guild_member_state(
+                    level=level,
+                    free_count=free_count,
+                    paid_count=0 if level < 4 else 1,
+                ),
+            ),
+            pb.encode_bool_field(5, False),
+        )
+    )
+
+
+def dynamic_paid_research_response() -> bytes:
+    currency_payment = b"".join(
+        (
+            pb.encode_int32_field(1, DIAMOND_CURRENCY_DATA_ID),
+            pb.encode_int64_field(2, 10),
+        )
+    )
+    payment = pb.encode_message_field(1, currency_payment)
+    return b"".join(
+        (
+            pb.encode_message_field(2, payment),
+            pb.encode_message_field(3, guild_progression(3, 4, 3, 4)),
+            pb.encode_message_field(4, guild_lab_research(3, 4)),
+            pb.encode_bool_field(5, False),
+            pb.encode_message_field(
+                6,
+                guild_member_state(level=4, free_count=3, paid_count=1),
+            ),
+        )
+    )
+
+
 def guild_detail_response(total_experience: int = 33) -> bytes:
     settings = b"".join(
         (
@@ -214,33 +299,77 @@ def guild_detail_response(total_experience: int = 33) -> bytes:
     )
 
 
-def guild_search_response() -> bytes:
-    settings = b"".join(
-        (
-            pb.encode_int32_field(1, 101),
-            pb.encode_int32_field(2, 202),
-            pb.encode_string_field(3, "description"),
-        )
-    )
+def guild_summary_message(
+    *,
+    level: int = 1,
+    join_method: int = 0,
+    master_mid: str = "MASTER",
+    master_name: str = "absdbld",
+) -> bytes:
+    setting_parts = [
+        pb.encode_int32_field(1, 101),
+        pb.encode_int32_field(2, 202),
+        pb.encode_string_field(3, "description"),
+    ]
+    if join_method:
+        setting_parts.append(pb.encode_int32_field(4, join_method))
+    settings = b"".join(setting_parts)
     master = b"".join(
         (
-            pb.encode_string_field(1, "MASTER"),
-            pb.encode_string_field(2, "absdbld"),
+            pb.encode_string_field(1, master_mid),
+            pb.encode_string_field(2, master_name),
             pb.encode_int32_field(7, 55),
         )
     )
-    summary = b"".join(
+    return b"".join(
         (
             pb.encode_string_field(1, "G-ID"),
             pb.encode_string_field(2, "ahhhha"),
             pb.encode_message_field(3, settings),
-            pb.encode_int32_field(4, 1),
+            pb.encode_int32_field(4, level),
             pb.encode_message_field(5, master),
             pb.encode_int32_field(6, 1),
             pb.encode_double_field(7, 12345),
         )
     )
-    return pb.encode_message_field(1, summary)
+
+
+def guild_search_response() -> bytes:
+    return pb.encode_message_field(1, guild_summary_message())
+
+
+def guild_invitations_response() -> bytes:
+    invited_at = pb.encode_int64_field(1, 1_786_000_000_000)
+    invitation = b"".join(
+        (
+            pb.encode_string_field(1, "GI-ID"),
+            pb.encode_message_field(2, invited_at),
+            pb.encode_message_field(3, guild_summary_message(level=4)),
+        )
+    )
+    return pb.encode_message_field(1, invitation)
+
+
+def accept_guild_invitation_response() -> bytes:
+    return pb.encode_message_field(
+        2,
+        guild_member_state(level=4, free_count=1, paid_count=2),
+    )
+
+
+def guild_applications_response() -> bytes:
+    applied_at = pb.encode_int64_field(1, 1_786_000_000_000)
+    application = b"".join(
+        (
+            pb.encode_string_field(1, "GA-ID"),
+            pb.encode_message_field(2, applied_at),
+            pb.encode_message_field(
+                3,
+                guild_summary_message(join_method=1),
+            ),
+        )
+    )
+    return pb.encode_message_field(1, application)
 
 
 def mail_entry(
@@ -354,6 +483,148 @@ class GuildParserTests(unittest.TestCase):
         self.assertEqual(detail.member_ids, ("MASTER", "MEMBER"))
         self.assertEqual(detail.total_experience, 33)
 
+    def test_guild_invitation_requests_and_responses(self) -> None:
+        self.assertEqual(
+            pb.decode_fields(invite_user_to_guild_request("G-ID", "INVITEE")),
+            [(1, 2, b"G-ID"), (2, 2, b"INVITEE")],
+        )
+        self.assertEqual(
+            pb.decode_fields(
+                accept_guild_invitation_request("G-ID", "GI-ID")
+            ),
+            [(1, 2, b"G-ID"), (2, 2, b"GI-ID")],
+        )
+        self.assertEqual(
+            parse_invite_user_to_guild_response(
+                pb.encode_string_field(1, "GI-ID")
+            ),
+            "GI-ID",
+        )
+
+        invitations = parse_guild_invitations_for_user_response(
+            guild_invitations_response()
+        )
+        self.assertEqual(len(invitations), 1)
+        self.assertEqual(invitations[0].invitation_id, "GI-ID")
+        self.assertEqual(invitations[0].guild.guild_id, "G-ID")
+        self.assertEqual(invitations[0].guild.name, "ahhhha")
+        self.assertEqual(invitations[0].guild.master_name, "absdbld")
+        self.assertEqual(invitations[0].guild.guild_level, 4)
+        self.assertEqual(invitations[0].invited_at_millis, 1_786_000_000_000)
+
+        accepted = parse_accept_guild_invitation_response(
+            accept_guild_invitation_response()
+        )
+        self.assertIsNotNone(accepted.member_state)
+        self.assertEqual(accepted.member_state.guild_level, 4)
+        self.assertEqual(accepted.member_state.daily_free_research_count, 1)
+        self.assertEqual(accepted.member_state.daily_paid_research_count, 2)
+
+    def test_guild_application_and_master_transfer_protocol(self) -> None:
+        self.assertEqual(
+            pb.decode_fields(apply_guild_request("G-ID")),
+            [(1, 2, b"G-ID")],
+        )
+        self.assertEqual(get_guild_applications_for_user_request(), b"")
+        self.assertEqual(
+            pb.decode_fields(
+                transfer_guild_master_request("G-ID", "NEW-MASTER")
+            ),
+            [(1, 2, b"G-ID"), (2, 2, b"NEW-MASTER")],
+        )
+        self.assertEqual(
+            parse_apply_guild_response(pb.encode_string_field(1, "GA-ID")),
+            "GA-ID",
+        )
+
+        applications = parse_guild_applications_for_user_response(
+            guild_applications_response()
+        )
+        self.assertEqual(len(applications), 1)
+        self.assertEqual(applications[0].application_id, "GA-ID")
+        self.assertEqual(applications[0].guild.guild_id, "G-ID")
+        self.assertEqual(applications[0].guild.join_method, 1)
+
+        transferred = parse_transfer_guild_master_response(
+            pb.encode_message_field(
+                2,
+                guild_member_state(
+                    level=4,
+                    free_count=1,
+                    paid_count=2,
+                    role=1,
+                    guild_id="G-ID",
+                    guild_name="ahhhha",
+                ),
+            )
+        )
+        self.assertIsNotNone(transferred.member_state)
+        self.assertEqual(transferred.member_state.role, 1)
+        self.assertEqual(transferred.member_state.guild_id, "G-ID")
+
+    def test_guild_application_and_transfer_facade_paths(self) -> None:
+        client = FakeWorkflowClient()
+        guild = Guild(
+            client,
+            AccountState(mid="MID", game_access_token="token").to_session(),
+        )
+
+        guild.apply_guild("G-ID")
+        guild.get_guild_applications_for_user()
+        guild.transfer_guild_master("G-ID", "NEW-MASTER")
+
+        self.assertEqual(
+            client.calls[-3:],
+            [
+                APPLY_GUILD_PATH,
+                GET_GUILD_APPLICATIONS_FOR_USER_PATH,
+                TRANSFER_GUILD_MASTER_PATH,
+            ],
+        )
+        self.assertEqual(
+            pb.decode_fields(client.requests[-1][1]),
+            [(1, 2, b"G-ID"), (2, 2, b"NEW-MASTER")],
+        )
+
+    def test_10101_guild_limits(self) -> None:
+        self.assertEqual(guild_daily_free_research_limit(1), 3)
+        self.assertEqual(guild_daily_free_research_limit(4), 4)
+        self.assertEqual(guild_daily_free_research_limit(7), 5)
+        self.assertEqual(guild_daily_free_research_limit(14), 8)
+        self.assertEqual(GUILD_PAID_RESEARCH_PRICE_TIER_COUNT, 27)
+        self.assertEqual(guild_paid_research_cost(1), 10)
+        self.assertEqual(guild_paid_research_cost(27), 10000)
+        self.assertEqual(guild_paid_research_cost(28), 10000)
+
+    def test_guild_invitation_facade_uses_10101_rpc_paths(self) -> None:
+        client = FakeWorkflowClient()
+        guild = Guild(
+            client,
+            AccountState(mid="MID", game_access_token="token").to_session(),
+        )
+
+        guild.invite_user_to_guild("G-ID", "PGLXK9073")
+        guild.get_guild_invitations_for_user()
+        guild.accept_guild_invitation("G-ID", "GI-ID")
+
+        self.assertEqual(
+            client.calls[-3:],
+            [
+                INVITE_USER_TO_GUILD_PATH,
+                GET_GUILD_INVITATIONS_FOR_USER_PATH,
+                ACCEPT_GUILD_INVITATION_PATH,
+            ],
+        )
+        self.assertEqual(
+            pb.decode_fields(client.requests[-3][1]),
+            [(1, 2, b"G-ID"), (2, 2, b"PGLXK9073")],
+        )
+        self.assertEqual(client.requests[-2][1], b"")
+        self.assertEqual(
+            pb.decode_fields(client.requests[-1][1]),
+            [(1, 2, b"G-ID"), (2, 2, b"GI-ID")],
+        )
+
     def test_mailbox_parsers_find_only_unclaimed_attachment_mail(self) -> None:
         snapshot = parse_refresh_mail_box_response(refresh_mail_box_response())
         self.assertEqual(len(snapshot.mails), 3)
@@ -405,6 +676,43 @@ class GuildParserTests(unittest.TestCase):
 
 
 class AccountDBGuildTests(unittest.TestCase):
+    def test_legacy_guild_target_backfills_original_master_mid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE guild_targets (
+                        gname TEXT NOT NULL,
+                        gmname TEXT NOT NULL,
+                        guild_id TEXT NOT NULL,
+                        guild_level INTEGER NOT NULL DEFAULT 0,
+                        member_count INTEGER NOT NULL DEFAULT 0,
+                        master_user_id TEXT NOT NULL DEFAULT '',
+                        details_json TEXT NOT NULL DEFAULT '{}',
+                        confirmed_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (gname, gmname)
+                    );
+                    INSERT INTO guild_targets VALUES (
+                        'ahhhha', 'absdbld', 'G-ID', 1, 2, 'OWNER',
+                        '{}', 100, 100
+                    );
+                    """
+                )
+
+            with AccountDB(db_path) as db:
+                target = db.get_guild_target("ahhhha", "absdbld")
+                self.assertIsNotNone(target)
+                self.assertEqual(target.original_master_mid, "OWNER")
+                columns = {
+                    row[1]
+                    for row in db._conn.execute(
+                        "PRAGMA table_info(guild_targets)"
+                    ).fetchall()
+                }
+                self.assertIn("original_master_mid", columns)
+
     def test_cooldown_and_target_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "accounts.db"
@@ -431,8 +739,10 @@ class AccountDBGuildTests(unittest.TestCase):
                     guild_id="G-ID",
                     guild_level=1,
                     member_count=2,
+                    master_user_id="OWNER",
                     details={"confirmed": True},
                 )
+                self.assertEqual(target.original_master_mid, "OWNER")
                 confirmed_at = target.confirmed_at
                 updated = db.upsert_guild_target(
                     gname="ahhhha",
@@ -440,11 +750,39 @@ class AccountDBGuildTests(unittest.TestCase):
                     guild_id="G-ID",
                     guild_level=2,
                     member_count=3,
+                    master_user_id="TEMP-MASTER",
                     details={"members": ["A", "B"]},
                 )
                 self.assertEqual(updated.confirmed_at, confirmed_at)
                 self.assertEqual(updated.guild_level, 2)
                 self.assertEqual(updated.details["members"], ["A", "B"])
+                self.assertEqual(updated.master_user_id, "TEMP-MASTER")
+                self.assertEqual(updated.original_master_mid, "OWNER")
+
+                job = db.create_private_job(
+                    guild_id="G-ID",
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    original_master_mid=updated.original_master_mid,
+                    controller_mid="TEMP-MASTER",
+                    paid_count_per_account=10,
+                    total_count_limit=20,
+                )
+                self.assertEqual(job.status, "created")
+                db.update_private_job(job.id, status="awaiting_master_transfer")
+                account = db.update_private_account(
+                    job.id,
+                    "B",
+                    state="accepted",
+                    invitation_id="GI-ID",
+                    member_state={
+                        "guild_level": 1,
+                        "daily_free_research_count": 0,
+                        "daily_paid_research_count": 0,
+                    },
+                )
+                self.assertEqual(account["state"], "accepted")
+                self.assertEqual(account["member_state"]["guild_level"], 1)
 
     def test_guild_run_history_and_account_totals_are_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -551,7 +889,78 @@ class FakeWorkflowClient:
         return GrpcResponse(b"", {}, {})
 
 
+class DynamicGuildLevelClient:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.free_count = 0
+
+    def unary(self, path, message, metadata=None):
+        self.calls.append(path)
+        if path == JOIN_GUILD_PATH:
+            return GrpcResponse(
+                pb.encode_message_field(
+                    2,
+                    guild_member_state(level=3, free_count=0, paid_count=0),
+                ),
+                {},
+                {},
+            )
+        if path == ATTEND_GUILD_PATH:
+            return GrpcResponse(
+                pb.encode_message_field(
+                    4,
+                    guild_member_state(level=3, free_count=0, paid_count=0),
+                ),
+                {},
+                {},
+            )
+        if path == CONDUCT_FREE_GUILD_LAB_RESEARCH_PATH:
+            self.free_count += 1
+            level = 3 if self.free_count <= 3 else 4
+            return GrpcResponse(
+                dynamic_free_research_response(
+                    level=level,
+                    free_count=self.free_count,
+                ),
+                {},
+                {},
+            )
+        if path == CONDUCT_PAID_GUILD_LAB_RESEARCH_PATH:
+            return GrpcResponse(dynamic_paid_research_response(), {}, {})
+        if path == GET_GUILD_PATH:
+            return GrpcResponse(guild_detail_response(), {}, {})
+        return GrpcResponse(b"", {}, {})
+
+
 class GuildRunnerTests(unittest.TestCase):
+    def test_run_joined_reuses_sop_without_join_rpc(self) -> None:
+        client = FakeWorkflowClient()
+        runner = GuildRunner(
+            client,
+            AccountState(mid="MID", game_access_token="token").to_session(),
+            paid_research_limit=0,
+            sleep_seconds=0,
+            initial_diamond_balance=900,
+        )
+        initial = parse_accept_guild_invitation_response(
+            pb.encode_message_field(
+                2,
+                guild_member_state(level=1, free_count=0, paid_count=0),
+            )
+        )
+
+        result = runner.run_joined(
+            "G-ID",
+            initial_action=initial,
+            joined_at=100,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.joined_at, 100)
+        self.assertNotIn(JOIN_GUILD_PATH, client.calls)
+        self.assertIn(ATTEND_GUILD_PATH, client.calls)
+        self.assertIn(LEAVE_GUILD_PATH, client.calls)
+
     def test_full_sop_until_insufficient_then_leave(self) -> None:
         client = FakeWorkflowClient()
         balances: list[int] = []
@@ -648,6 +1057,45 @@ class GuildRunnerTests(unittest.TestCase):
         self.assertEqual(result.stop_reason, "total_count_reached")
         self.assertNotIn(CONDUCT_PAID_GUILD_LAB_RESEARCH_PATH, client.calls)
 
+    def test_guild_level_up_unlocks_and_consumes_new_free_research(self) -> None:
+        client = DynamicGuildLevelClient()
+        runner = GuildRunner(
+            client,
+            AccountState(mid="MID", game_access_token="token").to_session(),
+            paid_research_limit=1,
+            sleep_seconds=0,
+            initial_diamond_balance=100,
+        )
+
+        result = runner.run("G-ID")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.free_research_count, 4)
+        self.assertEqual(result.paid_research_count, 1)
+        self.assertEqual(result.stop_reason, "paid_count_reached")
+        self.assertEqual(result.guild_progress.level_before, 3)
+        self.assertEqual(result.guild_progress.level_after, 4)
+        self.assertEqual(
+            result.guild_progress.daily_free_research_limit_before,
+            3,
+        )
+        self.assertEqual(
+            result.guild_progress.daily_free_research_limit_after,
+            4,
+        )
+        self.assertEqual(
+            result.guild_progress.daily_free_research_remaining_after,
+            0,
+        )
+        self.assertEqual(
+            client.calls.count(CONDUCT_FREE_GUILD_LAB_RESEARCH_PATH),
+            4,
+        )
+        self.assertEqual(
+            client.calls.count(CONDUCT_PAID_GUILD_LAB_RESEARCH_PATH),
+            1,
+        )
+
 
 class DummyClient:
     def __init__(self, *args, **kwargs) -> None:
@@ -743,12 +1191,106 @@ class FakeSearchGuild:
         return GrpcResponse(guild_search_response(), {}, {})
 
 
+class PrivateScenarioClient:
+    calls: list[tuple[str, str]] = []
+    master_mid = "CONTROLLER"
+    free_counts: dict[str, int] = {}
+
+    def __init__(self, endpoint: str) -> None:
+        self.endpoint = endpoint
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args) -> None:
+        return None
+
+    def unary(self, path, message, metadata=None):
+        mid = str((metadata or {}).get("crumble-user-id") or "")
+        type(self).calls.append((mid, path))
+        if path == SEARCH_GUILDS_PATH:
+            master_name = (
+                "absdbld" if type(self).master_mid == "OWNER" else "controller"
+            )
+            summary = guild_summary_message(
+                join_method=1,
+                master_mid=type(self).master_mid,
+                master_name=master_name,
+            )
+            return GrpcResponse(pb.encode_message_field(1, summary), {}, {})
+        if path == GET_GUILD_PATH:
+            return GrpcResponse(guild_detail_response(), {}, {})
+        if path == INVITE_USER_TO_GUILD_PATH:
+            return GrpcResponse(pb.encode_string_field(1, "GI-B"), {}, {})
+        if path == GET_GUILD_INVITATIONS_FOR_USER_PATH:
+            invited_at = pb.encode_int64_field(1, 1_786_000_000_000)
+            invitation = b"".join(
+                (
+                    pb.encode_string_field(1, "GI-B"),
+                    pb.encode_message_field(2, invited_at),
+                    pb.encode_message_field(
+                        3,
+                        guild_summary_message(
+                            join_method=1,
+                            master_mid="CONTROLLER",
+                            master_name="controller",
+                        ),
+                    ),
+                )
+            )
+            return GrpcResponse(pb.encode_message_field(1, invitation), {}, {})
+        if path == ACCEPT_GUILD_INVITATION_PATH:
+            return GrpcResponse(
+                pb.encode_message_field(
+                    2,
+                    guild_member_state(level=1, free_count=0, paid_count=0),
+                ),
+                {},
+                {},
+            )
+        if path == ATTEND_GUILD_PATH:
+            return GrpcResponse(attend_guild_response(), {}, {})
+        if path == CONDUCT_FREE_GUILD_LAB_RESEARCH_PATH:
+            count = type(self).free_counts.get(mid, 0) + 1
+            type(self).free_counts[mid] = count
+            return GrpcResponse(free_research_response(count), {}, {})
+        if path == CONDUCT_PAID_GUILD_LAB_RESEARCH_PATH:
+            return GrpcResponse(payment_response(10), {}, {})
+        if path == LEAVE_GUILD_PATH:
+            return GrpcResponse(b"", {}, {})
+        raise AssertionError(f"unexpected private RPC: mid={mid} path={path}")
+
+
+class PrivateWaitingClient:
+    calls: list[str] = []
+
+    def __init__(self, endpoint: str) -> None:
+        self.endpoint = endpoint
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args) -> None:
+        return None
+
+    def unary(self, path, message, metadata=None):
+        type(self).calls.append(path)
+        if path == GET_GUILD_PATH:
+            raise GrpcError(9, "user is not a guild member")
+        if path == GET_GUILD_APPLICATIONS_FOR_USER_PATH:
+            return GrpcResponse(b"", {}, {})
+        if path == APPLY_GUILD_PATH:
+            return GrpcResponse(pb.encode_string_field(1, "GA-ID"), {}, {})
+        raise AssertionError(f"unexpected waiting RPC: {path}")
+
+
 class GuildCommandTests(unittest.TestCase):
-    def test_guild_parser_requires_paid_and_total_counts(self) -> None:
+    def test_guild_parser_exposes_only_public_and_private(self) -> None:
         parser = cli.build_parser()
         args = parser.parse_args(
             [
                 "guild",
+                "public",
                 "--gname",
                 "ahhhha",
                 "--gmname",
@@ -761,19 +1303,239 @@ class GuildCommandTests(unittest.TestCase):
         )
         self.assertEqual(args.count, 20)
         self.assertEqual(args.totalcount, 200)
+        self.assertEqual(args.guild_action, "public")
 
-        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            parser.parse_args(
+        incomplete = parser.parse_args(
+            [
+                "guild",
+                "public",
+                "--gname",
+                "ahhhha",
+                "--gmname",
+                "absdbld",
+                "--count",
+                "20",
+            ]
+        )
+        with self.assertRaises(SystemExit):
+            cli.cmd_guild(incomplete)
+
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["guild"])
+            for removed_action in ("run", "invite", "accept"):
+                with self.subTest(removed_action=removed_action):
+                    with self.assertRaises(SystemExit):
+                        parser.parse_args(["guild", removed_action])
+
+        public = parser.parse_args(
+            [
+                "guild",
+                "public",
+                "--gname",
+                "ahhhha",
+                "--gmname",
+                "absdbld",
+                "--count",
+                "10",
+                "--totalcount",
+                "20",
+            ]
+        )
+        self.assertEqual(public.guild_action, "public")
+
+        private = parser.parse_args(
+            [
+                "guild",
+                "private",
+                "--gname",
+                "ahhhha",
+                "--gmname",
+                "absdbld",
+                "--master-mid",
+                "CONTROLLER",
+                "--count",
+                "10",
+                "--totalcount",
+                "20",
+            ]
+        )
+        self.assertEqual(private.guild_action, "private")
+        self.assertEqual(private.master_mid, "CONTROLLER")
+
+    def test_private_flow_invites_donor_and_waits_for_manual_master_return(
+        self,
+    ) -> None:
+        PrivateScenarioClient.calls = []
+        PrivateScenarioClient.free_counts = {}
+        PrivateScenarioClient.master_mid = "CONTROLLER"
+        parser = cli.build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                for mid in ("CONTROLLER", "DONOR"):
+                    db.upsert_state(
+                        AccountState(
+                            mid=mid,
+                            guest_secret="secret",
+                            game_access_token="token",
+                            next_stage=31,
+                            diamond_balance=900,
+                        ),
+                        used=True,
+                        ready=True,
+                        invalid=False,
+                    )
+                db.upsert_guild_target(
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    guild_id="G-ID",
+                    guild_level=1,
+                    member_count=2,
+                    master_user_id="OWNER",
+                    original_master_mid="OWNER",
+                    details={"search_summary": {"join_method": 1}},
+                )
+
+            args = parser.parse_args(
                 [
                     "guild",
+                    "private",
                     "--gname",
                     "ahhhha",
                     "--gmname",
                     "absdbld",
+                    "--master-mid",
+                    "CONTROLLER",
                     "--count",
-                    "20",
+                    "1",
+                    "--totalcount",
+                    "6",
+                    "--wait-timeout",
+                    "0",
+                    "--db",
+                    str(db_path),
                 ]
             )
+            output = io.StringIO()
+            with (
+                patch.object(cli, "GrpcClient", PrivateScenarioClient),
+                patch.object(
+                    cli, "_login_account", side_effect=lambda row: row.to_state()
+                ),
+                redirect_stdout(output),
+            ):
+                code = cli.cmd_guild(args)
+
+            self.assertEqual(code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["mode"], "private")
+            self.assertEqual(payload["next_state"], "awaiting_master_return")
+            self.assertEqual(
+                payload["manual_master_return"]["to_original_master_mid"],
+                "OWNER",
+            )
+            self.assertEqual(payload["accounts_attempted"], 1)
+            self.assertNotIn(
+                TRANSFER_GUILD_MASTER_PATH,
+                [path for _, path in PrivateScenarioClient.calls],
+            )
+
+            with AccountDB(db_path) as db:
+                target = db.get_guild_target("ahhhha", "absdbld")
+                self.assertEqual(target.original_master_mid, "OWNER")
+                job = db.get_active_private_job("G-ID", "CONTROLLER")
+                self.assertEqual(job.status, "awaiting_master_return")
+                donor = db.get("DONOR")
+                self.assertGreater(donor.guild_left_at, donor.guild_joined_at)
+                self.assertEqual(donor.guild_paid_research_total, 1)
+
+            PrivateScenarioClient.master_mid = "OWNER"
+            resumed_output = io.StringIO()
+            with (
+                patch.object(cli, "GrpcClient", PrivateScenarioClient),
+                patch.object(
+                    cli, "_login_account", side_effect=lambda row: row.to_state()
+                ),
+                redirect_stdout(resumed_output),
+            ):
+                resumed_code = cli.cmd_guild(args)
+
+            self.assertEqual(resumed_code, 0)
+            resumed = json.loads(resumed_output.getvalue())
+            self.assertTrue(resumed["complete"])
+            self.assertEqual(resumed["stopped_reason"], "complete")
+            with AccountDB(db_path) as db:
+                jobs = db._conn.execute(
+                    "SELECT status FROM guild_private_jobs ORDER BY id"
+                ).fetchall()
+                self.assertEqual([row[0] for row in jobs], ["complete"])
+
+    def test_private_flow_applies_and_persists_waiting_state(self) -> None:
+        PrivateWaitingClient.calls = []
+        parser = cli.build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                db.upsert_state(
+                    AccountState(
+                        mid="CONTROLLER",
+                        guest_secret="secret",
+                        game_access_token="token",
+                        next_stage=31,
+                    ),
+                    used=True,
+                    ready=True,
+                    invalid=False,
+                )
+                db.upsert_guild_target(
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    guild_id="G-ID",
+                    master_user_id="OWNER",
+                    original_master_mid="OWNER",
+                    details={"search_summary": {"join_method": 1}},
+                )
+            args = parser.parse_args(
+                [
+                    "guild",
+                    "private",
+                    "--gname",
+                    "ahhhha",
+                    "--gmname",
+                    "absdbld",
+                    "--master-mid",
+                    "CONTROLLER",
+                    "--count",
+                    "1",
+                    "--totalcount",
+                    "6",
+                    "--wait-timeout",
+                    "0",
+                    "--db",
+                    str(db_path),
+                ]
+            )
+            output = io.StringIO()
+            with (
+                patch.object(cli, "GrpcClient", PrivateWaitingClient),
+                patch.object(
+                    cli, "_login_account", side_effect=lambda row: row.to_state()
+                ),
+                redirect_stdout(output),
+            ):
+                code = cli.cmd_guild(args)
+
+            self.assertEqual(code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(
+                payload["stopped_reason"],
+                "awaiting_application_approval",
+            )
+            self.assertEqual(payload["job"]["application_id"], "GA-ID")
+            self.assertEqual(payload["job"]["original_master_mid"], "OWNER")
+            self.assertIn(APPLY_GUILD_PATH, PrivateWaitingClient.calls)
 
     def test_legacy_database_is_migrated_before_guild_pool_query(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -809,6 +1571,7 @@ class GuildCommandTests(unittest.TestCase):
                 )
 
             args = argparse.Namespace(
+                guild_action="public",
                 gname="ahhhha",
                 gmname="absdbld",
                 count=1,
@@ -892,6 +1655,7 @@ class GuildCommandTests(unittest.TestCase):
                 )
 
             args = argparse.Namespace(
+                guild_action="public",
                 gname="ahhhha",
                 gmname="absdbld",
                 count=2,
@@ -970,6 +1734,7 @@ class GuildCommandTests(unittest.TestCase):
                 )
 
             args = argparse.Namespace(
+                guild_action="public",
                 gname="ahhhha",
                 gmname="absdbld",
                 count=1,

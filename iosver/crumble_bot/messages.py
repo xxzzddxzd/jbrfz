@@ -201,6 +201,10 @@ def join_guild_request(guild_id: str) -> bytes:
     return guild_id_request(guild_id)
 
 
+def apply_guild_request(guild_id: str) -> bytes:
+    return guild_id_request(guild_id)
+
+
 def leave_guild_request(guild_id: str) -> bytes:
     return guild_id_request(guild_id)
 
@@ -219,6 +223,46 @@ def conduct_paid_guild_lab_research_request(guild_id: str) -> bytes:
 
 def attend_guild_request(guild_id: str) -> bytes:
     return guild_id_request(guild_id)
+
+
+def invite_user_to_guild_request(guild_id: str, invitee_id: str) -> bytes:
+    """Build InviteUserToGuildRequest: guild id field 1, invitee MID field 2."""
+    return b"".join(
+        (
+            pb.encode_string_field(1, guild_id),
+            pb.encode_string_field(2, invitee_id),
+        )
+    )
+
+
+def get_guild_invitations_for_user_request() -> bytes:
+    """Build the empty GetGuildInvitationsForUserRequest."""
+    return b""
+
+
+def get_guild_applications_for_user_request() -> bytes:
+    """Build the empty GetGuildApplicationsForUserRequest."""
+    return b""
+
+
+def accept_guild_invitation_request(guild_id: str, invitation_id: str) -> bytes:
+    """Build AcceptGuildInvitationRequest: guild id field 1, invitation id field 2."""
+    return b"".join(
+        (
+            pb.encode_string_field(1, guild_id),
+            pb.encode_string_field(2, invitation_id),
+        )
+    )
+
+
+def transfer_guild_master_request(guild_id: str, member_id: str) -> bytes:
+    """Build TransferGuildMasterRequest: guild id field 1, member MID field 2."""
+    return b"".join(
+        (
+            pb.encode_string_field(1, guild_id),
+            pb.encode_string_field(2, member_id),
+        )
+    )
 
 
 def refresh_mail_box_request() -> bytes:

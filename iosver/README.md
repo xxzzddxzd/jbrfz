@@ -9,7 +9,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m crumble_bot gen 5
 .venv/bin/python -m crumble_bot inv GNWPX5251 -c 3
 .venv/bin/python -m crumble_bot daily
-.venv/bin/python -m crumble_bot guild --gname 'ahhhha' --gmname 'absdbld' --count 20 --totalcount 200
+.venv/bin/python -m crumble_bot guild public --gname 'ahhhha' --gmname 'absdbld' --count 20 --totalcount 200
+.venv/bin/python -m crumble_bot guild private --gname 'ahhhha' --gmname 'absdbld' --master-mid RTHLZ8967 --count 20 --totalcount 200
 .venv/bin/python -m crumble_bot list --unused --ready
 ```
 
@@ -21,7 +22,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ./main.py gen 5
 ./main.py inv GNWPX5251 -c 3
 ./main.py daily
-./main.py guild --gname 'ahhhha' --gmname 'absdbld' --count 20 --totalcount 200
+./main.py guild public --gname 'ahhhha' --gmname 'absdbld' --count 20 --totalcount 200
+./main.py guild private --gname 'ahhhha' --gmname 'absdbld' --master-mid RTHLZ8967 --count 20 --totalcount 200
 ./main.py list --unused --ready
 
 # 或
