@@ -824,6 +824,20 @@ class AccountDB:
         ).fetchone()
         return self._private_job_row(row) if row else None
 
+    def list_active_private_jobs_for_guild(
+        self,
+        guild_id: str,
+    ) -> List[GuildPrivateJobRow]:
+        rows = self._conn.execute(
+            """
+            SELECT * FROM guild_private_jobs
+            WHERE guild_id=? AND status NOT IN ('complete', 'cancelled')
+            ORDER BY id DESC
+            """,
+            (guild_id,),
+        )
+        return [self._private_job_row(row) for row in rows]
+
     def get_latest_private_job(
         self,
         guild_id: str,
@@ -837,6 +851,20 @@ class AccountDB:
             ORDER BY id DESC LIMIT 1
             """,
             (guild_id, controller_mid),
+        ).fetchone()
+        return self._private_job_row(row) if row else None
+
+    def get_latest_private_job_for_guild(
+        self,
+        guild_id: str,
+    ) -> Optional[GuildPrivateJobRow]:
+        row = self._conn.execute(
+            """
+            SELECT * FROM guild_private_jobs
+            WHERE guild_id=?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (guild_id,),
         ).fetchone()
         return self._private_job_row(row) if row else None
 
@@ -993,6 +1021,16 @@ class AccountDB:
             JOIN guild_private_jobs AS j ON j.id=a.job_id
             WHERE j.status NOT IN ('complete', 'cancelled')
               AND a.state NOT IN ('complete', 'failed')
+            """
+        )
+        return {str(row[0]) for row in rows}
+
+    def active_private_controller_mids(self) -> set[str]:
+        rows = self._conn.execute(
+            """
+            SELECT DISTINCT controller_mid
+            FROM guild_private_jobs
+            WHERE status NOT IN ('complete', 'cancelled')
             """
         )
         return {str(row[0]) for row in rows}

@@ -320,6 +320,50 @@ def _guild_actor_mid(value: str | None, argument: str = "--mid") -> str:
     return mid
 
 
+def _select_private_controller(
+    db: AccountDB,
+    *,
+    exclude_mids: set[str] | None = None,
+) -> AccountRow | None:
+    """Choose a low-value eligible account for the non-donating controller role."""
+    excluded = {mid.upper() for mid in (exclude_mids or set())}
+    excluded.update(db.active_private_account_mids())
+    excluded.update(db.active_private_controller_mids())
+    candidates = [
+        row
+        for row in db.list_guild_eligible()
+        if row.mid not in excluded and bool(row.guest_secret)
+    ]
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda row: (
+            row.diamond_balance,
+            row.created_at,
+            row.mid,
+        ),
+    )
+
+
+def _private_controller_candidate_error() -> dict:
+    return {
+        "ok": False,
+        "complete": False,
+        "mode": "private",
+        "state": "controller_candidate_not_found",
+        "stopped_reason": "controller_candidate_not_found",
+        "error": "没有可作为代理会长的账号",
+        "next_action": {
+            "action": "prepare_controller_account",
+            "message": (
+                "请补充一个 ready=1、invalid=0、next_stage>30、当前不在公会且"
+                "已结束24小时冷却的账号，或显式传入 --master-mid。"
+            ),
+        },
+    }
+
+
 def _persist_logged_in_actor(
     db: AccountDB,
     row: AccountRow,
@@ -925,10 +969,13 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
     """Run or resume an approval-guild job using a temporary controlled master."""
     gname = str(getattr(args, "gname", "") or "").strip()
     gmname = str(getattr(args, "gmname", "") or "").strip()
-    controller_mid = _guild_actor_mid(
-        getattr(args, "master_mid", None),
-        "--master-mid",
+    controller_value = str(getattr(args, "master_mid", "") or "").strip()
+    controller_mid = (
+        _guild_actor_mid(controller_value, "--master-mid")
+        if controller_value
+        else ""
     )
+    controller_source = "argument" if controller_mid else ""
     if getattr(args, "count", None) is None:
         raise SystemExit("guild private 必须提供 --count")
     if getattr(args, "totalcount", None) is None:
@@ -945,6 +992,56 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
         raise SystemExit("--totalcount 必须 >= 1")
 
     with AccountDB(args.db) as db:
+        target = db.get_guild_target(gname, gmname)
+        if not controller_mid and target is not None:
+            active_jobs = db.list_active_private_jobs_for_guild(target.guild_id)
+            if len(active_jobs) > 1:
+                payload = {
+                    "ok": False,
+                    "complete": False,
+                    "mode": "private",
+                    "state": "controller_ambiguous",
+                    "stopped_reason": "controller_ambiguous",
+                    "controllers": [job.controller_mid for job in active_jobs],
+                    "next_action": {
+                        "action": "specify_controller",
+                        "message": "该公会存在多个未完成任务，请使用 --master-mid 指定代理会长。",
+                    },
+                }
+                print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+                return 1
+            if active_jobs:
+                controller_mid = active_jobs[0].controller_mid
+                controller_source = "active_job"
+            else:
+                latest = db.get_latest_private_job_for_guild(target.guild_id)
+                if (
+                    latest is not None
+                    and latest.status == "complete"
+                    and latest.paid_count_per_account == count
+                    and latest.total_count_limit == totalcount
+                ):
+                    controller_mid = latest.controller_mid
+                    controller_source = "latest_job"
+
+        if not controller_mid:
+            excluded = set()
+            if target is not None:
+                excluded.add(target.original_master_mid or target.master_user_id)
+            selected = _select_private_controller(db, exclude_mids=excluded)
+            if selected is None:
+                print(
+                    json.dumps(
+                        _private_controller_candidate_error(),
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    flush=True,
+                )
+                return 1
+            controller_mid = selected.mid
+            controller_source = "auto"
+
         controller_row = db.get(controller_mid)
         if controller_row is None:
             payload = {
@@ -962,7 +1059,6 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
             print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
             return 1
 
-        target = db.get_guild_target(gname, gmname)
         if target is None:
             state = _login_account(controller_row)
             session = state.to_session()
@@ -1081,6 +1177,39 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
         )
         if not original_master_mid:
             raise SystemExit("目标公会缺少原会长 MID，无法建立 private 任务")
+        if controller_mid == original_master_mid:
+            if controller_source == "auto":
+                selected = _select_private_controller(
+                    db,
+                    exclude_mids={original_master_mid},
+                )
+                if selected is None:
+                    print(
+                        json.dumps(
+                            _private_controller_candidate_error(),
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        flush=True,
+                    )
+                    return 1
+                controller_mid = selected.mid
+                controller_row = selected
+            else:
+                payload = {
+                    "ok": False,
+                    "complete": False,
+                    "mode": "private",
+                    "state": "controller_is_original_master",
+                    "stopped_reason": "controller_is_original_master",
+                    "controller_mid": controller_mid,
+                    "next_action": {
+                        "action": "choose_another_controller",
+                        "message": "代理会长不能是原会长，请改用其他 --master-mid。",
+                    },
+                }
+                print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+                return 1
         job = db.get_active_private_job(target.guild_id, controller_mid)
         if job is not None and (
             job.paid_count_per_account != count
@@ -1105,6 +1234,10 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                         "state": "complete",
                         "stopped_reason": "target_already_complete",
                         "job": _private_cli_job_payload(latest),
+                        "controller": {
+                            "mid": controller_mid,
+                            "source": controller_source,
+                        },
                         "progress": {
                             "current": latest.effective_count,
                             "target": latest.total_count_limit,
@@ -1162,6 +1295,10 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                     "message": "检查 error；修复对应条件后重跑同一命令继续。",
                 },
             }
+        payload["controller"] = {
+            "mid": controller_mid,
+            "source": controller_source,
+        }
 
     print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
     return 0 if payload.get("ok") else 1
@@ -1609,7 +1746,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.add_argument(
         "--master-mid",
-        help="private：临时接管会长并负责发送邀请的 sqlite 账号 MID",
+        help=(
+            "private：可选；显式指定临时会长账号 MID。省略时优先复用已有任务，"
+            "否则自动选择钻石最少的可用账号"
+        ),
     )
     sp.add_argument("--db", default=str(DEFAULT_DB), help="sqlite 路径")
     sp.set_defaults(func=cmd_guild)

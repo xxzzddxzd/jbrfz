@@ -1418,6 +1418,22 @@ class GuildCommandTests(unittest.TestCase):
         self.assertEqual(private.guild_action, "private")
         self.assertEqual(private.master_mid, "CONTROLLER")
 
+        private_auto = parser.parse_args(
+            [
+                "guild",
+                "private",
+                "--gname",
+                "ahhhha",
+                "--gmname",
+                "absdbld",
+                "--count",
+                "10",
+                "--totalcount",
+                "20",
+            ]
+        )
+        self.assertIsNone(private_auto.master_mid)
+
         return_list = parser.parse_args(["guild", "private", "return"])
         self.assertEqual(return_list.private_action, "return")
         self.assertIsNone(return_list.private_job_id)
@@ -1844,6 +1860,93 @@ class GuildCommandTests(unittest.TestCase):
             self.assertEqual(payload["job"]["application_id"], "GA-ID")
             self.assertEqual(payload["job"]["original_master_mid"], "OWNER")
             self.assertIn(APPLY_GUILD_PATH, PrivateWaitingClient.calls)
+
+    def test_private_flow_auto_selects_and_reuses_low_diamond_controller(
+        self,
+    ) -> None:
+        PrivateWaitingClient.calls = []
+        parser = cli.build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                for mid, diamonds in (
+                    ("OWNER", 0),
+                    ("PROXY-LOW", 10),
+                    ("PROXY-HIGH", 900),
+                ):
+                    db.upsert_state(
+                        AccountState(
+                            mid=mid,
+                            guest_secret="secret",
+                            game_access_token="token",
+                            next_stage=31,
+                            diamond_balance=diamonds,
+                        ),
+                        used=True,
+                        ready=True,
+                        invalid=False,
+                    )
+                db.upsert_guild_target(
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    guild_id="G-ID",
+                    master_user_id="OWNER",
+                    original_master_mid="OWNER",
+                    details={"search_summary": {"join_method": 1}},
+                )
+
+            args = parser.parse_args(
+                [
+                    "guild",
+                    "private",
+                    "--gname",
+                    "ahhhha",
+                    "--gmname",
+                    "absdbld",
+                    "--count",
+                    "1",
+                    "--totalcount",
+                    "6",
+                    "--db",
+                    str(db_path),
+                ]
+            )
+            first_output = io.StringIO()
+            with (
+                patch.object(cli, "GrpcClient", PrivateWaitingClient),
+                patch.object(
+                    cli, "_login_account", side_effect=lambda row: row.to_state()
+                ),
+                redirect_stdout(first_output),
+            ):
+                first_code = cli.cmd_guild(args)
+
+            self.assertEqual(first_code, 0)
+            first = json.loads(first_output.getvalue())
+            self.assertEqual(first["controller"]["mid"], "PROXY-LOW")
+            self.assertEqual(first["controller"]["source"], "auto")
+            self.assertEqual(first["state"], "awaiting_application_approval")
+            with AccountDB(db_path) as db:
+                jobs = db.list_active_private_jobs_for_guild("G-ID")
+                self.assertEqual(len(jobs), 1)
+                self.assertEqual(jobs[0].controller_mid, "PROXY-LOW")
+
+            second_output = io.StringIO()
+            with (
+                patch.object(cli, "GrpcClient", PrivateWaitingClient),
+                patch.object(
+                    cli, "_login_account", side_effect=lambda row: row.to_state()
+                ),
+                redirect_stdout(second_output),
+            ):
+                second_code = cli.cmd_guild(args)
+
+            self.assertEqual(second_code, 0)
+            second = json.loads(second_output.getvalue())
+            self.assertEqual(second["controller"]["mid"], "PROXY-LOW")
+            self.assertEqual(second["controller"]["source"], "active_job")
+            with AccountDB(db_path) as db:
+                self.assertEqual(len(db.list_private_jobs()), 1)
 
     def test_legacy_database_is_migrated_before_guild_pool_query(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
