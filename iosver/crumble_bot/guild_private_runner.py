@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import asdict
 from typing import Callable, Optional
@@ -31,6 +32,24 @@ log = logging.getLogger(__name__)
 
 LoginAccount = Callable[[AccountRow], AccountState]
 ClientFactory = Callable[[str], GrpcClient]
+
+_DAILY_RECRUITMENT_LIMIT_PATTERN = re.compile(
+    r"daily recruitment limit(?:\s+of)?\s*(\d+)?",
+    re.IGNORECASE,
+)
+
+
+def _parse_daily_recruitment_limit(message: str) -> Optional[int]:
+    """Return the guild-wide daily recruitment limit, or ``None`` if unrelated.
+
+    A return value of zero means the server reported the limit condition without
+    including the numeric limit in its message.
+    """
+    matched = _DAILY_RECRUITMENT_LIMIT_PATTERN.search(str(message or ""))
+    if matched is None:
+        return None
+    value = matched.group(1)
+    return int(value) if value else 0
 
 
 class PrivateGuildRunner:
@@ -373,10 +392,31 @@ class PrivateGuildRunner:
         workflows: list[GuildWorkflowResult] = []
         failures = 0
         attempted = 0
+        recruitment_limit: Optional[int] = None
+        recruitment_limit_error = ""
+        recruitment_limit_mid = ""
         effective_before = int(job.effective_count)
         effective_total = int(job.effective_count)
 
         records = self.db.list_private_accounts(job.id)
+        # Older versions treated this guild-wide transient condition as an
+        # account failure. Restore those rows so the same donors can be retried
+        # after the server resets the guild's daily recruitment count.
+        restored_records: list[dict] = []
+        for item in records:
+            if (
+                item["state"] == "failed"
+                and _parse_daily_recruitment_limit(str(item.get("error") or ""))
+                is not None
+            ):
+                item = self.db.update_private_account(
+                    job.id,
+                    str(item["mid"]),
+                    state="selected",
+                    error="",
+                )
+            restored_records.append(item)
+        records = restored_records
         pending = [
             item
             for item in records
@@ -423,8 +463,41 @@ class PrivateGuildRunner:
                 if not workflow.ok:
                     failures += 1
             except Exception as error:
-                failures += 1
                 message = f"{type(error).__name__}: {error}"
+                detected_limit = (
+                    _parse_daily_recruitment_limit(error.message)
+                    if isinstance(error, GrpcError) and error.status == 9
+                    else None
+                )
+                if detected_limit is not None:
+                    recruitment_limit = detected_limit
+                    recruitment_limit_error = message
+                    recruitment_limit_mid = row.mid
+                    self.db.update_private_account(
+                        job.id,
+                        row.mid,
+                        state="selected",
+                        error=message,
+                    )
+                    results.append(
+                        {
+                            "mid": row.mid,
+                            "ok": False,
+                            "retryable": True,
+                            "stopped_reason": "daily_recruitment_limit_reached",
+                            "daily_recruitment_limit": detected_limit or None,
+                            "error": message,
+                        }
+                    )
+                    log.warning(
+                        "private guild daily recruitment limit reached while "
+                        "inviting %s: %s",
+                        row.mid,
+                        message,
+                    )
+                    break
+
+                failures += 1
                 self.db.update_private_account(
                     job.id,
                     row.mid,
@@ -438,6 +511,9 @@ class PrivateGuildRunner:
         if target_reached:
             stopped_reason = "totalcount_reached"
             next_state = "awaiting_master_return"
+        elif recruitment_limit is not None:
+            stopped_reason = "daily_recruitment_limit_reached"
+            next_state = "awaiting_recruitment_reset"
         elif attempted:
             stopped_reason = "target_not_reached"
             next_state = "awaiting_donors"
@@ -449,7 +525,13 @@ class PrivateGuildRunner:
             job.id,
             status=next_state,
             effective_count=effective_total,
-            error="" if failures == 0 else f"{failures} donor account(s) failed",
+            error=(
+                recruitment_limit_error
+                if recruitment_limit_error
+                else (
+                    "" if failures == 0 else f"{failures} donor account(s) failed"
+                )
+            ),
         )
         pool = self.db.guild_pool_status()
         saved_records = self.db.list_private_accounts(job.id)
@@ -484,6 +566,9 @@ class PrivateGuildRunner:
             "totals": self._totals(workflows),
             "results": results,
         }
+        if recruitment_limit is not None:
+            payload["daily_recruitment_limit"] = recruitment_limit or None
+            payload["retryable_mid"] = recruitment_limit_mid
         if target_reached:
             payload["manual_master_return"] = {
                 "required": True,
@@ -495,6 +580,21 @@ class PrivateGuildRunner:
                 "action": "return_master",
                 "command": f"python main.py guild private return {job.id}",
                 "message": "目标已达到，请将会长交还给原会长。",
+            }
+        elif recruitment_limit is not None:
+            limit_text = (
+                f"（上限 {recruitment_limit} 人次）"
+                if recruitment_limit
+                else ""
+            )
+            payload["next_action"] = {
+                "action": "wait_for_daily_recruitment_reset_and_rerun",
+                "message": (
+                    f"公会今日招募人数已达上限{limit_text}；每日计数重置后，"
+                    "重新执行同一条 guild private 命令。当前账号不会被标记失败，"
+                    "也不会产生退出公会的 24 小时冷却。"
+                ),
+                "retryable_mid": recruitment_limit_mid,
             }
         else:
             payload["next_action"] = {

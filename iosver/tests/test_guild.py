@@ -1296,6 +1296,22 @@ class PrivateScenarioClient:
         raise AssertionError(f"unexpected private RPC: mid={mid} path={path}")
 
 
+class PrivateRecruitmentLimitClient(PrivateScenarioClient):
+    calls: list[tuple[str, str]] = []
+    master_mid = "CONTROLLER"
+    free_counts: dict[str, int] = {}
+
+    def unary(self, path, message, metadata=None):
+        if path == INVITE_USER_TO_GUILD_PATH:
+            mid = str((metadata or {}).get("crumble-user-id") or "")
+            type(self).calls.append((mid, path))
+            raise GrpcError(
+                9,
+                "Guild has reached the daily recruitment limit of 51.",
+            )
+        return super().unary(path, message, metadata)
+
+
 class PrivateWaitingClient:
     calls: list[str] = []
 
@@ -1740,6 +1756,121 @@ class GuildCommandTests(unittest.TestCase):
                 active = db.get_active_private_job("G-ID", "CONTROLLER")
                 self.assertEqual(active.status, "awaiting_master_return")
                 self.assertEqual(len(db.list_private_jobs()), 1)
+
+    def test_private_flow_stops_at_daily_recruitment_limit_and_keeps_donor(
+        self,
+    ) -> None:
+        PrivateRecruitmentLimitClient.calls = []
+        PrivateRecruitmentLimitClient.master_mid = "CONTROLLER"
+        parser = cli.build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                for mid in ("CONTROLLER", "DONOR-A", "DONOR-B"):
+                    db.upsert_state(
+                        AccountState(
+                            mid=mid,
+                            guest_secret="secret",
+                            game_access_token="token",
+                            next_stage=31,
+                            diamond_balance=900,
+                        ),
+                        used=True,
+                        ready=True,
+                        invalid=False,
+                    )
+                db.upsert_guild_target(
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    guild_id="G-ID",
+                    guild_level=1,
+                    member_count=2,
+                    master_user_id="OWNER",
+                    original_master_mid="OWNER",
+                    details={"search_summary": {"join_method": 1}},
+                )
+                job = db.create_private_job(
+                    guild_id="G-ID",
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    original_master_mid="OWNER",
+                    controller_mid="CONTROLLER",
+                    paid_count_per_account=1,
+                    total_count_limit=100,
+                )
+                db.update_private_job(job.id, status="awaiting_donors")
+                db.update_private_account(
+                    job.id,
+                    "DONOR-A",
+                    state="failed",
+                    error=(
+                        "GrpcError: grpc-status=9 message='Guild has reached "
+                        "the daily recruitment limit of 51.'"
+                    ),
+                )
+
+            args = parser.parse_args(
+                [
+                    "guild",
+                    "private",
+                    "--gname",
+                    "ahhhha",
+                    "--gmname",
+                    "absdbld",
+                    "--master-mid",
+                    "CONTROLLER",
+                    "--count",
+                    "1",
+                    "--totalcount",
+                    "100",
+                    "--db",
+                    str(db_path),
+                ]
+            )
+            output = io.StringIO()
+            with (
+                patch.object(cli, "GrpcClient", PrivateRecruitmentLimitClient),
+                patch.object(
+                    cli, "_login_account", side_effect=lambda row: row.to_state()
+                ),
+                redirect_stdout(output),
+            ):
+                code = cli.cmd_guild(args)
+
+            self.assertEqual(code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["complete"])
+            self.assertEqual(payload["state"], "awaiting_recruitment_reset")
+            self.assertEqual(
+                payload["stopped_reason"],
+                "daily_recruitment_limit_reached",
+            )
+            self.assertEqual(payload["daily_recruitment_limit"], 51)
+            self.assertEqual(payload["retryable_mid"], "DONOR-A")
+            self.assertEqual(payload["accounts_attempted"], 1)
+            self.assertEqual(payload["accounts_failed"], 0)
+            self.assertEqual(
+                payload["next_action"]["action"],
+                "wait_for_daily_recruitment_reset_and_rerun",
+            )
+            invite_calls = [
+                path
+                for _, path in PrivateRecruitmentLimitClient.calls
+                if path == INVITE_USER_TO_GUILD_PATH
+            ]
+            self.assertEqual(len(invite_calls), 1)
+
+            with AccountDB(db_path) as db:
+                saved_job = db.get_private_job(job.id)
+                self.assertEqual(saved_job.status, "awaiting_recruitment_reset")
+                donor_a = db.get_private_account(job.id, "DONOR-A")
+                self.assertEqual(donor_a["state"], "selected")
+                self.assertIn("daily recruitment limit", donor_a["error"])
+                self.assertIsNone(db.get_private_account(job.id, "DONOR-B"))
+                account = db.get("DONOR-A")
+                self.assertEqual(account.guild_joined_at, 0)
+                self.assertEqual(account.guild_left_at, 0)
 
     def test_private_return_lists_pending_jobs_by_database_id(self) -> None:
         parser = cli.build_parser()
