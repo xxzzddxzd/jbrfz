@@ -68,6 +68,35 @@ class GuildDetail:
     announcement: str = ""
 
 
+@dataclass(frozen=True)
+class GuildMemberStateSnapshot:
+    guild_level: int
+    daily_free_research_count: int
+    daily_paid_research_count: int
+
+
+@dataclass(frozen=True)
+class GuildProgressionChanges:
+    previous_experience: int
+    current_experience: int
+    previous_contribution: int
+    current_contribution: int
+
+
+@dataclass(frozen=True)
+class GuildLabResearchChanges:
+    previous_research_point: int
+    current_research_point: int
+
+
+@dataclass(frozen=True)
+class GuildActionResult:
+    member_state: GuildMemberStateSnapshot | None = None
+    progression: GuildProgressionChanges | None = None
+    lab_research: GuildLabResearchChanges | None = None
+    is_super_success: bool | None = None
+
+
 def parse_guild_search_response(body: bytes) -> list[GuildSearchSummary]:
     """Parse the identifying fields from SearchGuildsResponse."""
     summaries: list[GuildSearchSummary] = []
@@ -146,6 +175,97 @@ def parse_guild_detail_response(body: bytes) -> GuildDetail:
     )
 
 
+def parse_join_guild_response(body: bytes) -> GuildActionResult:
+    """Parse JoinGuildResponse.member_state (field 2)."""
+    return _parse_guild_action_response(body, member_state_field=2)
+
+
+def parse_attend_guild_response(body: bytes) -> GuildActionResult:
+    """Parse attendance progression and the resulting member state."""
+    return _parse_guild_action_response(
+        body,
+        progression_field=3,
+        member_state_field=4,
+    )
+
+
+def parse_free_guild_lab_research_response(body: bytes) -> GuildActionResult:
+    """Parse one free research result."""
+    return _parse_guild_action_response(
+        body,
+        progression_field=2,
+        lab_research_field=3,
+        member_state_field=4,
+        super_success_field=5,
+    )
+
+
+def parse_paid_guild_lab_research_response(body: bytes) -> GuildActionResult:
+    """Parse one diamond-paid research/donation result."""
+    return _parse_guild_action_response(
+        body,
+        progression_field=3,
+        lab_research_field=4,
+        member_state_field=6,
+        super_success_field=5,
+    )
+
+
+def _parse_guild_action_response(
+    body: bytes,
+    *,
+    member_state_field: int,
+    progression_field: int | None = None,
+    lab_research_field: int | None = None,
+    super_success_field: int | None = None,
+) -> GuildActionResult:
+    fields = pb.decode_fields(body)
+
+    member_state = None
+    member_state_body = _message_value(fields, member_state_field)
+    if member_state_body is not None:
+        member_fields = pb.decode_fields(member_state_body)
+        member_state = GuildMemberStateSnapshot(
+            guild_level=_int_value(member_fields, 7),
+            daily_free_research_count=_int_value(member_fields, 10),
+            daily_paid_research_count=_int_value(member_fields, 12),
+        )
+
+    progression = None
+    if progression_field is not None:
+        progression_body = _message_value(fields, progression_field)
+        if progression_body is not None:
+            progression_fields = pb.decode_fields(progression_body)
+            progression = GuildProgressionChanges(
+                previous_experience=_int_value(progression_fields, 1),
+                current_experience=_int_value(progression_fields, 2),
+                previous_contribution=_int_value(progression_fields, 3),
+                current_contribution=_int_value(progression_fields, 4),
+            )
+
+    lab_research = None
+    if lab_research_field is not None:
+        lab_research_body = _message_value(fields, lab_research_field)
+        if lab_research_body is not None:
+            lab_research_fields = pb.decode_fields(lab_research_body)
+            lab_research = GuildLabResearchChanges(
+                previous_research_point=_int_value(lab_research_fields, 1),
+                current_research_point=_int_value(lab_research_fields, 2),
+            )
+
+    is_super_success = (
+        _optional_bool_value(fields, super_success_field)
+        if super_success_field is not None
+        else None
+    )
+    return GuildActionResult(
+        member_state=member_state,
+        progression=progression,
+        lab_research=lab_research,
+        is_super_success=is_super_success,
+    )
+
+
 def _string_value(fields, target: int) -> str:
     for field_number, wire_type, value in fields:
         if field_number == target and wire_type == 2:
@@ -168,6 +288,13 @@ def _int_value(fields, target: int) -> int:
         if field_number == target and wire_type == 0:
             return int(value)
     return 0
+
+
+def _optional_bool_value(fields, target: int) -> bool | None:
+    for field_number, wire_type, value in fields:
+        if field_number == target and wire_type == 0:
+            return bool(value)
+    return None
 
 
 def _double_value(fields, target: int) -> float:

@@ -5,14 +5,17 @@ import json
 import sqlite3
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
+from zoneinfo import ZoneInfo
 
 from .auth import AccountState
 from .constants import ENDPOINT, FALLBACK_RESOURCE_KEY
 
 DEFAULT_DB = Path(__file__).resolve().parent.parent / "data" / "accounts.db"
 GUILD_COOLDOWN_SECONDS = 24 * 60 * 60
+DAILY_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
@@ -29,6 +32,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     next_stage INTEGER NOT NULL DEFAULT 1,
     diamond_balance INTEGER NOT NULL DEFAULT 0,
     guild REAL NOT NULL DEFAULT 0,
+    daily REAL NOT NULL DEFAULT 0,
     used INTEGER NOT NULL DEFAULT 0,
     ready INTEGER NOT NULL DEFAULT 0,
     invalid INTEGER NOT NULL DEFAULT 0,
@@ -69,6 +73,7 @@ class AccountRow:
     next_stage: int
     diamond_balance: int
     guild: float
+    daily: float
     used: bool
     ready: bool
     invalid: bool
@@ -122,10 +127,15 @@ class AccountDB:
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_accounts_guild ON accounts(guild)"
         )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_accounts_daily ON accounts(daily)"
+        )
         self._conn.commit()
 
     def _migrate(self) -> None:
-        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(accounts)").fetchall()}
+        cols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(accounts)").fetchall()
+        }
         if "invalid" not in cols:
             self._conn.execute(
                 "ALTER TABLE accounts ADD COLUMN invalid INTEGER NOT NULL DEFAULT 0"
@@ -137,6 +147,10 @@ class AccountDB:
         if "guild" not in cols:
             self._conn.execute(
                 "ALTER TABLE accounts ADD COLUMN guild REAL NOT NULL DEFAULT 0"
+            )
+        if "daily" not in cols:
+            self._conn.execute(
+                "ALTER TABLE accounts ADD COLUMN daily REAL NOT NULL DEFAULT 0"
             )
 
     def close(self) -> None:
@@ -265,12 +279,20 @@ class AccountDB:
         )
         self._conn.commit()
 
-    def mark_invited(self, mid: str, inviter_mid: str, state: Optional[AccountState] = None) -> None:
+    def mark_invited(
+        self, mid: str, inviter_mid: str, state: Optional[AccountState] = None
+    ) -> None:
         """Success path: fill inviter target id, mark used, keep valid."""
         now = time.time()
         if state is not None:
             state.inviter_mid = inviter_mid
-            self.upsert_state(state, used=True, ready=True, invalid=False, note=f"invited:{inviter_mid}")
+            self.upsert_state(
+                state,
+                used=True,
+                ready=True,
+                invalid=False,
+                note=f"invited:{inviter_mid}",
+            )
             return
         self._conn.execute(
             """
@@ -305,6 +327,68 @@ class AccountDB:
         )
         return [self._row(row) for row in rows]
 
+    def list_daily_accounts(
+        self,
+        *,
+        now: Optional[float] = None,
+        limit: int = 0,
+    ) -> List[AccountRow]:
+        """Ready, valid accounts not successfully processed today.
+
+        ``used`` and the guild cooldown intentionally do not affect this pool.
+        A day follows the account login timezone, Asia/Shanghai.
+        """
+        day_start, _ = self._daily_window(now)
+        sql = """
+            SELECT * FROM accounts
+            WHERE ready=1 AND invalid=0 AND next_stage>30
+              AND daily<?
+            ORDER BY created_at ASC
+        """
+        params: tuple[float | int, ...] = (day_start,)
+        if limit > 0:
+            sql += " LIMIT ?"
+            params = (day_start, int(limit))
+        return [self._row(row) for row in self._conn.execute(sql, params)]
+
+    def daily_pool_status(self, *, now: Optional[float] = None) -> Dict[str, Any]:
+        """Return today's eligible and completed daily-account counts."""
+        day_start, next_day_start = self._daily_window(now)
+        base = "ready=1 AND invalid=0 AND next_stage>30"
+        total = self._conn.execute(
+            f"SELECT COUNT(*) FROM accounts WHERE {base}"
+        ).fetchone()[0]
+        eligible = self._conn.execute(
+            f"SELECT COUNT(*) FROM accounts WHERE {base} AND daily<?",
+            (day_start,),
+        ).fetchone()[0]
+        completed_today = self._conn.execute(
+            f"SELECT COUNT(*) FROM accounts WHERE {base} AND daily>=? AND daily<?",
+            (day_start, next_day_start),
+        ).fetchone()[0]
+        return {
+            "day": datetime.fromtimestamp(day_start, DAILY_TIMEZONE).date().isoformat(),
+            "timezone": str(DAILY_TIMEZONE),
+            "total": int(total),
+            "eligible": int(eligible),
+            "completed_today": int(completed_today),
+        }
+
+    def mark_daily_completed(
+        self,
+        mid: str,
+        *,
+        completed_at: Optional[float] = None,
+    ) -> float:
+        """Record the time a complete daily workflow succeeded."""
+        timestamp = time.time() if completed_at is None else float(completed_at)
+        self._conn.execute(
+            "UPDATE accounts SET daily=?, updated_at=? WHERE mid=?",
+            (timestamp, timestamp, mid),
+        )
+        self._conn.commit()
+        return timestamp
+
     def guild_pool_status(
         self,
         *,
@@ -338,7 +422,9 @@ class AccountDB:
         return {
             "eligible": int(eligible),
             "cooling": int(cooling),
-            "next_available_at": float(next_row[0]) if next_row and next_row[0] else None,
+            "next_available_at": float(next_row[0])
+            if next_row and next_row[0]
+            else None,
         }
 
     def mark_guild_left(self, mid: str, *, left_at: Optional[float] = None) -> float:
@@ -349,6 +435,14 @@ class AccountDB:
         )
         self._conn.commit()
         return timestamp
+
+    @staticmethod
+    def _daily_window(now: Optional[float] = None) -> tuple[float, float]:
+        timestamp = time.time() if now is None else float(now)
+        current = datetime.fromtimestamp(timestamp, DAILY_TIMEZONE)
+        day_start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+        next_day_start = day_start + timedelta(days=1)
+        return day_start.timestamp(), next_day_start.timestamp()
 
     def get_guild_target(self, gname: str, gmname: str) -> Optional[GuildTargetRow]:
         row = self._conn.execute(
@@ -421,8 +515,12 @@ class AccountDB:
 
     def count(self) -> Dict[str, int]:
         total = self._conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
-        used = self._conn.execute("SELECT COUNT(*) FROM accounts WHERE used=1").fetchone()[0]
-        invalid = self._conn.execute("SELECT COUNT(*) FROM accounts WHERE invalid=1").fetchone()[0]
+        used = self._conn.execute(
+            "SELECT COUNT(*) FROM accounts WHERE used=1"
+        ).fetchone()[0]
+        invalid = self._conn.execute(
+            "SELECT COUNT(*) FROM accounts WHERE invalid=1"
+        ).fetchone()[0]
         ready_unused = self._conn.execute(
             "SELECT COUNT(*) FROM accounts WHERE ready=1 AND used=0 AND invalid=0"
         ).fetchone()[0]
@@ -462,6 +560,7 @@ class AccountDB:
             next_stage=int(row["next_stage"] or 1),
             diamond_balance=int(row["diamond_balance"] or 0),
             guild=float(row["guild"] or 0),
+            daily=float(row["daily"] or 0) if "daily" in keys else 0,
             used=bool(row["used"]),
             ready=bool(row["ready"]),
             invalid=bool(row["invalid"]) if "invalid" in keys else False,

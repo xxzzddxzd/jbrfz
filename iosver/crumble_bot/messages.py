@@ -80,7 +80,11 @@ def stage_clear_report(
             return raw_template
         return _rewrite_varint_field1(raw_template, random_seed)
 
-    seed = random_seed if random_seed is not None else random.randint(-(1 << 31), (1 << 31) - 1)
+    seed = (
+        random_seed
+        if random_seed is not None
+        else random.randint(-(1 << 31), (1 << 31) - 1)
+    )
     seed_u = seed & ((1 << 64) - 1)
     seed_bytes = pb.tag(1, 0) + pb._varint(seed_u)
     return b"".join(
@@ -115,7 +119,9 @@ def _rewrite_varint_field1(buf: bytes, seed: int) -> bytes:
     return b"".join(rest)
 
 
-def client_battle_report_minimal(owner_mid: str, cookie_ids: Sequence[int] = DEFAULT_COOKIE_IDS) -> bytes:
+def client_battle_report_minimal(
+    owner_mid: str, cookie_ids: Sequence[int] = DEFAULT_COOKIE_IDS
+) -> bytes:
     entities = []
     for i, cid in enumerate(cookie_ids, start=1):
         ent = b"".join(
@@ -213,6 +219,45 @@ def conduct_paid_guild_lab_research_request(guild_id: str) -> bytes:
 
 def attend_guild_request(guild_id: str) -> bytes:
     return guild_id_request(guild_id)
+
+
+def refresh_mail_box_request() -> bytes:
+    """Build the empty ``RefreshMailBoxRequest``."""
+    return b""
+
+
+def receive_mail_rewards_request(mail_ids: Sequence[str]) -> bytes:
+    """Build ``ReceiveMailRewardsRequest`` with repeated field 1 mail ids."""
+    return b"".join(pb.encode_string_field(1, mail_id) for mail_id in mail_ids)
+
+
+def viewed_advertisement(
+    advertisement_data_id: int,
+    *,
+    skip_count: Optional[int] = None,
+) -> bytes:
+    """Build ``ViewedAdvertisement`` and preserve optional-field presence."""
+    parts = [pb.encode_int32_field(1, advertisement_data_id)]
+    if skip_count is not None:
+        # ``skip_count`` is proto3 optional.  Its explicit zero value must still
+        # be serialized, while the normal client request leaves it absent.
+        parts.append(pb.tag(2, 0) + pb._varint(skip_count))
+    return b"".join(parts)
+
+
+def receive_mail_advertisement_reward_request(
+    advertisement_data_id: int,
+    *,
+    skip_count: Optional[int] = None,
+) -> bytes:
+    """Build ``ReceiveMailAdvertisementRewardRequest``."""
+    return pb.encode_message_field(
+        1,
+        viewed_advertisement(
+            advertisement_data_id,
+            skip_count=skip_count,
+        ),
+    )
 
 
 def sign_up_request() -> bytes:

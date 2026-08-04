@@ -9,10 +9,11 @@ from pathlib import Path
 
 from .auth import AccountState, guest_login, new_device_ids
 from .constants import ENDPOINT, FALLBACK_RESOURCE_KEY, TO_STAGE
+from .daily_runner import DailyRunner, DailyWorkflowResult
 from .db import DEFAULT_DB, AccountDB, AccountRow
 from .grpc_client import GrpcClient, GrpcError
 from .guild import Guild, GuildSearchSummary, parse_guild_search_response
-from .guild_runner import GuildRunner
+from .guild_runner import GuildRunner, GuildWorkflowResult
 from .invite import register_friend_inviter
 from .inviter import parse_inviter
 from .stage_runner import StageConfig, StageRunner
@@ -101,7 +102,152 @@ def _guild_pool_payload(status: dict) -> dict:
     return payload
 
 
-def _login_guild_account(row: AccountRow) -> AccountState:
+def _numeric_change(before: int | None, after: int | None) -> int | None:
+    if before is None or after is None:
+        return None
+    return int(after) - int(before)
+
+
+def _daily_run_totals(workflows: list[DailyWorkflowResult]) -> dict:
+    return {
+        "login_completed_count": sum(
+            1 for workflow in workflows if workflow.login_completed
+        ),
+        "mailbox_checked_count": sum(
+            1 for workflow in workflows if workflow.mailbox.checked
+        ),
+        "mail_count": sum(workflow.mailbox.mail_count for workflow in workflows),
+        "mail_claimable_count": sum(
+            workflow.mailbox.claimable_count for workflow in workflows
+        ),
+        "mail_claim_requested_count": sum(
+            workflow.mailbox.claim_requested_count for workflow in workflows
+        ),
+        "mail_claimed_count": sum(
+            workflow.mailbox.claimed_count for workflow in workflows
+        ),
+        "mail_remaining_claimable_count": sum(
+            workflow.mailbox.remaining_claimable_count for workflow in workflows
+        ),
+        "mail_reward_count": sum(
+            workflow.mailbox.reward_count for workflow in workflows
+        ),
+        "mail_advertisement_checked_count": sum(
+            1 for workflow in workflows if workflow.mailbox.advertisement.checked
+        ),
+        "mail_advertisement_claimable_count": sum(
+            workflow.mailbox.advertisement.claimable_count for workflow in workflows
+        ),
+        "mail_advertisement_claim_requested_count": sum(
+            workflow.mailbox.advertisement.claim_requested_count
+            for workflow in workflows
+        ),
+        "mail_advertisement_claimed_count": sum(
+            workflow.mailbox.advertisement.claimed_count for workflow in workflows
+        ),
+        "mail_advertisement_remaining_claimable_count": sum(
+            workflow.mailbox.advertisement.remaining_claimable_count
+            for workflow in workflows
+        ),
+        "mail_advertisement_reward_count": sum(
+            workflow.mailbox.advertisement.reward_count for workflow in workflows
+        ),
+        "mail_advertisement_diamond_reward_amount": sum(
+            workflow.mailbox.advertisement.diamond_reward_amount
+            for workflow in workflows
+        ),
+        "mail_diamond_gained": sum(
+            _numeric_change(
+                workflow.mailbox.diamond_balance_before,
+                workflow.mailbox.diamond_balance_after,
+            )
+            or 0
+            for workflow in workflows
+        ),
+    }
+
+
+def _guild_run_totals(workflows: list[GuildWorkflowResult]) -> dict:
+    def summed_change(before_attr: str, after_attr: str) -> int:
+        total = 0
+        for workflow in workflows:
+            progress = workflow.guild_progress
+            change = _numeric_change(
+                getattr(progress, before_attr),
+                getattr(progress, after_attr),
+            )
+            if change is not None:
+                total += change
+        return total
+
+    return {
+        "attendance_reward_count": sum(
+            1 for workflow in workflows if workflow.attendance_claimed
+        ),
+        "free_research_count": sum(
+            workflow.free_research_count for workflow in workflows
+        ),
+        "donation_count": sum(workflow.paid_research_count for workflow in workflows),
+        "diamond_spent": sum(workflow.diamond_spent for workflow in workflows),
+        "guild_experience_gained": summed_change(
+            "experience_before",
+            "experience_after",
+        ),
+        "member_contribution_gained": summed_change(
+            "member_contribution_before",
+            "member_contribution_after",
+        ),
+        "research_point_gained": summed_change(
+            "research_point_before",
+            "research_point_after",
+        ),
+        "super_success_count": sum(
+            workflow.guild_progress.super_success_count for workflow in workflows
+        ),
+    }
+
+
+def _guild_overall_progress(workflows: list[GuildWorkflowResult]) -> dict:
+    def first_value(attribute: str) -> int | None:
+        for workflow in workflows:
+            value = getattr(workflow.guild_progress, attribute)
+            if value is not None:
+                return int(value)
+        return None
+
+    def last_value(attribute: str) -> int | None:
+        for workflow in reversed(workflows):
+            value = getattr(workflow.guild_progress, attribute)
+            if value is not None:
+                return int(value)
+        return None
+
+    level_before = first_value("level_before")
+    level_after = last_value("level_after")
+    experience_before = first_value("experience_before")
+    experience_after = last_value("experience_after")
+    research_point_before = first_value("research_point_before")
+    research_point_after = last_value("research_point_after")
+    return {
+        "level_before": level_before,
+        "level_after": level_after,
+        "level_change": _numeric_change(level_before, level_after),
+        "experience_before": experience_before,
+        "experience_after": experience_after,
+        "experience_gained": _numeric_change(
+            experience_before,
+            experience_after,
+        ),
+        "research_point_before": research_point_before,
+        "research_point_after": research_point_after,
+        "research_point_gained": _numeric_change(
+            research_point_before,
+            research_point_after,
+        ),
+    }
+
+
+def _login_account(row: AccountRow) -> AccountState:
     state = row.to_state()
     if not state.guest_secret:
         raise RuntimeError("missing guest_secret")
@@ -113,7 +259,9 @@ def _login_guild_account(row: AccountRow) -> AccountState:
         endpoint=state.endpoint or ENDPOINT,
     )
     if fresh.mid != row.mid:
-        raise RuntimeError(f"re-login mid mismatch: expected {row.mid}, got {fresh.mid}")
+        raise RuntimeError(
+            f"re-login mid mismatch: expected {row.mid}, got {fresh.mid}"
+        )
     fresh.next_stage = state.next_stage
     fresh.inviter_mid = state.inviter_mid
     fresh.diamond_balance = state.diamond_balance
@@ -129,9 +277,7 @@ def _guild_confirmation_payload(summary: GuildSearchSummary) -> dict:
         1: "approval",
     }.get(summary.join_method, f"unknown:{summary.join_method}")
     payload["member_ids"] = None
-    payload["member_ids_note"] = (
-        "搜索接口只返回成员数；完整成员 ID 列表需账号加入后读取"
-    )
+    payload["member_ids_note"] = "搜索接口只返回成员数；完整成员 ID 列表需账号加入后读取"
     return payload
 
 
@@ -163,7 +309,8 @@ def cmd_list(args: argparse.Namespace) -> int:
             print(
                 f"{r.mid}\tused={int(r.used)}\tready={int(r.ready)}\tinvalid={int(r.invalid)}\t"
                 f"next={r.next_stage}\tinviter={inv}\t"
-                f"diamonds={r.diamond_balance}\tguild={_local_timestamp(r.guild)}\t"
+                f"diamonds={r.diamond_balance}\tdaily={_local_timestamp(r.daily)}\t"
+                f"guild={_local_timestamp(r.guild)}\t"
                 f"secret={r.guest_secret[:8]}...\temail={r.email}"
             )
     return 0
@@ -215,10 +362,14 @@ def cmd_gen(args: argparse.Namespace) -> int:
                     )
                     log.debug("[%s] SignUp bytes=%s", idx, len(body))
 
-                    def on_progress(r, _idx=idx, _state=state, _session=session, _db=db):
+                    def on_progress(
+                        r, _idx=idx, _state=state, _session=session, _db=db
+                    ):
                         if r.ok:
                             # 默认只在 Boss(点位最后) 打一行；DEBUG 打每个点
-                            if r.start_point == 1 or logging.getLogger().isEnabledFor(logging.DEBUG):
+                            if r.start_point == 1 or logging.getLogger().isEnabledFor(
+                                logging.DEBUG
+                            ):
                                 log.info(
                                     "[%s] stage=%s sp=%s -> %s",
                                     _idx,
@@ -245,7 +396,9 @@ def cmd_gen(args: argparse.Namespace) -> int:
                         if r.ok and r.current_after is not None:
                             _state.next_stage = r.current_after
                             _state.resource_key = _session.resource_key
-                            _db.upsert_state(_state, used=False, ready=False, note="clearing")
+                            _db.upsert_state(
+                                _state, used=False, ready=False, note="clearing"
+                            )
 
                     log.info("[%s] clear 1..%s ...", idx, TO_STAGE)
                     results = StageRunner(
@@ -288,13 +441,23 @@ def cmd_gen(args: argparse.Namespace) -> int:
                     )
             except KeyboardInterrupt:
                 log.warning("interrupted")
-                print(json.dumps({"made": made, "failures": failures, **db.count()}, indent=2), flush=True)
+                print(
+                    json.dumps(
+                        {"made": made, "failures": failures, **db.count()}, indent=2
+                    ),
+                    flush=True,
+                )
                 return 130
             except Exception as e:
                 failures += 1
                 log.error("[%s] %s: %s", idx, type(e).__name__, e)
                 if args.stop_on_error:
-                    print(json.dumps({"made": made, "failures": failures, **db.count()}, indent=2), flush=True)
+                    print(
+                        json.dumps(
+                            {"made": made, "failures": failures, **db.count()}, indent=2
+                        ),
+                        flush=True,
+                    )
                     return 1
                 continue
 
@@ -365,7 +528,9 @@ def cmd_inv(args: argparse.Namespace) -> int:
                 "idx": idx,
             }
 
-        db.upsert_state(state, used=False, ready=row.ready, invalid=False, note="logged_in")
+        db.upsert_state(
+            state, used=False, ready=row.ready, invalid=False, note="logged_in"
+        )
         session = state.to_session()
         if not session.resource_key or session.resource_key == "dev-0000000000":
             session.resource_key = FALLBACK_RESOURCE_KEY
@@ -416,7 +581,13 @@ def cmd_inv(args: argparse.Namespace) -> int:
         except Exception as e:
             note = f"invite_error:{type(e).__name__}:{e}"
             db.mark_invalid(state.mid, note=note)
-            return {"ok": False, "mid": state.mid, "error": note, "invalid": True, "idx": idx}
+            return {
+                "ok": False,
+                "mid": state.mid,
+                "error": note,
+                "invalid": True,
+                "idx": idx,
+            }
 
     with AccountDB(db_path) as db:
         for i in range(1, count + 1):
@@ -430,7 +601,9 @@ def cmd_inv(args: argparse.Namespace) -> int:
                 if item.get("error") == "no_unused_account":
                     log.warning("[%s] pool empty, stop", i)
                     break
-                log.error("[%s] FAIL mid=%s err=%s", i, item.get("mid"), item.get("error"))
+                log.error(
+                    "[%s] FAIL mid=%s err=%s", i, item.get("mid"), item.get("error")
+                )
 
         summary = {
             "ok": fail_n == 0 and ok_n > 0,
@@ -447,6 +620,148 @@ def cmd_inv(args: argparse.Namespace) -> int:
     if ok_n == 0 and any(r.get("error") == "no_unused_account" for r in results):
         return 2
     return 0 if fail_n == 0 and ok_n > 0 else 1
+
+
+def cmd_daily(args: argparse.Namespace) -> int:
+    """Run daily actions for every ready account not completed today."""
+    results: list[dict] = []
+    workflows: list[DailyWorkflowResult] = []
+    completed = 0
+    failures = 0
+    attempted = 0
+
+    with AccountDB(args.db) as db:
+        pool = db.daily_pool_status()
+        eligible_rows = db.list_daily_accounts()
+        if not eligible_rows:
+            stopped_reason = (
+                "all_accounts_completed_today"
+                if pool["total"] > 0 and pool["completed_today"] == pool["total"]
+                else "no_eligible_accounts"
+            )
+            summary = {
+                "ok": True,
+                "count": 0,
+                "attempted": 0,
+                "failed": 0,
+                "skipped_today": pool["completed_today"],
+                "stopped_reason": stopped_reason,
+                "pool": pool,
+                "pool_after": pool,
+                "totals": _daily_run_totals([]),
+                "results": [],
+            }
+            print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+            return 0
+
+        for index, row in enumerate(eligible_rows, start=1):
+            attempted += 1
+            log.info(
+                "[%s] daily SOP mid=%s ready=%s next=%s",
+                index,
+                row.mid,
+                int(row.ready),
+                row.next_stage,
+            )
+
+            try:
+                state = _login_account(row)
+                session = state.to_session()
+
+                def persist_balance(
+                    balance: int,
+                    *,
+                    _state=state,
+                    _session=session,
+                    _row=row,
+                ) -> None:
+                    _state.diamond_balance = balance
+                    _state.resource_key = _session.resource_key
+                    db.upsert_state(
+                        _state,
+                        used=_row.used,
+                        ready=_row.ready,
+                        invalid=_row.invalid,
+                        note=_row.note,
+                    )
+
+                db.upsert_state(
+                    state,
+                    used=row.used,
+                    ready=row.ready,
+                    invalid=row.invalid,
+                    note=row.note,
+                )
+                with GrpcClient(state.endpoint or ENDPOINT) as client:
+                    workflow = DailyRunner(
+                        client,
+                        session,
+                        on_balance=persist_balance,
+                    ).run()
+                    workflows.append(workflow)
+
+                state.resource_key = session.resource_key
+                if workflow.diamond_balance_final is not None:
+                    state.diamond_balance = workflow.diamond_balance_final
+                db.upsert_state(
+                    state,
+                    used=row.used,
+                    ready=row.ready,
+                    invalid=row.invalid,
+                    note=row.note,
+                )
+
+                item = {"mid": row.mid, **workflow.to_dict()}
+                if workflow.ok:
+                    completed_at = db.mark_daily_completed(row.mid)
+                    item["daily_completed_at"] = _local_timestamp(completed_at)
+                    completed += 1
+                    log.info(
+                        "[%s] daily SOP complete mid=%s count=%s",
+                        index,
+                        row.mid,
+                        completed,
+                    )
+                else:
+                    failures += 1
+                    log.error(
+                        "[%s] daily SOP failed mid=%s error=%s",
+                        index,
+                        row.mid,
+                        workflow.error,
+                    )
+                results.append(item)
+            except Exception as error:
+                failures += 1
+                item = {
+                    "ok": False,
+                    "mid": row.mid,
+                    "error": f"{type(error).__name__}: {error}",
+                }
+                results.append(item)
+                log.error(
+                    "[%s] daily account failed mid=%s error=%s",
+                    index,
+                    row.mid,
+                    item["error"],
+                )
+
+        pool_after = db.daily_pool_status()
+        summary = {
+            "ok": failures == 0,
+            "count": completed,
+            "attempted": attempted,
+            "failed": failures,
+            "skipped_today": pool["completed_today"],
+            "stopped_reason": "all_eligible_accounts_attempted",
+            "pool": pool,
+            "pool_after": pool_after,
+            "totals": _daily_run_totals(workflows),
+            "results": results,
+        }
+        print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+
+    return 0 if failures == 0 else 1
 
 
 def cmd_guild(args: argparse.Namespace) -> int:
@@ -467,6 +782,7 @@ def cmd_guild(args: argparse.Namespace) -> int:
     attempted = 0
     target_source = "cache"
     prepared_states: dict[str, AccountState] = {}
+    workflows: list[GuildWorkflowResult] = []
 
     with AccountDB(args.db) as db:
         pool_before = _guild_pool_payload(db.guild_pool_status())
@@ -491,27 +807,10 @@ def cmd_guild(args: argparse.Namespace) -> int:
             target_source = "search"
             discovery_row = eligible_rows[0]
             try:
-                state = _login_guild_account(discovery_row)
+                state = _login_account(discovery_row)
                 session = state.to_session()
 
-                def persist_discovery_balance(balance: int) -> None:
-                    state.diamond_balance = balance
-                    state.resource_key = session.resource_key
-                    db.upsert_state(
-                        state,
-                        used=discovery_row.used,
-                        ready=discovery_row.ready,
-                        invalid=discovery_row.invalid,
-                        note=discovery_row.note,
-                    )
-
                 with GrpcClient(state.endpoint or ENDPOINT) as client:
-                    runner = GuildRunner(
-                        client,
-                        session,
-                        on_balance=persist_discovery_balance,
-                    )
-                    runner.sync_diamond_balance()
                     response = Guild(client, session).search_guilds(gname)
                     summaries = parse_guild_search_response(response.message)
 
@@ -610,7 +909,7 @@ def cmd_guild(args: argparse.Namespace) -> int:
             )
 
             try:
-                state = prepared_states.pop(row.mid, None) or _login_guild_account(row)
+                state = prepared_states.pop(row.mid, None) or _login_account(row)
                 session = state.to_session()
 
                 def persist_balance(
@@ -642,9 +941,11 @@ def cmd_guild(args: argparse.Namespace) -> int:
                         client,
                         session,
                         on_balance=persist_balance,
+                        initial_guild_level=target.guild_level,
+                        initial_diamond_balance=state.diamond_balance,
                     )
-                    runner.sync_diamond_balance()
                     workflow = runner.run(target.guild_id)
+                    workflows.append(workflow)
 
                 state.resource_key = session.resource_key
                 if workflow.diamond_balance_final is not None:
@@ -672,7 +973,11 @@ def cmd_guild(args: argparse.Namespace) -> int:
                         gname=gname,
                         gmname=gmname,
                         guild_id=target.guild_id,
-                        guild_level=target.guild_level,
+                        guild_level=(
+                            workflow.guild_progress.level_after
+                            if workflow.guild_progress.level_after is not None
+                            else target.guild_level
+                        ),
                         member_count=target.member_count,
                         master_user_id=target.master_user_id,
                         details=details,
@@ -729,7 +1034,9 @@ def cmd_guild(args: argparse.Namespace) -> int:
                 "master_name": gmname,
                 "source": target_source,
                 "confirmed_at": _local_timestamp(target.confirmed_at),
+                **_guild_overall_progress(workflows),
             },
+            "totals": _guild_run_totals(workflows),
             "pool_before": pool_before,
             "pool_after": pool_after,
             "results": results,
@@ -742,7 +1049,7 @@ def cmd_guild(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="crumble_bot",
-        description="Crumble bot: gen / inv / guild / list",
+        description="Crumble bot: gen / inv / daily / guild / list",
     )
     p.add_argument("-v", "--verbose", action="store_true", help="DEBUG：每关点位 + HTTP")
     p.add_argument("-q", "--quiet", action="store_true", help="仅警告/错误 + 最终 JSON")
@@ -761,7 +1068,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--stop-on-error", action="store_true")
     sp.set_defaults(func=cmd_gen)
 
-    sp = sub.add_parser("guild", help="批量执行公会签到、研究、捐赠并退出")
+    sp = sub.add_parser("daily", help="批量执行每日登录、邮箱领取和邮箱广告")
+    sp.add_argument("--db", default=str(DEFAULT_DB), help="sqlite 路径")
+    sp.set_defaults(func=cmd_daily)
+
+    sp = sub.add_parser("guild", help="批量执行公会签到、研究、捐赠、退出")
     sp.add_argument("--gname", required=True, help="公会名称")
     sp.add_argument("--gmname", required=True, help="会长名称")
     sp.add_argument("--count", required=True, type=int, help="成功执行的账号数量")
@@ -782,7 +1093,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    _setup_log(verbose=bool(getattr(args, "verbose", False)), quiet=bool(getattr(args, "quiet", False)))
+    _setup_log(
+        verbose=bool(getattr(args, "verbose", False)),
+        quiet=bool(getattr(args, "quiet", False)),
+    )
     return args.func(args)
 
 
