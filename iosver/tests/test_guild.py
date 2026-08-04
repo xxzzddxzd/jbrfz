@@ -1276,6 +1276,19 @@ class PrivateWaitingClient:
 
     def unary(self, path, message, metadata=None):
         type(self).calls.append(path)
+        if path == SEARCH_GUILDS_PATH:
+            return GrpcResponse(
+                pb.encode_message_field(
+                    1,
+                    guild_summary_message(
+                        join_method=1,
+                        master_mid="OWNER",
+                        master_name="absdbld",
+                    ),
+                ),
+                {},
+                {},
+            )
         if path == GET_GUILD_PATH:
             raise GrpcError(9, "user is not a guild member")
         if path == GET_GUILD_APPLICATIONS_FOR_USER_PATH:
@@ -1861,6 +1874,73 @@ class GuildCommandTests(unittest.TestCase):
             self.assertEqual(payload["job"]["original_master_mid"], "OWNER")
             self.assertIn(APPLY_GUILD_PATH, PrivateWaitingClient.calls)
 
+    def test_private_flow_refreshes_stale_public_cache(self) -> None:
+        PrivateWaitingClient.calls = []
+        parser = cli.build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                db.upsert_state(
+                    AccountState(
+                        mid="CONTROLLER",
+                        guest_secret="secret",
+                        game_access_token="token",
+                        next_stage=31,
+                    ),
+                    used=True,
+                    ready=True,
+                    invalid=False,
+                )
+                db.upsert_guild_target(
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    guild_id="G-ID",
+                    master_user_id="OWNER",
+                    original_master_mid="OWNER",
+                    details={"search_summary": {"join_method": 0}},
+                )
+
+            args = parser.parse_args(
+                [
+                    "guild",
+                    "private",
+                    "--gname",
+                    "ahhhha",
+                    "--gmname",
+                    "absdbld",
+                    "--master-mid",
+                    "CONTROLLER",
+                    "--count",
+                    "1",
+                    "--totalcount",
+                    "6",
+                    "--db",
+                    str(db_path),
+                ]
+            )
+            output = io.StringIO()
+            with (
+                patch.object(cli, "GrpcClient", PrivateWaitingClient),
+                patch.object(
+                    cli, "_login_account", side_effect=lambda row: row.to_state()
+                ),
+                redirect_stdout(output),
+            ):
+                code = cli.cmd_guild(args)
+
+            self.assertEqual(code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["state"], "awaiting_application_approval")
+            self.assertIn(SEARCH_GUILDS_PATH, PrivateWaitingClient.calls)
+            self.assertIn(APPLY_GUILD_PATH, PrivateWaitingClient.calls)
+            with AccountDB(db_path) as db:
+                target = db.get_guild_target("ahhhha", "absdbld")
+                self.assertEqual(
+                    target.details["search_summary"]["join_method"],
+                    1,
+                )
+                self.assertEqual(target.original_master_mid, "OWNER")
+
     def test_private_flow_auto_selects_and_reuses_low_diamond_controller(
         self,
     ) -> None:
@@ -2126,6 +2206,70 @@ class GuildCommandTests(unittest.TestCase):
                 self.assertEqual(len(db.list_guild_runs("A")), 1)
                 self.assertEqual(len(db.list_guild_runs("B")), 1)
                 self.assertEqual(db.guild_pool_status()["cooling"], 3)
+
+    def test_public_flow_refreshes_stale_private_cache(self) -> None:
+        FakeSearchGuild.calls = 0
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                db.upsert_state(
+                    AccountState(
+                        mid="A",
+                        guest_secret="secret",
+                        game_access_token="token",
+                        next_stage=31,
+                    ),
+                    used=True,
+                    ready=True,
+                    invalid=False,
+                )
+                db.upsert_guild_target(
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    guild_id="G-ID",
+                    guild_level=1,
+                    member_count=1,
+                    master_user_id="OWNER",
+                    original_master_mid="OWNER",
+                    details={"search_summary": {"join_method": 1}},
+                )
+
+            args = argparse.Namespace(
+                guild_action="public",
+                gname="ahhhha",
+                gmname="absdbld",
+                count=1,
+                totalcount=4,
+                db=str(db_path),
+            )
+            output = io.StringIO()
+            with (
+                patch.object(cli, "GrpcClient", DummyClient),
+                patch.object(cli, "GuildRunner", FakeRunner),
+                patch.object(cli, "Guild", FakeSearchGuild),
+                patch.object(
+                    cli, "_login_account", side_effect=lambda row: row.to_state()
+                ),
+                patch.object(
+                    cli,
+                    "_confirm_guild",
+                    side_effect=AssertionError("known guild must not reconfirm"),
+                ),
+                redirect_stdout(output),
+            ):
+                code = cli.cmd_guild(args)
+
+            self.assertEqual(code, 0)
+            summary = json.loads(output.getvalue())
+            self.assertEqual(summary["guild"]["source"], "refresh")
+            self.assertEqual(FakeSearchGuild.calls, 1)
+            with AccountDB(db_path) as db:
+                target = db.get_guild_target("ahhhha", "absdbld")
+                self.assertEqual(
+                    target.details["search_summary"]["join_method"],
+                    0,
+                )
+                self.assertEqual(target.original_master_mid, "OWNER")
 
     def test_uncached_target_searches_and_confirms_once(self) -> None:
         FakeSearchGuild.calls = 0

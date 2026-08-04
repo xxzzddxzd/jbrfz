@@ -10,7 +10,7 @@ from pathlib import Path
 from .auth import AccountState, guest_login, new_device_ids
 from .constants import ENDPOINT, FALLBACK_RESOURCE_KEY, TO_STAGE
 from .daily_runner import DailyRunner, DailyWorkflowResult
-from .db import DEFAULT_DB, AccountDB, AccountRow
+from .db import DEFAULT_DB, AccountDB, AccountRow, GuildTargetRow
 from .grpc_client import GrpcClient, GrpcError
 from .guild import (
     Guild,
@@ -884,6 +884,45 @@ def _guild_target_join_method(details: dict) -> int | None:
     return None
 
 
+def _refresh_cached_guild_target(
+    db: AccountDB,
+    row: AccountRow,
+    target: GuildTargetRow,
+) -> tuple[GuildTargetRow, GuildSearchSummary, AccountState]:
+    """Refresh mutable guild settings while preserving the confirmed guild ID."""
+    state = _login_account(row)
+    session = state.to_session()
+    with GrpcClient(state.endpoint or ENDPOINT) as client:
+        summaries = parse_guild_search_response(
+            Guild(client, session).search_guilds(target.gname).message
+        )
+    _persist_logged_in_actor(db, row, state, session)
+
+    matches = [item for item in summaries if item.guild_id == target.guild_id]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "在线搜索无法按缓存 guild_id 唯一定位目标公会: "
+            f"guild_id={target.guild_id}, matches={len(matches)}"
+        )
+
+    matched = matches[0]
+    details = dict(target.details)
+    details["search_summary"] = _guild_confirmation_payload(matched)
+    refreshed = db.upsert_guild_target(
+        gname=target.gname,
+        gmname=target.gmname,
+        guild_id=matched.guild_id,
+        guild_level=matched.guild_level,
+        member_count=matched.member_count,
+        master_user_id=matched.master_user_id,
+        original_master_mid=(
+            target.original_master_mid or target.master_user_id
+        ),
+        details=details,
+    )
+    return refreshed, matched, state
+
+
 def _private_cli_job_payload(job) -> dict:
     return {
         "id": job.id,
@@ -1152,6 +1191,42 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
         else:
             join_method = _guild_target_join_method(target.details)
             if join_method == 0:
+                try:
+                    target, refreshed_summary, _ = _refresh_cached_guild_target(
+                        db,
+                        controller_row,
+                        target,
+                    )
+                    join_method = refreshed_summary.join_method
+                    log.info(
+                        "refreshed cached guild mode name=%s guild_id=%s "
+                        "join_method=%s",
+                        gname,
+                        target.guild_id,
+                        join_method,
+                    )
+                except Exception as error:
+                    print(
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "mode": "private",
+                                "state": "guild_mode_refresh_failed",
+                                "stopped_reason": "guild_mode_refresh_failed",
+                                "cached_join_method": 0,
+                                "error": f"{type(error).__name__}: {error}",
+                                "next_action": {
+                                    "action": "retry_guild_search",
+                                    "message": "在线刷新公会入会方式失败，请检查网络后重跑原命令。",
+                                },
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        flush=True,
+                    )
+                    return 1
+            if join_method == 0:
                 print(
                     json.dumps(
                         {
@@ -1160,6 +1235,7 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                             "state": "guild_is_public",
                             "stopped_reason": "guild_is_public",
                             "join_method": join_method,
+                            "source": "refresh",
                             "next_action": {
                                 "action": "use_public_flow",
                                 "message": "该公会可直接加入，请改用 guild public。",
@@ -1471,6 +1547,49 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
         else:
             join_method = _guild_target_join_method(target.details)
             if join_method == 1:
+                refresh_row = eligible_rows[0]
+                try:
+                    target, refreshed_summary, refreshed_state = (
+                        _refresh_cached_guild_target(
+                            db,
+                            refresh_row,
+                            target,
+                        )
+                    )
+                    prepared_states[refresh_row.mid] = refreshed_state
+                    join_method = refreshed_summary.join_method
+                    target_source = "refresh"
+                    log.info(
+                        "refreshed cached guild mode name=%s guild_id=%s "
+                        "join_method=%s",
+                        gname,
+                        target.guild_id,
+                        join_method,
+                    )
+                except Exception as error:
+                    summary = {
+                        "ok": False,
+                        "mode": "public",
+                        "count": paid_count_per_account,
+                        "requested_totalcount": requested_total_count,
+                        "totalcount": 0,
+                        "totalcount_reached": False,
+                        "account_count": 0,
+                        "accounts_attempted": 0,
+                        "accounts_failed": 1,
+                        "stopped_reason": "guild_mode_refresh_failed",
+                        "cached_join_method": 1,
+                        "error": f"{type(error).__name__}: {error}",
+                        "guild": {"name": gname, "master_name": gmname},
+                        "pool": pool_before,
+                        "results": [],
+                    }
+                    print(
+                        json.dumps(summary, ensure_ascii=False, indent=2),
+                        flush=True,
+                    )
+                    return 1
+            if join_method == 1:
                 summary = {
                     "ok": False,
                     "mode": "public",
@@ -1483,6 +1602,7 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
                     "accounts_failed": 0,
                     "stopped_reason": "guild_requires_approval",
                     "join_method": join_method,
+                    "source": "refresh",
                     "guild": {"name": gname, "master_name": gmname},
                     "pool": pool_before,
                     "results": [],
