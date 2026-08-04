@@ -24,6 +24,8 @@ from .guild import (
     parse_invite_user_to_guild_response,
 )
 from .guild_runner import GuildRunner, GuildWorkflowResult
+from .headers import Session
+from .social import Social, parse_get_user_social_info_response
 
 log = logging.getLogger(__name__)
 
@@ -121,6 +123,11 @@ class PrivateGuildRunner:
                         return self._waiting_payload(
                             job,
                             "awaiting_application_approval",
+                            controller_name=self._lookup_user_name(
+                                controller_client,
+                                controller_session,
+                                job.controller_mid,
+                            ),
                         )
 
                 current = self._find_guild(controller, job)
@@ -133,6 +140,11 @@ class PrivateGuildRunner:
                         job,
                         "awaiting_master_transfer",
                         current_master=current,
+                        controller_name=self._lookup_user_name(
+                            controller_client,
+                            controller_session,
+                            job.controller_mid,
+                        ),
                     )
 
                 if not job.master_acquired_at:
@@ -333,6 +345,28 @@ class PrivateGuildRunner:
             (item for item in summaries if item.guild_id == job.guild_id),
             None,
         )
+
+    @staticmethod
+    def _lookup_user_name(
+        client: GrpcClient,
+        session: Session,
+        user_id: str,
+    ) -> str:
+        try:
+            response = Social(client, session).get_user_social_info((user_id,))
+            infos = parse_get_user_social_info_response(response.message)
+            matched = next(
+                (item for item in infos if item.user_id == user_id),
+                None,
+            )
+            return matched.name if matched is not None else ""
+        except Exception as error:
+            log.warning(
+                "unable to resolve game name for %s: %s",
+                user_id,
+                error,
+            )
+            return ""
 
     def _run_donors(self, job: GuildPrivateJobRow, controller: Guild) -> dict:
         results: list[dict] = []
@@ -684,7 +718,13 @@ class PrivateGuildRunner:
         complete: bool = False,
         error: str = "",
         current_master: Optional[GuildSearchSummary] = None,
+        controller_name: str = "",
     ) -> dict:
+        controller_label = (
+            f"「{controller_name}」（MID: {job.controller_mid}）"
+            if controller_name
+            else f"MID {job.controller_mid}"
+        )
         payload = {
             "ok": ok,
             "complete": complete or job.status == "complete",
@@ -704,29 +744,44 @@ class PrivateGuildRunner:
             "manual_action": None,
             "next_action": None,
         }
+        if controller_name:
+            payload["controller_name"] = controller_name
         if reason == "awaiting_application_approval":
             payload["manual_action"] = {
                 "action": "approve_application_and_transfer_master",
                 "application_id": job.application_id,
                 "controller_mid": job.controller_mid,
+                "controller_name": controller_name,
             }
             payload["next_action"] = {
                 "action": "approve_and_grant_master",
                 "message": (
-                    f"手机使用原会长账号批准 {job.controller_mid} 入会，"
-                    "然后将会长委任给该账号；完成后重跑同一命令。"
+                    f"手机使用原会长账号批准 {controller_label} 入会，"
+                    f"然后在成员列表中将会长委任给「{controller_name}」；"
+                    "完成后重跑同一命令。"
+                    if controller_name
+                    else (
+                        f"手机使用原会长账号批准 {controller_label} 入会，"
+                        "然后将会长委任给该账号；完成后重跑同一命令。"
+                    )
                 ),
             }
         elif reason == "awaiting_master_transfer":
             payload["manual_action"] = {
                 "action": "transfer_master_to_controller",
                 "controller_mid": job.controller_mid,
+                "controller_name": controller_name,
             }
             payload["next_action"] = {
                 "action": "grant_master",
                 "message": (
-                    f"临时账号 {job.controller_mid} 已入会；手机使用当前会长账号"
-                    "将会长委任给它，然后重跑同一命令。"
+                    f"临时账号 {controller_label} 已入会；手机使用当前会长账号"
+                    f"在成员列表中将会长委任给「{controller_name}」，然后重跑同一命令。"
+                    if controller_name
+                    else (
+                        f"临时账号 {controller_label} 已入会；手机使用当前会长账号"
+                        "将会长委任给它，然后重跑同一命令。"
+                    )
                 ),
             }
         elif reason == "awaiting_master_return":

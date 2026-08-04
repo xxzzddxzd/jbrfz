@@ -65,9 +65,14 @@ from crumble_bot.messages import (
     accept_guild_invitation_request,
     apply_guild_request,
     get_guild_applications_for_user_request,
+    get_user_social_info_request,
     invite_user_to_guild_request,
     receive_mail_advertisement_reward_request,
     transfer_guild_master_request,
+)
+from crumble_bot.social import (
+    GET_USER_SOCIAL_INFO_PATH,
+    parse_get_user_social_info_response,
 )
 from crumble_bot.stage_runner import SIGNUP_PATH
 
@@ -339,6 +344,21 @@ def guild_search_response() -> bytes:
     return pb.encode_message_field(1, guild_summary_message())
 
 
+def user_social_info_response(
+    user_id: str = "CONTROLLER",
+    name: str = "garlic-proxy",
+    level: int = 2,
+) -> bytes:
+    info = b"".join(
+        (
+            pb.encode_string_field(1, user_id),
+            pb.encode_int32_field(2, level),
+            pb.encode_string_field(3, name),
+        )
+    )
+    return pb.encode_message_field(1, info)
+
+
 def guild_invitations_response() -> bytes:
     invited_at = pb.encode_int64_field(1, 1_786_000_000_000)
     invitation = b"".join(
@@ -562,6 +582,20 @@ class GuildParserTests(unittest.TestCase):
         self.assertIsNotNone(transferred.member_state)
         self.assertEqual(transferred.member_state.role, 1)
         self.assertEqual(transferred.member_state.guild_id, "G-ID")
+
+    def test_user_social_info_protocol_exposes_game_name(self) -> None:
+        request = get_user_social_info_request(("A", "B"))
+        self.assertEqual(
+            pb.decode_fields(request),
+            [(1, 2, b"A"), (1, 2, b"B")],
+        )
+        parsed = parse_get_user_social_info_response(
+            user_social_info_response("LSVNZ3678", "visible-name", 31)
+        )
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0].user_id, "LSVNZ3678")
+        self.assertEqual(parsed[0].name, "visible-name")
+        self.assertEqual(parsed[0].crumble_level, 31)
 
     def test_guild_application_and_transfer_facade_paths(self) -> None:
         client = FakeWorkflowClient()
@@ -1276,6 +1310,8 @@ class PrivateWaitingClient:
 
     def unary(self, path, message, metadata=None):
         type(self).calls.append(path)
+        if path == GET_USER_SOCIAL_INFO_PATH:
+            return GrpcResponse(user_social_info_response(), {}, {})
         if path == SEARCH_GUILDS_PATH:
             return GrpcResponse(
                 pb.encode_message_field(
@@ -1430,6 +1466,7 @@ class GuildCommandTests(unittest.TestCase):
         )
         self.assertEqual(private.guild_action, "private")
         self.assertEqual(private.master_mid, "CONTROLLER")
+        self.assertFalse(private.confirm)
 
         private_auto = parser.parse_args(
             [
@@ -1446,6 +1483,23 @@ class GuildCommandTests(unittest.TestCase):
             ]
         )
         self.assertIsNone(private_auto.master_mid)
+
+        private_confirm = parser.parse_args(
+            [
+                "guild",
+                "private",
+                "--gname",
+                "ahhhha",
+                "--gmname",
+                "absdbld",
+                "--count",
+                "10",
+                "--totalcount",
+                "2000",
+                "--confirm",
+            ]
+        )
+        self.assertTrue(private_confirm.confirm)
 
         return_list = parser.parse_args(["guild", "private", "return"])
         self.assertEqual(return_list.private_action, "return")
@@ -1872,7 +1926,105 @@ class GuildCommandTests(unittest.TestCase):
             )
             self.assertEqual(payload["job"]["application_id"], "GA-ID")
             self.assertEqual(payload["job"]["original_master_mid"], "OWNER")
+            self.assertEqual(payload["controller"]["name"], "garlic-proxy")
+            self.assertEqual(
+                payload["manual_action"]["controller_name"],
+                "garlic-proxy",
+            )
+            self.assertIn("garlic-proxy", payload["next_action"]["message"])
+            self.assertIn("CONTROLLER", payload["next_action"]["message"])
             self.assertIn(APPLY_GUILD_PATH, PrivateWaitingClient.calls)
+
+    def test_private_confirm_updates_active_job_parameters(self) -> None:
+        parser = cli.build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                db.upsert_state(
+                    AccountState(
+                        mid="CONTROLLER",
+                        guest_secret="secret",
+                        game_access_token="token",
+                        next_stage=31,
+                    ),
+                    used=True,
+                    ready=True,
+                    invalid=False,
+                )
+                db.upsert_guild_target(
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    guild_id="G-ID",
+                    master_user_id="OWNER",
+                    original_master_mid="OWNER",
+                    details={"search_summary": {"join_method": 1}},
+                )
+                job = db.create_private_job(
+                    guild_id="G-ID",
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    original_master_mid="OWNER",
+                    controller_mid="CONTROLLER",
+                    paid_count_per_account=10,
+                    total_count_limit=200,
+                )
+
+            command = [
+                "guild",
+                "private",
+                "--gname",
+                "ahhhha",
+                "--gmname",
+                "absdbld",
+                "--master-mid",
+                "CONTROLLER",
+                "--count",
+                "20",
+                "--totalcount",
+                "2000",
+                "--db",
+                str(db_path),
+            ]
+            without_confirm = parser.parse_args(command)
+            with self.assertRaisesRegex(SystemExit, "--confirm"):
+                cli.cmd_guild(without_confirm)
+
+            with_confirm = parser.parse_args([*command, "--confirm"])
+            output = io.StringIO()
+            with (
+                patch.object(
+                    cli.PrivateGuildRunner,
+                    "run",
+                    return_value={
+                        "ok": True,
+                        "complete": False,
+                        "mode": "private",
+                        "state": "awaiting_donors",
+                        "stopped_reason": "target_not_reached",
+                    },
+                ) as run,
+                redirect_stdout(output),
+            ):
+                code = cli.cmd_guild(with_confirm)
+
+            self.assertEqual(code, 0)
+            updated_job = run.call_args.args[0]
+            self.assertEqual(updated_job.id, job.id)
+            self.assertEqual(updated_job.paid_count_per_account, 20)
+            self.assertEqual(updated_job.total_count_limit, 2000)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(
+                payload["job_parameters_updated"],
+                {
+                    "confirmed": True,
+                    "previous": {"count": 10, "totalcount": 200},
+                    "current": {"count": 20, "totalcount": 2000},
+                },
+            )
+            with AccountDB(db_path) as db:
+                saved = db.get_private_job(job.id)
+                self.assertEqual(saved.paid_count_per_account, 20)
+                self.assertEqual(saved.total_count_limit, 2000)
 
     def test_private_flow_refreshes_stale_public_cache(self) -> None:
         PrivateWaitingClient.calls = []

@@ -913,6 +913,8 @@ class AccountDB:
         allowed = {
             "application_id",
             "status",
+            "paid_count_per_account",
+            "total_count_limit",
             "effective_count",
             "master_acquired_at",
             "completed_at",

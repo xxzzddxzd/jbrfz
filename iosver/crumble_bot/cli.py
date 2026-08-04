@@ -861,11 +861,15 @@ def cmd_guild(args: argparse.Namespace) -> int:
     private_action = str(getattr(args, "private_action", "") or "")
     if action == "private":
         if private_action == "return":
+            if bool(getattr(args, "confirm", False)):
+                raise SystemExit("--confirm 只能用于 guild private 主流程")
             return _cmd_guild_private_return(args)
         return _cmd_guild_private(args)
     if action == "public":
         if private_action:
             raise SystemExit("guild private return 只能用于 private 流程")
+        if bool(getattr(args, "confirm", False)):
+            raise SystemExit("--confirm 只能用于 guild private")
         return _cmd_guild_run(args)
     raise SystemExit(f"未知 guild 动作: {action}")
 
@@ -1015,6 +1019,8 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
         else ""
     )
     controller_source = "argument" if controller_mid else ""
+    confirm_update = bool(getattr(args, "confirm", False))
+    parameter_update: dict | None = None
     if getattr(args, "count", None) is None:
         raise SystemExit("guild private 必须提供 --count")
     if getattr(args, "totalcount", None) is None:
@@ -1291,9 +1297,28 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
             job.paid_count_per_account != count
             or job.total_count_limit != totalcount
         ):
-            raise SystemExit(
-                "已有未完成 private 任务，--count/--totalcount 必须与原任务一致"
+            if not confirm_update:
+                raise SystemExit(
+                    "已有未完成 private 任务，--count/--totalcount 与原任务不一致；"
+                    "确认要更新原任务目标时请增加 --confirm"
+                )
+            previous = {
+                "count": job.paid_count_per_account,
+                "totalcount": job.total_count_limit,
+            }
+            job = db.update_private_job(
+                job.id,
+                paid_count_per_account=count,
+                total_count_limit=totalcount,
             )
+            parameter_update = {
+                "confirmed": True,
+                "previous": previous,
+                "current": {
+                    "count": job.paid_count_per_account,
+                    "totalcount": job.total_count_limit,
+                },
+            }
         if job is None:
             latest = db.get_latest_private_job(target.guild_id, controller_mid)
             same_target = bool(
@@ -1371,10 +1396,15 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                     "message": "检查 error；修复对应条件后重跑同一命令继续。",
                 },
             }
+        controller_name = str(payload.pop("controller_name", "") or "")
         payload["controller"] = {
             "mid": controller_mid,
             "source": controller_source,
         }
+        if controller_name:
+            payload["controller"]["name"] = controller_name
+        if parameter_update is not None:
+            payload["job_parameters_updated"] = parameter_update
 
     print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
     return 0 if payload.get("ok") else 1
@@ -1869,6 +1899,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "private：可选；显式指定临时会长账号 MID。省略时优先复用已有任务，"
             "否则自动选择钻石最少的可用账号"
+        ),
+    )
+    sp.add_argument(
+        "--confirm",
+        action="store_true",
+        help=(
+            "private：当 count/totalcount 与未完成任务不一致时，"
+            "确认更新原任务参数并继续"
         ),
     )
     sp.add_argument("--db", default=str(DEFAULT_DB), help="sqlite 路径")

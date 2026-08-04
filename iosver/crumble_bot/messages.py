@@ -245,6 +245,11 @@ def get_guild_applications_for_user_request() -> bytes:
     return b""
 
 
+def get_user_social_info_request(user_ids: Sequence[str]) -> bytes:
+    """Build GetUserSocialInfoRequest with repeated MID field 1."""
+    return b"".join(pb.encode_string_field(1, user_id) for user_id in user_ids)
+
+
 def accept_guild_invitation_request(guild_id: str, invitation_id: str) -> bytes:
     """Build AcceptGuildInvitationRequest: guild id field 1, invitation id field 2."""
     return b"".join(
