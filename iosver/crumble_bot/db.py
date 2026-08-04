@@ -791,6 +791,23 @@ class AccountDB:
         ).fetchone()
         return self._private_job_row(row) if row else None
 
+    def list_private_jobs(
+        self,
+        *,
+        status: Optional[str] = None,
+    ) -> List[GuildPrivateJobRow]:
+        """List private-guild jobs using their persistent database ids."""
+        sql = "SELECT * FROM guild_private_jobs"
+        params: tuple[Any, ...] = ()
+        if status is not None:
+            sql += " WHERE status=?"
+            params = (str(status),)
+        sql += " ORDER BY id"
+        return [
+            self._private_job_row(row)
+            for row in self._conn.execute(sql, params)
+        ]
+
     def get_active_private_job(
         self,
         guild_id: str,
@@ -801,6 +818,22 @@ class AccountDB:
             SELECT * FROM guild_private_jobs
             WHERE guild_id=? AND controller_mid=?
               AND status NOT IN ('complete', 'cancelled')
+            ORDER BY id DESC LIMIT 1
+            """,
+            (guild_id, controller_mid),
+        ).fetchone()
+        return self._private_job_row(row) if row else None
+
+    def get_latest_private_job(
+        self,
+        guild_id: str,
+        controller_mid: str,
+    ) -> Optional[GuildPrivateJobRow]:
+        """Return the newest job, including completed and cancelled jobs."""
+        row = self._conn.execute(
+            """
+            SELECT * FROM guild_private_jobs
+            WHERE guild_id=? AND controller_mid=?
             ORDER BY id DESC LIMIT 1
             """,
             (guild_id, controller_mid),

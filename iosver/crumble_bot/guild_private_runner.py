@@ -17,6 +17,7 @@ from .guild import (
     GuildSearchSummary,
     parse_accept_guild_invitation_response,
     parse_apply_guild_response,
+    parse_guild_detail_response,
     parse_guild_applications_for_user_response,
     parse_guild_invitations_for_user_response,
     parse_guild_search_response,
@@ -39,16 +40,10 @@ class PrivateGuildRunner:
         login_account: LoginAccount,
         *,
         client_factory: ClientFactory = GrpcClient,
-        wait_timeout: float = 300,
-        poll_interval: float = 5,
-        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.db = db
         self.login_account = login_account
         self.client_factory = client_factory
-        self.wait_timeout = max(0.0, float(wait_timeout))
-        self.poll_interval = max(0.1, float(poll_interval))
-        self.sleep = sleep
 
     def run(self, job: GuildPrivateJobRow) -> dict:
         controller_row = self.db.get(job.controller_mid)
@@ -68,7 +63,20 @@ class PrivateGuildRunner:
             ) as controller_client:
                 controller = Guild(controller_client, controller_session)
 
-                if job.status == "awaiting_master_return":
+                if job.status == "complete":
+                    return self._waiting_payload(
+                        job,
+                        "complete",
+                        complete=True,
+                    )
+
+                target_reached = job.effective_count >= job.total_count_limit
+                if target_reached:
+                    if job.status != "awaiting_master_return":
+                        job = self.db.update_private_job(
+                            job.id,
+                            status="awaiting_master_return",
+                        )
                     current = self._find_guild(controller, job)
                     if (
                         current is not None
@@ -92,10 +100,19 @@ class PrivateGuildRunner:
                         current_master=current,
                     )
 
+                if job.status == "awaiting_master_return":
+                    # Older runs used this state even when the account pool was
+                    # exhausted before reaching the requested target. Resume
+                    # those jobs instead of returning the master prematurely.
+                    job = self.db.update_private_job(
+                        job.id,
+                        status="awaiting_donors",
+                    )
+
                 member = self._controller_is_member(controller, job.guild_id)
                 if not member:
                     job = self._ensure_application(controller, job)
-                    member = self._wait_for_membership(controller, job.guild_id)
+                    member = self._controller_is_member(controller, job.guild_id)
                     if not member:
                         job = self.db.update_private_job(
                             job.id,
@@ -106,7 +123,7 @@ class PrivateGuildRunner:
                             "awaiting_application_approval",
                         )
 
-                current = self._wait_for_controller_master(controller, job)
+                current = self._find_guild(controller, job)
                 if current is None or current.master_user_id != job.controller_mid:
                     job = self.db.update_private_job(
                         job.id,
@@ -132,6 +149,135 @@ class PrivateGuildRunner:
                 job = self.db.get_private_job(job.id) or job
                 result["job"] = self._job_payload(job)
                 return result
+        finally:
+            self._persist_account(
+                controller_row,
+                controller_state,
+                controller_session.resource_key,
+            )
+
+    def return_master(self, job: GuildPrivateJobRow) -> dict:
+        """Return a completed private batch to its recorded original master."""
+        if job.status != "awaiting_master_return":
+            return self._return_payload(
+                job,
+                ok=False,
+                stopped_reason="job_not_awaiting_master_return",
+                error=f"private job status is {job.status}",
+            )
+        if not job.original_master_mid:
+            return self._return_payload(
+                job,
+                ok=False,
+                stopped_reason="original_master_missing",
+                error="private job does not contain original_master_mid",
+            )
+        if job.original_master_mid == job.controller_mid:
+            return self._return_payload(
+                job,
+                ok=False,
+                stopped_reason="original_master_is_controller",
+                error="original master and controller are the same account",
+            )
+
+        controller_row = self.db.get(job.controller_mid)
+        if controller_row is None:
+            return self._return_payload(
+                job,
+                ok=False,
+                stopped_reason="controller_not_found",
+                error=f"sqlite 中没有自控会长账号: {job.controller_mid}",
+            )
+
+        controller_state = self.login_account(controller_row)
+        controller_session = controller_state.to_session()
+        try:
+            with self.client_factory(
+                controller_state.endpoint or ENDPOINT
+            ) as controller_client:
+                guild = Guild(controller_client, controller_session)
+                current = self._find_guild(guild, job)
+                if current is None:
+                    return self._return_payload(
+                        job,
+                        ok=False,
+                        stopped_reason="guild_not_found",
+                        error="target guild was not found by its saved id",
+                    )
+
+                if current.master_user_id == job.original_master_mid:
+                    job = self.db.update_private_job(
+                        job.id,
+                        status="complete",
+                        completed_at=time.time(),
+                        error="",
+                    )
+                    return self._return_payload(
+                        job,
+                        stopped_reason="complete",
+                        transferred=False,
+                        already_returned=True,
+                        current_master=current,
+                    )
+
+                if current.master_user_id != job.controller_mid:
+                    return self._return_payload(
+                        job,
+                        ok=False,
+                        stopped_reason="controller_is_not_current_master",
+                        error=(
+                            "saved controller is not the current guild master; "
+                            "refusing to transfer"
+                        ),
+                        current_master=current,
+                    )
+
+                detail = parse_guild_detail_response(
+                    guild.get_guild(job.guild_id).message
+                )
+                if job.original_master_mid not in detail.member_ids:
+                    return self._return_payload(
+                        job,
+                        ok=False,
+                        stopped_reason="original_master_not_member",
+                        error="recorded original master is not a current guild member",
+                        current_master=current,
+                    )
+
+                guild.transfer_guild_master(
+                    job.guild_id,
+                    job.original_master_mid,
+                )
+                verified = self._find_guild(guild, job)
+                if (
+                    verified is None
+                    or verified.master_user_id != job.original_master_mid
+                ):
+                    job = self.db.update_private_job(
+                        job.id,
+                        error="master transfer sent but verification is pending",
+                    )
+                    return self._return_payload(
+                        job,
+                        ok=False,
+                        stopped_reason="master_return_verification_pending",
+                        error=job.error,
+                        transferred=True,
+                        current_master=verified,
+                    )
+
+                job = self.db.update_private_job(
+                    job.id,
+                    status="complete",
+                    completed_at=time.time(),
+                    error="",
+                )
+                return self._return_payload(
+                    job,
+                    stopped_reason="complete",
+                    transferred=True,
+                    current_master=verified,
+                )
         finally:
             self._persist_account(
                 controller_row,
@@ -169,15 +315,6 @@ class PrivateGuildRunner:
             error="",
         )
 
-    def _wait_for_membership(self, guild: Guild, guild_id: str) -> bool:
-        deadline = time.monotonic() + self.wait_timeout
-        while True:
-            if self._controller_is_member(guild, guild_id):
-                return True
-            if time.monotonic() >= deadline:
-                return False
-            self.sleep(min(self.poll_interval, max(0.0, deadline - time.monotonic())))
-
     @staticmethod
     def _controller_is_member(guild: Guild, guild_id: str) -> bool:
         try:
@@ -185,20 +322,6 @@ class PrivateGuildRunner:
             return True
         except GrpcError:
             return False
-
-    def _wait_for_controller_master(
-        self,
-        guild: Guild,
-        job: GuildPrivateJobRow,
-    ) -> Optional[GuildSearchSummary]:
-        deadline = time.monotonic() + self.wait_timeout
-        while True:
-            current = self._find_guild(guild, job)
-            if current is not None and current.master_user_id == job.controller_mid:
-                return current
-            if time.monotonic() >= deadline:
-                return current
-            self.sleep(min(self.poll_interval, max(0.0, deadline - time.monotonic())))
 
     @staticmethod
     def _find_guild(
@@ -216,20 +339,21 @@ class PrivateGuildRunner:
         workflows: list[GuildWorkflowResult] = []
         failures = 0
         attempted = 0
+        effective_before = int(job.effective_count)
         effective_total = int(job.effective_count)
 
+        records = self.db.list_private_accounts(job.id)
         pending = [
             item
-            for item in self.db.list_private_accounts(job.id)
+            for item in records
             if item["state"] in {"selected", "invited", "accepted"}
         ]
         rows: list[tuple[AccountRow, Optional[dict]]] = []
-        seen: set[str] = set()
+        seen: set[str] = {str(item["mid"]) for item in records}
         for item in pending:
             row = self.db.get(str(item["mid"]))
             if row is not None and row.mid != job.controller_mid:
                 rows.append((row, item))
-                seen.add(row.mid)
 
         active_mids = self.db.active_private_account_mids()
         for row in self.db.list_guild_eligible():
@@ -276,37 +400,85 @@ class PrivateGuildRunner:
                 results.append({"mid": row.mid, "ok": False, "error": message})
                 log.error("private guild donor %s failed: %s", row.mid, message)
 
-        stopped_reason = (
-            "totalcount_reached"
-            if effective_total >= job.total_count_limit
-            else "all_eligible_accounts_attempted"
-        )
+        target_reached = effective_total >= job.total_count_limit
+        if target_reached:
+            stopped_reason = "totalcount_reached"
+            next_state = "awaiting_master_return"
+        elif attempted:
+            stopped_reason = "target_not_reached"
+            next_state = "awaiting_donors"
+        else:
+            stopped_reason = "awaiting_eligible_accounts"
+            next_state = "awaiting_donors"
+
         job = self.db.update_private_job(
             job.id,
-            status="awaiting_master_return",
+            status=next_state,
             effective_count=effective_total,
             error="" if failures == 0 else f"{failures} donor account(s) failed",
         )
-        return {
+        pool = self.db.guild_pool_status()
+        saved_records = self.db.list_private_accounts(job.id)
+        record_counts: dict[str, int] = {}
+        for item in saved_records:
+            state = str(item["state"])
+            record_counts[state] = record_counts.get(state, 0) + 1
+
+        payload = {
             "ok": failures == 0,
             "complete": False,
             "mode": "private",
+            "state": next_state,
             "count": job.paid_count_per_account,
             "requested_totalcount": job.total_count_limit,
             "totalcount": effective_total,
-            "totalcount_reached": effective_total >= job.total_count_limit,
+            "totalcount_added": effective_total - effective_before,
+            "remaining_totalcount": max(
+                0,
+                job.total_count_limit - effective_total,
+            ),
+            "totalcount_reached": target_reached,
             "accounts_attempted": attempted,
             "accounts_failed": failures,
             "stopped_reason": stopped_reason,
-            "next_state": "awaiting_master_return",
-            "manual_master_return": {
-                "required": True,
-                "from_mid": job.controller_mid,
-                "to_original_master_mid": job.original_master_mid,
+            "next_state": next_state,
+            "account_records": record_counts,
+            "pool": {
+                **pool,
+                "candidates_this_run": len(rows),
             },
             "totals": self._totals(workflows),
             "results": results,
         }
+        if target_reached:
+            payload["manual_master_return"] = {
+                "required": True,
+                "from_mid": job.controller_mid,
+                "to_original_master_mid": job.original_master_mid,
+                "command": f"python main.py guild private return {job.id}",
+            }
+            payload["next_action"] = {
+                "action": "return_master",
+                "command": f"python main.py guild private return {job.id}",
+                "message": "目标已达到，请将会长交还给原会长。",
+            }
+        else:
+            payload["next_action"] = {
+                "action": "prepare_eligible_donors_and_rerun",
+                "message": (
+                    "目标尚未达到；补充符合条件的 B 账号，或等待账号退出公会满 "
+                    "24 小时后，重新执行同一条 guild private 命令。"
+                ),
+                "requirements": [
+                    "ready=1",
+                    "invalid=0",
+                    "next_stage>30",
+                    "当前不在公会",
+                    "最近退出公会已满24小时",
+                    "未在本任务中使用过",
+                ],
+            }
+        return payload
 
     def _run_one_donor(
         self,
@@ -515,11 +687,22 @@ class PrivateGuildRunner:
     ) -> dict:
         payload = {
             "ok": ok,
-            "complete": complete,
+            "complete": complete or job.status == "complete",
             "mode": "private",
+            "state": reason,
             "stopped_reason": reason,
             "job": self._job_payload(job),
+            "progress": {
+                "current": job.effective_count,
+                "target": job.total_count_limit,
+                "remaining": max(
+                    0,
+                    job.total_count_limit - job.effective_count,
+                ),
+                "reached": job.effective_count >= job.total_count_limit,
+            },
             "manual_action": None,
+            "next_action": None,
         }
         if reason == "awaiting_application_approval":
             payload["manual_action"] = {
@@ -527,17 +710,78 @@ class PrivateGuildRunner:
                 "application_id": job.application_id,
                 "controller_mid": job.controller_mid,
             }
+            payload["next_action"] = {
+                "action": "approve_and_grant_master",
+                "message": (
+                    f"手机使用原会长账号批准 {job.controller_mid} 入会，"
+                    "然后将会长委任给该账号；完成后重跑同一命令。"
+                ),
+            }
         elif reason == "awaiting_master_transfer":
             payload["manual_action"] = {
                 "action": "transfer_master_to_controller",
                 "controller_mid": job.controller_mid,
             }
+            payload["next_action"] = {
+                "action": "grant_master",
+                "message": (
+                    f"临时账号 {job.controller_mid} 已入会；手机使用当前会长账号"
+                    "将会长委任给它，然后重跑同一命令。"
+                ),
+            }
         elif reason == "awaiting_master_return":
             payload["manual_action"] = {
-                "action": "return_master_manually",
+                "action": "return_master",
                 "from_mid": job.controller_mid,
                 "to_original_master_mid": job.original_master_mid,
+                "command": f"python main.py guild private return {job.id}",
             }
+            payload["next_action"] = {
+                "action": "return_master",
+                "command": f"python main.py guild private return {job.id}",
+                "message": "目标已达到，请执行 return 命令交还会长。",
+            }
+        elif reason == "controller_not_found":
+            payload["next_action"] = {
+                "action": "restore_controller_account",
+                "message": f"请先把临时会长账号 {job.controller_mid} 补回 SQLite。",
+            }
+        elif reason == "complete":
+            payload["next_action"] = {
+                "action": "none",
+                "message": "目标已达到且会长已交还，无需继续操作。",
+            }
+        if current_master is not None:
+            payload["current_master"] = {
+                "mid": current_master.master_user_id,
+                "name": current_master.master_name,
+            }
+        if error:
+            payload["error"] = error
+        return payload
+
+    def _return_payload(
+        self,
+        job: GuildPrivateJobRow,
+        *,
+        stopped_reason: str,
+        ok: bool = True,
+        transferred: bool = False,
+        already_returned: bool = False,
+        error: str = "",
+        current_master: Optional[GuildSearchSummary] = None,
+    ) -> dict:
+        payload = {
+            "ok": ok,
+            "complete": job.status == "complete",
+            "mode": "private_return",
+            "stopped_reason": stopped_reason,
+            "transferred": transferred,
+            "already_returned": already_returned,
+            "from_mid": job.controller_mid,
+            "to_original_master_mid": job.original_master_mid,
+            "job": self._job_payload(job),
+        }
         if current_master is not None:
             payload["current_master"] = {
                 "mid": current_master.master_user_id,

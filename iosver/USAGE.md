@@ -42,7 +42,9 @@ gen [n]           建号 + 推 1-30 + 入 sqlite（不邀请）
 inv 目标 [-c N]   取未使用号登录并邀请
 daily            批量执行每日登录、邮箱领取和邮箱广告
 guild public      公开公会：直接加入后批量签到、研究、捐赠并退出
-guild private     审批公会：等待临时会长、邀请账号入会捐赠并退出
+guild private     审批公会：引导临时会长接管、邀请账号入会捐赠并退出
+guild private return [ID]
+                  列出待交还会长任务，或按数据库 ID 交还原会长
 list              查看号池
 ```
 
@@ -53,6 +55,8 @@ list              查看号池
 ./main.py guild public --gname 'ahhhha' --gmname 'absdbld' --count 20 --totalcount 200
 ./main.py guild private --gname 'ahhhha' --gmname 'absdbld' \
   --master-mid RTHLZ8967 --count 20 --totalcount 200
+python main.py guild private return
+python main.py guild private return 1
 ./main.py list --unused --ready
 ```
 
@@ -153,18 +157,47 @@ SOP：登录鉴权 → 直接加入公开公会 → 领取公会签到奖励 →
 | `--master-mid` | **是** | — | 临时接管会长并负责发送邀请的自控账号 A |
 | `--count` | **是** | — | 每个 B 最多执行的钻石捐赠次数 |
 | `--totalcount` | **是** | — | 所有 B 的免费+付费有效研究总目标 |
-| `--wait-timeout` | 否 | `300` | 单阶段等待人工审批或转让的秒数；`0` 只检查一次 |
-| `--poll-interval` | 否 | `5` | 等待期间的轮询间隔秒数 |
 | `--db` | 否 | `data/accounts.db` | sqlite |
 
 状态流程：A 发送入会申请 → 等待原会长人工审批 → 等待原会长人工将会长转给 A → A 逐个邀请 B → B 接受邀请后直接入会 → 复用与 public 相同的签到/研究/捐赠/退出 SOP。
 
+- 同一组参数对应一个固定任务；反复执行同一命令会读取原 job 和累计进度，不会从零开始。
+- 每次 JSON 都包含 `state`、当前/目标/剩余进度和 `next_action`，用于说明当前卡点及下一步操作。
+- 未达到 `--totalcount` 且暂时没有可用 B 时，状态保持为 `awaiting_donors`；补充符合条件的账号或等待 24 小时冷却结束后，重跑同一命令继续。
+- 只有达到目标后才进入 `awaiting_master_return`；任务已完成时重跑同一命令只返回 `target_already_complete`，不会创建新一轮。
 - 每次只邀请并处理一个 B，退出后才处理下一个，避免占满公会或遗留批量邀请。
+- 同一个 B 在一个 private job 内只使用一次，避免冷却结束后被同一任务重复计算。
 - `--count`、`--totalcount`、暴击计数、动态免费次数和钻石统计与 public 完全一致。
-- 等待超时不是失败；任务状态保存在 SQLite，再次执行相同命令会从申请、转让或账号步骤继续。
-- private 批次结束后状态为 `awaiting_master_return`，JSON 会输出 `original_master_mid`。程序**不会自动交还会长**，需要手动执行；再次运行相同命令会验证交还结果并将任务标记为完成。
+- 命令不等待人工操作：发现需要审批或委任时立即输出 `next_action` 并退出；操作完成后重跑同一命令继续。
+- private 批次结束后状态为 `awaiting_master_return`，JSON 会输出 `original_master_mid`。批次本身不会自动交还会长；可在手机上手动交还，也可使用下面的 `guild private return` 明确执行。
 - A 只负责审批流程和邀请，不参与捐赠，也不会自动退出公会。
-- `TransferGuildMaster`、`ApplyGuild`、邀请和接受邀请等接口均作为 `Guild` 成员函数提供，由 private 流程内部调用，不单独暴露 CLI 命令；private 不自动调用最终交还委任。
+- `TransferGuildMaster`、`ApplyGuild`、邀请和接受邀请等接口均作为 `Guild` 成员函数提供；申请、邀请和接受邀请由 private 流程内部调用，最终交还只能通过明确的 `private return ID` 或手机操作触发。
+
+常见状态：
+
+| `state` | 含义 / 操作 |
+|---------|-------------|
+| `awaiting_application_approval` | 手机批准 A 入会，然后将会长委任给 A |
+| `awaiting_master_transfer` | A 已入会；手机将会长委任给 A |
+| `awaiting_donors` | 目标未达到；补充可用 B 或等待冷却后重跑原命令 |
+| `awaiting_master_return` | 目标已达到；执行 `guild private return ID` |
+| `complete` | 目标完成且会长已交还，无需操作 |
+
+#### `guild private return [ID]`
+
+```bash
+# 列出所有等待交还会长的任务
+python main.py guild private return
+
+# 使用 guild_private_jobs.id 交还指定任务
+python main.py guild private return 3
+```
+
+- 不带 `ID` 时只读 SQLite，列出 `status=awaiting_master_return` 的记录；输出中的 `id` 就是后续命令使用的稳定索引，不是临时列表序号。
+- 带 `ID` 时登录该记录的临时会长 A，在线核对目标公会、当前会长和原会长成员资格，再调用 `TransferGuildMaster`。
+- 只有当前会长等于记录中的 `controller_mid`，且 `original_master_mid` 仍在成员列表时才会执行，避免误转让。
+- 成功后再次搜索并确认会长已经变为 `original_master_mid`，随后把任务更新为 `complete`；若此前已人工交还，则不会重复委任，只补记完成状态。
+- 可附加 `--db PATH`；默认数据库仍为 `data/accounts.db`。
 
 ### `list`
 

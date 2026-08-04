@@ -814,9 +814,14 @@ def cmd_daily(args: argparse.Namespace) -> int:
 def cmd_guild(args: argparse.Namespace) -> int:
     """Dispatch the public or private guild SOP."""
     action = str(getattr(args, "guild_action", "") or "")
+    private_action = str(getattr(args, "private_action", "") or "")
     if action == "private":
+        if private_action == "return":
+            return _cmd_guild_private_return(args)
         return _cmd_guild_private(args)
     if action == "public":
+        if private_action:
+            raise SystemExit("guild private return 只能用于 private 流程")
         return _cmd_guild_run(args)
     raise SystemExit(f"未知 guild 动作: {action}")
 
@@ -833,6 +838,87 @@ def _guild_target_join_method(details: dict) -> int | None:
             except (TypeError, ValueError):
                 pass
     return None
+
+
+def _private_cli_job_payload(job) -> dict:
+    return {
+        "id": job.id,
+        "status": job.status,
+        "guild_id": job.guild_id,
+        "gname": job.gname,
+        "original_master_name": job.gmname,
+        "original_master_mid": job.original_master_mid,
+        "controller_mid": job.controller_mid,
+        "count": job.paid_count_per_account,
+        "requested_totalcount": job.total_count_limit,
+        "totalcount": job.effective_count,
+    }
+
+
+def _private_return_job_payload(job) -> dict:
+    return {
+        **_private_cli_job_payload(job),
+        "master_acquired_at": job.master_acquired_at,
+        "master_acquired_at_local": _local_timestamp(job.master_acquired_at),
+        "updated_at": job.updated_at,
+        "updated_at_local": _local_timestamp(job.updated_at),
+        "error": job.error,
+        "return_command": f"python main.py guild private return {job.id}",
+    }
+
+
+def _cmd_guild_private_return(args: argparse.Namespace) -> int:
+    """List pending master returns or execute one by private-job row id."""
+    job_id = getattr(args, "private_job_id", None)
+    if job_id is not None and int(job_id) < 1:
+        raise SystemExit("guild_private_jobs.id 必须 >= 1")
+
+    with AccountDB(args.db) as db:
+        if job_id is None:
+            jobs = db.list_private_jobs(status="awaiting_master_return")
+            payload = {
+                "ok": True,
+                "mode": "private_return_list",
+                "index_field": "guild_private_jobs.id",
+                "count": len(jobs),
+                "jobs": [_private_return_job_payload(job) for job in jobs],
+            }
+            print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+            return 0
+
+        job = db.get_private_job(int(job_id))
+        if job is None:
+            payload = {
+                "ok": False,
+                "mode": "private_return",
+                "stopped_reason": "private_job_not_found",
+                "job_id": int(job_id),
+                "error": f"guild_private_jobs 中没有 id={int(job_id)} 的记录",
+            }
+            print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+            return 1
+
+        runner = PrivateGuildRunner(
+            db,
+            _login_account,
+            client_factory=GrpcClient,
+        )
+        try:
+            payload = runner.return_master(job)
+        except Exception as error:
+            message = f"{type(error).__name__}: {error}"
+            db.update_private_job(job.id, error=message)
+            payload = {
+                "ok": False,
+                "complete": False,
+                "mode": "private_return",
+                "stopped_reason": "master_return_failed",
+                "job_id": job.id,
+                "error": message,
+            }
+
+    print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+    return 0 if payload.get("ok") else 1
 
 
 def _cmd_guild_private(args: argparse.Namespace) -> int:
@@ -861,7 +947,20 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
     with AccountDB(args.db) as db:
         controller_row = db.get(controller_mid)
         if controller_row is None:
-            raise SystemExit(f"sqlite 中没有自控会长账号: {controller_mid}")
+            payload = {
+                "ok": False,
+                "complete": False,
+                "mode": "private",
+                "state": "controller_not_found",
+                "stopped_reason": "controller_not_found",
+                "error": f"sqlite 中没有自控会长账号: {controller_mid}",
+                "next_action": {
+                    "action": "restore_controller_account",
+                    "message": f"请先把临时会长账号 {controller_mid} 补回 SQLite。",
+                },
+            }
+            print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+            return 1
 
         target = db.get_guild_target(gname, gmname)
         if target is None:
@@ -888,9 +987,14 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                         {
                             "ok": False,
                             "mode": "private",
+                            "state": "guild_target_not_unique",
                             "stopped_reason": "guild_target_not_unique",
                             "match_count": len(matches),
                             "search_result_count": len(summaries),
+                            "next_action": {
+                                "action": "verify_guild_identity",
+                                "message": "请核对 --gname 和 --gmname，确保只匹配一个公会。",
+                            },
                         },
                         ensure_ascii=False,
                         indent=2,
@@ -906,7 +1010,12 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                         {
                             "ok": True,
                             "mode": "private",
+                            "state": "not_confirmed",
                             "stopped_reason": "not_confirmed",
+                            "next_action": {
+                                "action": "confirm_guild",
+                                "message": "确认目标信息后，重跑原命令并输入 y。",
+                            },
                         },
                         ensure_ascii=False,
                         indent=2,
@@ -920,8 +1029,13 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                         {
                             "ok": False,
                             "mode": "private",
+                            "state": "guild_is_public",
                             "stopped_reason": "guild_is_public",
                             "join_method": matched.join_method,
+                            "next_action": {
+                                "action": "use_public_flow",
+                                "message": "该公会可直接加入，请改用 guild public。",
+                            },
                         },
                         ensure_ascii=False,
                         indent=2,
@@ -947,8 +1061,13 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                         {
                             "ok": False,
                             "mode": "private",
+                            "state": "guild_is_public",
                             "stopped_reason": "guild_is_public",
                             "join_method": join_method,
+                            "next_action": {
+                                "action": "use_public_flow",
+                                "message": "该公会可直接加入，请改用 guild public。",
+                            },
                         },
                         ensure_ascii=False,
                         indent=2,
@@ -971,25 +1090,62 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                 "已有未完成 private 任务，--count/--totalcount 必须与原任务一致"
             )
         if job is None:
-            job = db.create_private_job(
-                guild_id=target.guild_id,
-                gname=gname,
-                gmname=gmname,
-                original_master_mid=original_master_mid,
-                controller_mid=controller_mid,
-                paid_count_per_account=count,
-                total_count_limit=totalcount,
+            latest = db.get_latest_private_job(target.guild_id, controller_mid)
+            same_target = bool(
+                latest is not None
+                and latest.paid_count_per_account == count
+                and latest.total_count_limit == totalcount
             )
+            if latest is not None and latest.status == "complete" and same_target:
+                if latest.effective_count >= latest.total_count_limit:
+                    payload = {
+                        "ok": True,
+                        "complete": True,
+                        "mode": "private",
+                        "state": "complete",
+                        "stopped_reason": "target_already_complete",
+                        "job": _private_cli_job_payload(latest),
+                        "progress": {
+                            "current": latest.effective_count,
+                            "target": latest.total_count_limit,
+                            "remaining": 0,
+                            "reached": True,
+                        },
+                        "next_action": {
+                            "action": "none",
+                            "message": "目标已达到且会长已交还，无需继续操作。",
+                        },
+                    }
+                    print(
+                        json.dumps(payload, ensure_ascii=False, indent=2),
+                        flush=True,
+                    )
+                    return 0
+                job = db.update_private_job(
+                    latest.id,
+                    status="awaiting_donors",
+                    completed_at=0,
+                )
+            else:
+                job = db.create_private_job(
+                    guild_id=target.guild_id,
+                    gname=gname,
+                    gmname=gmname,
+                    original_master_mid=original_master_mid,
+                    controller_mid=controller_mid,
+                    paid_count_per_account=count,
+                    total_count_limit=totalcount,
+                )
 
         runner = PrivateGuildRunner(
             db,
             _login_account,
             client_factory=GrpcClient,
-            wait_timeout=float(getattr(args, "wait_timeout", 300)),
-            poll_interval=float(getattr(args, "poll_interval", 5)),
         )
         try:
             payload = runner.run(job)
+            if isinstance(payload.get("pool"), dict):
+                payload["pool"] = _guild_pool_payload(payload["pool"])
         except Exception as error:
             message = f"{type(error).__name__}: {error}"
             db.update_private_job(job.id, error=message)
@@ -997,9 +1153,14 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                 "ok": False,
                 "complete": False,
                 "mode": "private",
+                "state": "private_job_failed",
                 "stopped_reason": "private_job_failed",
                 "job_id": job.id,
                 "error": message,
+                "next_action": {
+                    "action": "inspect_error_and_rerun",
+                    "message": "检查 error；修复对应条件后重跑同一命令继续。",
+                },
             }
 
     print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
@@ -1422,6 +1583,18 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("public", "private"),
         help="公会流程类型",
     )
+    sp.add_argument(
+        "private_action",
+        nargs="?",
+        choices=("return",),
+        help="private 可选动作：return 列出或交还会长",
+    )
+    sp.add_argument(
+        "private_job_id",
+        nargs="?",
+        type=int,
+        help="return：guild_private_jobs.id；省略时列出待交还任务",
+    )
     sp.add_argument("--gname", help="公会名称")
     sp.add_argument("--gmname", help="会长名称")
     sp.add_argument(
@@ -1437,18 +1610,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "--master-mid",
         help="private：临时接管会长并负责发送邀请的 sqlite 账号 MID",
-    )
-    sp.add_argument(
-        "--wait-timeout",
-        type=float,
-        default=300,
-        help="private：等待审批或人工转让的秒数，默认 300；0 为仅检查一次",
-    )
-    sp.add_argument(
-        "--poll-interval",
-        type=float,
-        default=5,
-        help="private：等待状态轮询间隔秒数，默认 5",
     )
     sp.add_argument("--db", default=str(DEFAULT_DB), help="sqlite 路径")
     sp.set_defaults(func=cmd_guild)
@@ -1471,7 +1632,22 @@ def main(argv: list[str] | None = None) -> int:
         verbose=bool(getattr(args, "verbose", False)),
         quiet=bool(getattr(args, "quiet", False)),
     )
-    return args.func(args)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "stopped_reason": "interrupted",
+                    "message": "已中断；任务进度保存在 SQLite，重跑原命令可继续。",
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            flush=True,
+        )
+        return 130
 
 
 if __name__ == "__main__":

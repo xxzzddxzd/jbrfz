@@ -266,7 +266,11 @@ def dynamic_paid_research_response() -> bytes:
     )
 
 
-def guild_detail_response(total_experience: int = 33) -> bytes:
+def guild_detail_response(
+    total_experience: int = 33,
+    *,
+    member_ids: tuple[str, ...] = ("MASTER", "MEMBER"),
+) -> bytes:
     settings = b"".join(
         (
             pb.encode_int32_field(1, 101),
@@ -276,10 +280,7 @@ def guild_detail_response(total_experience: int = 33) -> bytes:
     )
     members = pb.encode_repeated_messages(
         1,
-        (
-            pb.encode_string_field(1, "MASTER"),
-            pb.encode_string_field(1, "MEMBER"),
-        ),
+        tuple(pb.encode_string_field(1, mid) for mid in member_ids),
     )
     experiences = pb.encode_int64_field(1, total_experience)
     guild = b"".join(
@@ -1284,6 +1285,60 @@ class PrivateWaitingClient:
         raise AssertionError(f"unexpected waiting RPC: {path}")
 
 
+class PrivateReturnClient:
+    calls: list[tuple[str, str]] = []
+    master_mid = "CONTROLLER"
+    member_ids: tuple[str, ...] = ("OWNER", "CONTROLLER")
+
+    def __init__(self, endpoint: str) -> None:
+        self.endpoint = endpoint
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args) -> None:
+        return None
+
+    def unary(self, path, message, metadata=None):
+        mid = str((metadata or {}).get("crumble-user-id") or "")
+        type(self).calls.append((mid, path))
+        if path == SEARCH_GUILDS_PATH:
+            master_name = (
+                "absdbld" if type(self).master_mid == "OWNER" else "controller"
+            )
+            return GrpcResponse(
+                pb.encode_message_field(
+                    1,
+                    guild_summary_message(
+                        join_method=1,
+                        master_mid=type(self).master_mid,
+                        master_name=master_name,
+                    ),
+                ),
+                {},
+                {},
+            )
+        if path == GET_GUILD_PATH:
+            return GrpcResponse(
+                guild_detail_response(member_ids=type(self).member_ids),
+                {},
+                {},
+            )
+        if path == TRANSFER_GUILD_MASTER_PATH:
+            self.assert_transfer_request(message)
+            type(self).master_mid = "OWNER"
+            return GrpcResponse(b"", {}, {})
+        raise AssertionError(f"unexpected private return RPC: {path}")
+
+    @staticmethod
+    def assert_transfer_request(message: bytes) -> None:
+        if pb.decode_fields(message) != [
+            (1, 2, b"G-ID"),
+            (2, 2, b"OWNER"),
+        ]:
+            raise AssertionError("unexpected transfer request")
+
+
 class GuildCommandTests(unittest.TestCase):
     def test_guild_parser_exposes_only_public_and_private(self) -> None:
         parser = cli.build_parser()
@@ -1363,6 +1418,14 @@ class GuildCommandTests(unittest.TestCase):
         self.assertEqual(private.guild_action, "private")
         self.assertEqual(private.master_mid, "CONTROLLER")
 
+        return_list = parser.parse_args(["guild", "private", "return"])
+        self.assertEqual(return_list.private_action, "return")
+        self.assertIsNone(return_list.private_job_id)
+
+        return_one = parser.parse_args(["guild", "private", "return", "12"])
+        self.assertEqual(return_one.private_action, "return")
+        self.assertEqual(return_one.private_job_id, 12)
+
     def test_private_flow_invites_donor_and_waits_for_manual_master_return(
         self,
     ) -> None:
@@ -1411,8 +1474,6 @@ class GuildCommandTests(unittest.TestCase):
                     "1",
                     "--totalcount",
                     "6",
-                    "--wait-timeout",
-                    "0",
                     "--db",
                     str(db_path),
                 ]
@@ -1472,6 +1533,255 @@ class GuildCommandTests(unittest.TestCase):
                 ).fetchall()
                 self.assertEqual([row[0] for row in jobs], ["complete"])
 
+            repeated_output = io.StringIO()
+            with redirect_stdout(repeated_output):
+                repeated_code = cli.cmd_guild(args)
+            self.assertEqual(repeated_code, 0)
+            repeated = json.loads(repeated_output.getvalue())
+            self.assertTrue(repeated["complete"])
+            self.assertEqual(
+                repeated["stopped_reason"],
+                "target_already_complete",
+            )
+            self.assertEqual(repeated["next_action"]["action"], "none")
+            with AccountDB(db_path) as db:
+                self.assertEqual(len(db.list_private_jobs()), 1)
+
+    def test_private_flow_waits_for_more_accounts_and_resumes_same_target(
+        self,
+    ) -> None:
+        PrivateScenarioClient.calls = []
+        PrivateScenarioClient.free_counts = {}
+        PrivateScenarioClient.master_mid = "CONTROLLER"
+        parser = cli.build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                for mid in ("CONTROLLER", "DONOR-A"):
+                    db.upsert_state(
+                        AccountState(
+                            mid=mid,
+                            guest_secret="secret",
+                            game_access_token="token",
+                            next_stage=31,
+                            diamond_balance=900,
+                        ),
+                        used=True,
+                        ready=True,
+                        invalid=False,
+                    )
+                db.upsert_guild_target(
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    guild_id="G-ID",
+                    guild_level=1,
+                    member_count=2,
+                    master_user_id="OWNER",
+                    original_master_mid="OWNER",
+                    details={"search_summary": {"join_method": 1}},
+                )
+
+            args = parser.parse_args(
+                [
+                    "guild",
+                    "private",
+                    "--gname",
+                    "ahhhha",
+                    "--gmname",
+                    "absdbld",
+                    "--master-mid",
+                    "CONTROLLER",
+                    "--count",
+                    "1",
+                    "--totalcount",
+                    "9",
+                    "--db",
+                    str(db_path),
+                ]
+            )
+
+            first_output = io.StringIO()
+            with (
+                patch.object(cli, "GrpcClient", PrivateScenarioClient),
+                patch.object(
+                    cli, "_login_account", side_effect=lambda row: row.to_state()
+                ),
+                redirect_stdout(first_output),
+            ):
+                first_code = cli.cmd_guild(args)
+
+            self.assertEqual(first_code, 0)
+            first = json.loads(first_output.getvalue())
+            self.assertEqual(first["state"], "awaiting_donors")
+            self.assertEqual(first["stopped_reason"], "target_not_reached")
+            self.assertEqual(first["totalcount"], 8)
+            self.assertEqual(first["remaining_totalcount"], 1)
+            self.assertEqual(
+                first["next_action"]["action"],
+                "prepare_eligible_donors_and_rerun",
+            )
+            with AccountDB(db_path) as db:
+                active = db.get_active_private_job("G-ID", "CONTROLLER")
+                self.assertEqual(active.status, "awaiting_donors")
+                db.upsert_state(
+                    AccountState(
+                        mid="DONOR-B",
+                        guest_secret="secret",
+                        game_access_token="token",
+                        next_stage=31,
+                        diamond_balance=900,
+                    ),
+                    used=True,
+                    ready=True,
+                    invalid=False,
+                )
+
+            second_output = io.StringIO()
+            with (
+                patch.object(cli, "GrpcClient", PrivateScenarioClient),
+                patch.object(
+                    cli, "_login_account", side_effect=lambda row: row.to_state()
+                ),
+                redirect_stdout(second_output),
+            ):
+                second_code = cli.cmd_guild(args)
+
+            self.assertEqual(second_code, 0)
+            second = json.loads(second_output.getvalue())
+            self.assertEqual(second["state"], "awaiting_master_return")
+            self.assertTrue(second["totalcount_reached"])
+            self.assertEqual(second["totalcount"], 9)
+            self.assertEqual(second["totalcount_added"], 1)
+            self.assertEqual(second["next_action"]["action"], "return_master")
+            with AccountDB(db_path) as db:
+                active = db.get_active_private_job("G-ID", "CONTROLLER")
+                self.assertEqual(active.status, "awaiting_master_return")
+                self.assertEqual(len(db.list_private_jobs()), 1)
+
+    def test_private_return_lists_pending_jobs_by_database_id(self) -> None:
+        parser = cli.build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                pending = db.create_private_job(
+                    guild_id="G-ID",
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    original_master_mid="OWNER",
+                    controller_mid="CONTROLLER",
+                    paid_count_per_account=10,
+                    total_count_limit=20,
+                )
+                db.update_private_job(
+                    pending.id,
+                    status="awaiting_master_return",
+                    effective_count=20,
+                )
+                complete = db.create_private_job(
+                    guild_id="OTHER-GUILD",
+                    gname="other",
+                    gmname="other-owner",
+                    original_master_mid="OTHER-OWNER",
+                    controller_mid="OTHER-CONTROLLER",
+                    paid_count_per_account=1,
+                    total_count_limit=3,
+                )
+                db.update_private_job(complete.id, status="complete")
+
+            args = parser.parse_args(
+                [
+                    "guild",
+                    "private",
+                    "return",
+                    "--db",
+                    str(db_path),
+                ]
+            )
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = cli.cmd_guild(args)
+
+            self.assertEqual(code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["index_field"], "guild_private_jobs.id")
+            self.assertEqual(payload["count"], 1)
+            self.assertEqual(payload["jobs"][0]["id"], pending.id)
+            self.assertEqual(
+                payload["jobs"][0]["return_command"],
+                f"python main.py guild private return {pending.id}",
+            )
+
+    def test_private_return_transfers_to_original_master_and_completes_job(
+        self,
+    ) -> None:
+        PrivateReturnClient.calls = []
+        PrivateReturnClient.master_mid = "CONTROLLER"
+        PrivateReturnClient.member_ids = ("OWNER", "CONTROLLER")
+        parser = cli.build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                db.upsert_state(
+                    AccountState(
+                        mid="CONTROLLER",
+                        guest_secret="secret",
+                        game_access_token="token",
+                        next_stage=31,
+                    ),
+                    used=True,
+                    ready=True,
+                    invalid=False,
+                )
+                job = db.create_private_job(
+                    guild_id="G-ID",
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    original_master_mid="OWNER",
+                    controller_mid="CONTROLLER",
+                    paid_count_per_account=10,
+                    total_count_limit=20,
+                )
+                db.update_private_job(
+                    job.id,
+                    status="awaiting_master_return",
+                    effective_count=20,
+                )
+
+            args = parser.parse_args(
+                [
+                    "guild",
+                    "private",
+                    "return",
+                    str(job.id),
+                    "--db",
+                    str(db_path),
+                ]
+            )
+            output = io.StringIO()
+            with (
+                patch.object(cli, "GrpcClient", PrivateReturnClient),
+                patch.object(
+                    cli, "_login_account", side_effect=lambda row: row.to_state()
+                ),
+                redirect_stdout(output),
+            ):
+                code = cli.cmd_guild(args)
+
+            self.assertEqual(code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["complete"])
+            self.assertTrue(payload["transferred"])
+            self.assertEqual(payload["to_original_master_mid"], "OWNER")
+            self.assertIn(
+                ("CONTROLLER", TRANSFER_GUILD_MASTER_PATH),
+                PrivateReturnClient.calls,
+            )
+            with AccountDB(db_path) as db:
+                saved = db.get_private_job(job.id)
+                self.assertEqual(saved.status, "complete")
+                self.assertGreater(saved.completed_at, 0)
+
     def test_private_flow_applies_and_persists_waiting_state(self) -> None:
         PrivateWaitingClient.calls = []
         parser = cli.build_parser()
@@ -1511,8 +1821,6 @@ class GuildCommandTests(unittest.TestCase):
                     "1",
                     "--totalcount",
                     "6",
-                    "--wait-timeout",
-                    "0",
                     "--db",
                     str(db_path),
                 ]
