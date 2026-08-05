@@ -20,10 +20,12 @@ from crumble_bot.guild import (
     ACCEPT_GUILD_INVITATION_PATH,
     APPLY_GUILD_PATH,
     ATTEND_GUILD_PATH,
+    BANISH_GUILD_MEMBER_PATH,
     CONDUCT_FREE_GUILD_LAB_RESEARCH_PATH,
     CONDUCT_PAID_GUILD_LAB_RESEARCH_PATH,
     GET_GUILD_APPLICATIONS_FOR_USER_PATH,
     GET_GUILD_INVITATIONS_FOR_USER_PATH,
+    GET_GUILD_MEMBERS_PATH,
     GET_GUILD_PATH,
     INVITE_USER_TO_GUILD_PATH,
     JOIN_GUILD_PATH,
@@ -33,9 +35,11 @@ from crumble_bot.guild import (
     Guild,
     parse_accept_guild_invitation_response,
     parse_apply_guild_response,
+    parse_banish_guild_member_response,
     parse_guild_detail_response,
     parse_guild_applications_for_user_response,
     parse_guild_invitations_for_user_response,
+    parse_get_guild_members_response,
     parse_guild_search_response,
     parse_invite_user_to_guild_response,
     parse_transfer_guild_master_response,
@@ -64,7 +68,9 @@ from crumble_bot.mailbox import (
 from crumble_bot.messages import (
     accept_guild_invitation_request,
     apply_guild_request,
+    banish_guild_member_request,
     get_guild_applications_for_user_request,
+    get_guild_members_request,
     get_user_social_info_request,
     invite_user_to_guild_request,
     receive_mail_advertisement_reward_request,
@@ -582,6 +588,158 @@ class GuildParserTests(unittest.TestCase):
         self.assertIsNotNone(transferred.member_state)
         self.assertEqual(transferred.member_state.role, 1)
         self.assertEqual(transferred.member_state.guild_id, "G-ID")
+
+    def test_guild_banish_member_protocol(self) -> None:
+        self.assertEqual(
+            pb.decode_fields(
+                banish_guild_member_request("G-ID", "MEMBER-MID")
+            ),
+            [(1, 2, b"G-ID"), (2, 2, b"MEMBER-MID")],
+        )
+        last_banishment = pb.encode_int64_field(1, 1_786_000_000_000)
+        banishments = b"".join(
+            (
+                pb.encode_message_field(1, last_banishment),
+                pb.encode_int32_field(2, 2),
+            )
+        )
+        parsed = parse_banish_guild_member_response(
+            pb.encode_message_field(1, banishments)
+        )
+        self.assertEqual(parsed.last_banishment_at_millis, 1_786_000_000_000)
+        self.assertEqual(parsed.daily_banishment_count, 2)
+
+    def test_get_guild_members_protocol_exposes_member_information(self) -> None:
+        self.assertEqual(
+            pb.decode_fields(get_guild_members_request("G-ID")),
+            [(1, 2, b"G-ID")],
+        )
+
+        def member_summary(
+            mid: str,
+            name: str,
+            level: int,
+            role: int,
+            joined_at: int,
+            last_accessed_at: int,
+            combat_power: float,
+            contribution: int,
+        ) -> bytes:
+            crumble = b"".join(
+                (
+                    pb.encode_string_field(1, mid),
+                    pb.encode_string_field(2, name),
+                    pb.encode_int32_field(3, 101),
+                    pb.encode_int32_field(4, 202),
+                    pb.encode_int32_field(5, 303),
+                    pb.encode_int32_field(6, 4),
+                    pb.encode_int32_field(7, level),
+                )
+            )
+            return b"".join(
+                (
+                    pb.encode_message_field(1, crumble),
+                    pb.encode_int32_field(2, role),
+                    pb.encode_message_field(
+                        3,
+                        pb.encode_int64_field(1, joined_at),
+                    ),
+                    pb.encode_message_field(
+                        4,
+                        pb.encode_int64_field(1, last_accessed_at),
+                    ),
+                    pb.encode_double_field(5, combat_power),
+                    pb.encode_int64_field(6, contribution),
+                )
+            )
+
+        banishments = b"".join(
+            (
+                pb.encode_message_field(
+                    1,
+                    pb.encode_int64_field(1, 1_786_000_000_000),
+                ),
+                pb.encode_int32_field(2, 2),
+            )
+        )
+        response = b"".join(
+            (
+                pb.encode_message_field(
+                    1,
+                    member_summary(
+                        "OWNER",
+                        "absdbld",
+                        55,
+                        0,
+                        1_785_000_000_000,
+                        1_786_000_000_000,
+                        123_456.5,
+                        789,
+                    ),
+                ),
+                pb.encode_message_field(
+                    1,
+                    member_summary(
+                        "MEMBER",
+                        "donor-name",
+                        31,
+                        1,
+                        1_785_100_000_000,
+                        1_786_100_000_000,
+                        50_000,
+                        123,
+                    ),
+                ),
+                pb.encode_message_field(2, banishments),
+            )
+        )
+
+        parsed = parse_get_guild_members_response(response)
+        self.assertEqual(len(parsed.members), 2)
+        master, member = parsed.members
+        self.assertEqual(master.mid, "OWNER")
+        self.assertEqual(master.name, "absdbld")
+        self.assertEqual(master.crumble_level, 55)
+        self.assertEqual(master.role, 0)
+        self.assertEqual(master.role_name, "master")
+        self.assertEqual(master.joined_at_millis, 1_785_000_000_000)
+        self.assertEqual(master.last_accessed_at_millis, 1_786_000_000_000)
+        self.assertEqual(master.total_combat_power, 123_456.5)
+        self.assertEqual(master.contribution_point, 789)
+        self.assertEqual(master.profile_image_data_id, 101)
+        self.assertEqual(master.profile_frame_data_id, 202)
+        self.assertEqual(master.profile_title_data_id, 303)
+        self.assertEqual(master.channel_id, 4)
+        self.assertEqual(member.mid, "MEMBER")
+        self.assertEqual(member.name, "donor-name")
+        self.assertEqual(member.crumble_level, 31)
+        self.assertEqual(member.role_name, "member")
+        self.assertEqual(parsed.banishments.daily_banishment_count, 2)
+
+    def test_guild_member_management_facades_are_not_commands(self) -> None:
+        client = FakeWorkflowClient()
+        guild = Guild(
+            client,
+            AccountState(mid="MID", game_access_token="token").to_session(),
+        )
+
+        guild.get_guild_members(" G-ID ")
+        guild.banish_guild_member(" G-ID ", " MEMBER-MID ")
+
+        self.assertEqual(client.calls[-1], BANISH_GUILD_MEMBER_PATH)
+        self.assertEqual(client.calls[-2], GET_GUILD_MEMBERS_PATH)
+        self.assertEqual(
+            pb.decode_fields(client.requests[-2][1]),
+            [(1, 2, b"G-ID")],
+        )
+        self.assertEqual(
+            pb.decode_fields(client.requests[-1][1]),
+            [(1, 2, b"G-ID"), (2, 2, b"MEMBER-MID")],
+        )
+        with self.assertRaisesRegex(ValueError, "guild_id must not be empty"):
+            guild.banish_guild_member(" ", "MEMBER-MID")
+        with self.assertRaisesRegex(ValueError, "member_id must be a string"):
+            guild.banish_guild_member("G-ID", None)
 
     def test_user_social_info_protocol_exposes_game_name(self) -> None:
         request = get_user_social_info_request(("A", "B"))
@@ -1443,7 +1601,15 @@ class GuildCommandTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 parser.parse_args(["guild"])
-            for removed_action in ("run", "invite", "accept"):
+            for removed_action in (
+                "run",
+                "invite",
+                "accept",
+                "banish",
+                "kick",
+                "members",
+                "getmembers",
+            ):
                 with self.subTest(removed_action=removed_action):
                     with self.assertRaises(SystemExit):
                         parser.parse_args(["guild", removed_action])

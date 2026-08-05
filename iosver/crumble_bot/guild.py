@@ -13,10 +13,12 @@ from .messages import (
     accept_guild_invitation_request,
     apply_guild_request,
     attend_guild_request,
+    banish_guild_member_request,
     conduct_free_guild_lab_research_request,
     conduct_paid_guild_lab_research_request,
     get_guild_applications_for_user_request,
     get_guild_invitations_for_user_request,
+    get_guild_members_request,
     get_guild_request,
     invite_user_to_guild_request,
     join_guild_request,
@@ -32,6 +34,7 @@ JOIN_GUILD_PATH = "/cc.public.game.GuildDiscoveryService/JoinGuild"
 APPLY_GUILD_PATH = "/cc.public.game.GuildDiscoveryService/ApplyGuild"
 LEAVE_GUILD_PATH = "/cc.public.game.GuildMemberService/LeaveGuild"
 GET_GUILD_PATH = "/cc.public.game.GuildMemberService/GetGuild"
+GET_GUILD_MEMBERS_PATH = "/cc.public.game.GuildMemberService/GetGuildMembers"
 CONDUCT_FREE_GUILD_LAB_RESEARCH_PATH = (
     "/cc.public.game.GuildMemberService/ConductFreeGuildLabResearch"
 )
@@ -53,6 +56,9 @@ GET_GUILD_APPLICATIONS_FOR_USER_PATH = (
 )
 TRANSFER_GUILD_MASTER_PATH = (
     "/cc.public.game.GuildMemberService/TransferGuildMaster"
+)
+BANISH_GUILD_MEMBER_PATH = (
+    "/cc.public.game.GuildMemberService/BanishGuildMember"
 )
 
 GuildIdRequestBuilder = Callable[[str], bytes]
@@ -134,6 +140,38 @@ class GuildActionResult:
     progression: GuildProgressionChanges | None = None
     lab_research: GuildLabResearchChanges | None = None
     is_super_success: bool | None = None
+
+
+@dataclass(frozen=True)
+class GuildBanishmentSnapshot:
+    last_banishment_at_millis: int
+    daily_banishment_count: int
+
+
+@dataclass(frozen=True)
+class GuildMemberSummarySnapshot:
+    mid: str
+    name: str
+    crumble_level: int
+    role: int
+    joined_at_millis: int
+    last_accessed_at_millis: int
+    total_combat_power: float
+    contribution_point: int
+    profile_image_data_id: int = 0
+    profile_frame_data_id: int = 0
+    profile_title_data_id: int = 0
+    channel_id: int = 0
+
+    @property
+    def role_name(self) -> str:
+        return {0: "master", 1: "member"}.get(self.role, f"unknown:{self.role}")
+
+
+@dataclass(frozen=True)
+class GuildMembersSnapshot:
+    members: tuple[GuildMemberSummarySnapshot, ...]
+    banishments: GuildBanishmentSnapshot
 
 
 def parse_guild_search_response(body: bytes) -> list[GuildSearchSummary]:
@@ -218,6 +256,58 @@ def parse_guild_applications_for_user_response(
 def parse_transfer_guild_master_response(body: bytes) -> GuildActionResult:
     """Parse the former master's member state after transferring ownership."""
     return _parse_guild_action_response(body, member_state_field=2)
+
+
+def parse_banish_guild_member_response(body: bytes) -> GuildBanishmentSnapshot:
+    """Parse the guild's updated daily banishment counters."""
+    return _parse_guild_banishments(
+        _message_value(pb.decode_fields(body), 1)
+    )
+
+
+def parse_get_guild_members_response(body: bytes) -> GuildMembersSnapshot:
+    """Parse member identity, level, activity, combat, and contribution data."""
+    fields = pb.decode_fields(body)
+    members: list[GuildMemberSummarySnapshot] = []
+    for field_number, wire_type, value in fields:
+        if field_number != 1 or wire_type != 2:
+            continue
+        member_fields = pb.decode_fields(bytes(value))
+        crumble = _message_value(member_fields, 1)
+        crumble_fields = pb.decode_fields(crumble) if crumble is not None else []
+        mid = _string_value(crumble_fields, 1)
+        if not mid:
+            continue
+        joined_at = _message_value(member_fields, 3)
+        last_accessed_at = _message_value(member_fields, 4)
+        members.append(
+            GuildMemberSummarySnapshot(
+                mid=mid,
+                name=_string_value(crumble_fields, 2),
+                crumble_level=_int_value(crumble_fields, 7),
+                role=_int_value(member_fields, 2),
+                joined_at_millis=_time_millis(joined_at),
+                last_accessed_at_millis=_time_millis(last_accessed_at),
+                total_combat_power=_double_value(member_fields, 5),
+                contribution_point=_int_value(member_fields, 6),
+                profile_image_data_id=_int_value(crumble_fields, 3),
+                profile_frame_data_id=_int_value(crumble_fields, 4),
+                profile_title_data_id=_int_value(crumble_fields, 5),
+                channel_id=_int_value(crumble_fields, 6),
+            )
+        )
+    return GuildMembersSnapshot(
+        members=tuple(members),
+        banishments=_parse_guild_banishments(_message_value(fields, 2)),
+    )
+
+
+def _parse_guild_banishments(body: bytes | None) -> GuildBanishmentSnapshot:
+    fields = pb.decode_fields(body) if body is not None else []
+    return GuildBanishmentSnapshot(
+        last_banishment_at_millis=_time_millis(_message_value(fields, 1)),
+        daily_banishment_count=_int_value(fields, 2),
+    )
 
 
 def _parse_guild_summary(body: bytes) -> GuildSearchSummary | None:
@@ -400,6 +490,10 @@ def _message_value(fields, target: int) -> bytes | None:
     return None
 
 
+def _time_millis(body: bytes | None) -> int:
+    return _int_value(pb.decode_fields(body), 1) if body is not None else 0
+
+
 def _int_value(fields, target: int) -> int:
     for field_number, wire_type, value in fields:
         if field_number == target and wire_type == 0:
@@ -492,6 +586,14 @@ class Guild:
         """Fetch guild details; the authenticated account must be a member."""
         return self._guild_id_rpc(GET_GUILD_PATH, get_guild_request, guild_id)
 
+    def get_guild_members(self, guild_id: str) -> GrpcResponse:
+        """Fetch the guild's member summaries and banishment counters."""
+        return self._guild_id_rpc(
+            GET_GUILD_MEMBERS_PATH,
+            get_guild_members_request,
+            guild_id,
+        )
+
     def conduct_free_guild_lab_research(self, guild_id: str) -> GrpcResponse:
         """Conduct one free guild-lab research action.
 
@@ -572,6 +674,23 @@ class Guild:
         return self._unary(
             TRANSFER_GUILD_MASTER_PATH,
             transfer_guild_master_request(guild_id, member_id),
+        )
+
+    def banish_guild_member(
+        self,
+        guild_id: str,
+        member_id: str,
+    ) -> GrpcResponse:
+        """Remove an existing member from the authenticated operator's guild.
+
+        Authority, the daily banishment limit, and rejoin cooldowns are
+        enforced by the server.
+        """
+        guild_id = self._validated_string(guild_id, "guild_id")
+        member_id = self._validated_string(member_id, "member_id")
+        return self._unary(
+            BANISH_GUILD_MEMBER_PATH,
+            banish_guild_member_request(guild_id, member_id),
         )
 
     def _guild_id_rpc(

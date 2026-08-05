@@ -195,6 +195,7 @@ SOP：登录鉴权 → 直接加入公开公会 → 领取公会签到奖励 →
 - private 批次结束后状态为 `awaiting_master_return`，JSON 会输出 `original_master_mid`。批次本身不会自动交还会长；可在手机上手动交还，也可使用下面的 `guild private return` 明确执行。
 - A 只负责审批流程和邀请，不参与捐赠，也不会自动退出公会。
 - `TransferGuildMaster`、`ApplyGuild`、邀请和接受邀请等接口均作为 `Guild` 成员函数提供；申请、邀请和接受邀请由 private 流程内部调用，最终交还只能通过明确的 `private return ID` 或手机操作触发。
+- `GetGuildMembers` 和 `BanishGuildMember` 仅作为 `Guild` 成员函数提供，不暴露 CLI。成员查询会解析名称、等级、MID、角色、加入/活跃时间、战力和贡献值；踢人响应会解析当日踢人计数。
 
 常见状态：
 

@@ -214,6 +214,10 @@ def get_guild_request(guild_id: str) -> bytes:
     return guild_id_request(guild_id)
 
 
+def get_guild_members_request(guild_id: str) -> bytes:
+    return guild_id_request(guild_id)
+
+
 def conduct_free_guild_lab_research_request(guild_id: str) -> bytes:
     return guild_id_request(guild_id)
 
@@ -263,6 +267,16 @@ def accept_guild_invitation_request(guild_id: str, invitation_id: str) -> bytes:
 
 def transfer_guild_master_request(guild_id: str, member_id: str) -> bytes:
     """Build TransferGuildMasterRequest: guild id field 1, member MID field 2."""
+    return b"".join(
+        (
+            pb.encode_string_field(1, guild_id),
+            pb.encode_string_field(2, member_id),
+        )
+    )
+
+
+def banish_guild_member_request(guild_id: str, member_id: str) -> bytes:
+    """Build BanishGuildMemberRequest: guild id field 1, member MID field 2."""
     return b"".join(
         (
             pb.encode_string_field(1, guild_id),
