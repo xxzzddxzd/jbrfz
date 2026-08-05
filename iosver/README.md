@@ -13,6 +13,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m crumble_bot guild private --gname 'ahhhha' --gmname 'absdbld' --count 20 --totalcount 200
 .venv/bin/python -m crumble_bot guild private return
 .venv/bin/python -m crumble_bot guild private return 1
+.venv/bin/python -m crumble_bot guild joblist
 .venv/bin/python -m crumble_bot list --unused --ready
 ```
 
@@ -30,6 +31,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ./main.py guild private --gname 'ahhhha' --gmname 'absdbld' --count 20 --totalcount 200
 python main.py guild private return
 python main.py guild private return 1
+python main.py guild joblist
 ./main.py list --unused --ready
 
 # 或

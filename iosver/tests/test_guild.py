@@ -1405,7 +1405,7 @@ class PrivateReturnClient:
 
 
 class GuildCommandTests(unittest.TestCase):
-    def test_guild_parser_exposes_only_public_and_private(self) -> None:
+    def test_guild_parser_exposes_public_private_and_joblist(self) -> None:
         parser = cli.build_parser()
         args = parser.parse_args(
             [
@@ -1517,6 +1517,12 @@ class GuildCommandTests(unittest.TestCase):
         )
         self.assertTrue(private_confirm.confirm)
 
+        guild_joblist = parser.parse_args(["guild", "joblist"])
+        self.assertEqual(guild_joblist.guild_action, "joblist")
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["guild", "list"])
+
         return_list = parser.parse_args(["guild", "private", "return"])
         self.assertEqual(return_list.private_action, "return")
         self.assertIsNone(return_list.private_job_id)
@@ -1524,6 +1530,79 @@ class GuildCommandTests(unittest.TestCase):
         return_one = parser.parse_args(["guild", "private", "return", "12"])
         self.assertEqual(return_one.private_action, "return")
         self.assertEqual(return_one.private_job_id, 12)
+
+    def test_guild_joblist_shows_all_private_jobs(self) -> None:
+        parser = cli.build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                pending = db.create_private_job(
+                    guild_id="G-ID",
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    original_master_mid="OWNER",
+                    controller_mid="CONTROLLER-A",
+                    paid_count_per_account=10,
+                    total_count_limit=500,
+                )
+                db.update_private_job(
+                    pending.id,
+                    status="awaiting_master_return",
+                    effective_count=500,
+                )
+                db.update_private_account(
+                    pending.id,
+                    "DONOR-A",
+                    state="complete",
+                )
+                complete = db.create_private_job(
+                    guild_id="G-ID",
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    original_master_mid="OWNER",
+                    controller_mid="CONTROLLER-B",
+                    paid_count_per_account=5,
+                    total_count_limit=100,
+                )
+                db.update_private_job(
+                    complete.id,
+                    status="complete",
+                    effective_count=100,
+                )
+
+            args = parser.parse_args(
+                ["guild", "joblist", "--db", str(db_path)]
+            )
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = cli.cmd_guild(args)
+
+            self.assertEqual(code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["mode"], "guild_joblist")
+            self.assertEqual(payload["index_field"], "guild_private_jobs.id")
+            self.assertEqual(payload["count"], 2)
+            self.assertEqual(payload["pending_master_return_count"], 1)
+            self.assertEqual(
+                payload["status_counts"],
+                {
+                    "awaiting_master_return": 1,
+                    "complete": 1,
+                },
+            )
+            self.assertNotIn("guild_targets", payload)
+            jobs = {job["id"]: job for job in payload["jobs"]}
+            self.assertTrue(jobs[pending.id]["return_pending"])
+            self.assertEqual(
+                jobs[pending.id]["return_command"],
+                f"python main.py guild private return {pending.id}",
+            )
+            self.assertEqual(jobs[pending.id]["account_states"], {"complete": 1})
+            self.assertFalse(jobs[complete.id]["return_pending"])
+            self.assertEqual(
+                jobs[complete.id]["return_command"],
+                f"python main.py guild private return {complete.id}",
+            )
 
     def test_private_flow_invites_donor_and_waits_for_manual_master_return(
         self,
@@ -1645,6 +1724,31 @@ class GuildCommandTests(unittest.TestCase):
             self.assertEqual(repeated["next_action"]["action"], "none")
             with AccountDB(db_path) as db:
                 self.assertEqual(len(db.list_private_jobs()), 1)
+
+    def test_private_flow_rejects_total_above_daily_invitation_capacity(
+        self,
+    ) -> None:
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            [
+                "guild",
+                "private",
+                "--gname",
+                "ahhhha",
+                "--gmname",
+                "absdbld",
+                "--count",
+                "10",
+                "--totalcount",
+                "501",
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            SystemExit,
+            r"--count=10.*50.*= 500.*--totalcount.*<= 500.*--count.*>= 11",
+        ):
+            cli.cmd_guild(args)
 
     def test_private_flow_waits_for_more_accounts_and_resumes_same_target(
         self,
@@ -1796,7 +1900,7 @@ class GuildCommandTests(unittest.TestCase):
                     original_master_mid="OWNER",
                     controller_mid="CONTROLLER",
                     paid_count_per_account=1,
-                    total_count_limit=100,
+                    total_count_limit=50,
                 )
                 db.update_private_job(job.id, status="awaiting_donors")
                 db.update_private_account(
@@ -1822,7 +1926,7 @@ class GuildCommandTests(unittest.TestCase):
                     "--count",
                     "1",
                     "--totalcount",
-                    "100",
+                    "50",
                     "--db",
                     str(db_path),
                 ]
@@ -1996,6 +2100,73 @@ class GuildCommandTests(unittest.TestCase):
                 self.assertEqual(saved.status, "complete")
                 self.assertGreater(saved.completed_at, 0)
 
+    def test_private_return_allows_running_job_when_explicitly_requested(
+        self,
+    ) -> None:
+        PrivateReturnClient.calls = []
+        PrivateReturnClient.master_mid = "CONTROLLER"
+        PrivateReturnClient.member_ids = ("OWNER", "CONTROLLER")
+        parser = cli.build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                db.upsert_state(
+                    AccountState(
+                        mid="CONTROLLER",
+                        guest_secret="secret",
+                        game_access_token="token",
+                        next_stage=31,
+                    ),
+                    used=True,
+                    ready=True,
+                    invalid=False,
+                )
+                job = db.create_private_job(
+                    guild_id="G-ID",
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    original_master_mid="OWNER",
+                    controller_mid="CONTROLLER",
+                    paid_count_per_account=10,
+                    total_count_limit=2000,
+                )
+                db.update_private_job(
+                    job.id,
+                    status="running",
+                    effective_count=672,
+                )
+
+            args = parser.parse_args(
+                [
+                    "guild",
+                    "private",
+                    "return",
+                    str(job.id),
+                    "--db",
+                    str(db_path),
+                ]
+            )
+            output = io.StringIO()
+            with (
+                patch.object(cli, "GrpcClient", PrivateReturnClient),
+                patch.object(
+                    cli, "_login_account", side_effect=lambda row: row.to_state()
+                ),
+                redirect_stdout(output),
+            ):
+                code = cli.cmd_guild(args)
+
+            self.assertEqual(code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["complete"])
+            self.assertTrue(payload["transferred"])
+            self.assertEqual(payload["job"]["totalcount"], 672)
+            with AccountDB(db_path) as db:
+                saved = db.get_private_job(job.id)
+                self.assertEqual(saved.status, "complete")
+                self.assertEqual(saved.effective_count, 672)
+
     def test_private_flow_applies_and_persists_waiting_state(self) -> None:
         PrivateWaitingClient.calls = []
         parser = cli.build_parser()
@@ -2110,7 +2281,7 @@ class GuildCommandTests(unittest.TestCase):
                 "--master-mid",
                 "CONTROLLER",
                 "--count",
-                "20",
+                "40",
                 "--totalcount",
                 "2000",
                 "--db",
@@ -2141,7 +2312,7 @@ class GuildCommandTests(unittest.TestCase):
             self.assertEqual(code, 0)
             updated_job = run.call_args.args[0]
             self.assertEqual(updated_job.id, job.id)
-            self.assertEqual(updated_job.paid_count_per_account, 20)
+            self.assertEqual(updated_job.paid_count_per_account, 40)
             self.assertEqual(updated_job.total_count_limit, 2000)
             payload = json.loads(output.getvalue())
             self.assertEqual(
@@ -2149,12 +2320,12 @@ class GuildCommandTests(unittest.TestCase):
                 {
                     "confirmed": True,
                     "previous": {"count": 10, "totalcount": 200},
-                    "current": {"count": 20, "totalcount": 2000},
+                    "current": {"count": 40, "totalcount": 2000},
                 },
             )
             with AccountDB(db_path) as db:
                 saved = db.get_private_job(job.id)
-                self.assertEqual(saved.paid_count_per_account, 20)
+                self.assertEqual(saved.paid_count_per_account, 40)
                 self.assertEqual(saved.total_count_limit, 2000)
 
     def test_private_flow_refreshes_stale_public_cache(self) -> None:

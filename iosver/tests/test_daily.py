@@ -14,10 +14,13 @@ from crumble_bot import cli, pbutil as pb
 from crumble_bot.auth import AccountState
 from crumble_bot.currency import DIAMOND_CURRENCY_DATA_ID
 from crumble_bot.daily_runner import (
+    DailyStageRewardProgress,
     DailyRunner,
     DailyWorkflowResult,
     MailAdvertisementProgress,
     MailboxProgress,
+    OfflineStageRewardProgress,
+    StageBonusRewardProgress,
 )
 from crumble_bot.db import DAILY_TIMEZONE, AccountDB
 from crumble_bot.grpc_client import GrpcResponse
@@ -28,10 +31,30 @@ from crumble_bot.mailbox import (
     REFRESH_MAIL_BOX_PATH,
     MailReward,
 )
+from crumble_bot.messages import (
+    receive_stage_auto_production_rewards_request,
+    receive_stage_bonus_auto_production_rewards_request,
+)
+from crumble_bot.stage_rewards import (
+    RECEIVE_STAGE_AUTO_PRODUCTION_REWARDS_PATH,
+    RECEIVE_STAGE_BONUS_AUTO_PRODUCTION_REWARDS_PATH,
+    STAGE_AUTO_PRODUCTION_RECEIVE_TYPE_OFFLINE,
+    STAGE_AUTO_PRODUCTION_RECEIVE_TYPE_OFFLINE_STACK,
+    STAGE_BONUS_ADVERTISEMENT_DATA_ID,
+    parse_receive_stage_auto_production_rewards_response,
+    parse_receive_stage_bonus_auto_production_rewards_response,
+    parse_signup_stage_reward_counters,
+)
 from crumble_bot.stage_runner import SIGNUP_PATH
 
 
-def signup_response(diamonds: int, advertisement_count: int = 0) -> bytes:
+def signup_response(
+    diamonds: int,
+    advertisement_count: int = 0,
+    *,
+    stage_free_count: int = 0,
+    stage_advertisement_count: int = 0,
+) -> bytes:
     currency = b"".join(
         (
             pb.encode_int32_field(1, DIAMOND_CURRENCY_DATA_ID),
@@ -45,7 +68,19 @@ def signup_response(diamonds: int, advertisement_count: int = 0) -> bytes:
             pb.encode_int64_field(2, advertisement_count),
         )
     )
-    daily_counters = pb.encode_message_field(3, advertisement_counter)
+    stage_advertisement_counter = b"".join(
+        (
+            pb.encode_int32_field(1, STAGE_BONUS_ADVERTISEMENT_DATA_ID),
+            pb.encode_int64_field(2, stage_advertisement_count),
+        )
+    )
+    daily_counters = b"".join(
+        (
+            pb.encode_int64_field(2, stage_free_count),
+            pb.encode_message_field(3, advertisement_counter),
+            pb.encode_message_field(3, stage_advertisement_counter),
+        )
+    )
     progress = pb.encode_message_field(2, daily_counters)
     crumble = b"".join(
         (
@@ -54,6 +89,89 @@ def signup_response(diamonds: int, advertisement_count: int = 0) -> bytes:
         )
     )
     return pb.encode_message_field(3, crumble)
+
+
+def stage_reward(
+    item_data_id: int,
+    amount: int,
+    *,
+    reward_element_field: int = 1,
+) -> bytes:
+    item = b"".join(
+        (
+            pb.encode_int32_field(1, item_data_id),
+            pb.encode_int64_field(2, amount),
+        )
+    )
+    element = pb.encode_message_field(reward_element_field, item)
+    return pb.encode_message_field(1, element)
+
+
+def stage_auto_stack_response() -> bytes:
+    stacked_rewards = b"".join(
+        pb.encode_message_field(
+            3,
+            b"".join(
+                (
+                    pb.encode_int32_field(1, item_data_id),
+                    pb.encode_int64_field(2, amount),
+                )
+            ),
+        )
+        for item_data_id, amount in ((1154589354, 1660800), (1240358069, 217920))
+    )
+    auto_production = b"".join(
+        (
+            stacked_rewards,
+            pb.encode_message_field(4, pb.encode_int64_field(1, 28_800_000)),
+        )
+    )
+    return pb.encode_message_field(3, auto_production)
+
+
+def stage_auto_claim_response() -> bytes:
+    return b"".join(
+        (
+            pb.encode_message_field(2, stage_reward(1154589354, 1660800)),
+            pb.encode_message_field(
+                2,
+                stage_reward(
+                    2004501366,
+                    45120,
+                    reward_element_field=6,
+                ),
+            ),
+        )
+    )
+
+
+def stage_bonus_response(
+    *,
+    free_count: int,
+    advertisement_count: int,
+    bonus_type: int = 0,
+) -> bytes:
+    advertisement_counter = b"".join(
+        (
+            pb.encode_int32_field(1, STAGE_BONUS_ADVERTISEMENT_DATA_ID),
+            pb.encode_int64_field(2, advertisement_count),
+        )
+    )
+    daily_counters = b"".join(
+        (
+            pb.encode_int64_field(2, free_count),
+            pb.encode_message_field(3, advertisement_counter),
+        )
+    )
+    postprocessed = pb.encode_message_field(2, daily_counters)
+    additional = pb.encode_message_field(2, postprocessed)
+    return b"".join(
+        (
+            pb.encode_message_field(1, additional),
+            pb.encode_int32_field(2, bonus_type),
+            pb.encode_message_field(3, stage_reward(1154589354, 415200)),
+        )
+    )
 
 
 def mail_entry(
@@ -127,10 +245,18 @@ def receive_mail_advertisement_reward_response() -> bytes:
 
 
 class FakeDailyClient:
-    def __init__(self, advertisement_count: int = 0) -> None:
+    def __init__(
+        self,
+        advertisement_count: int = 0,
+        *,
+        stage_free_count: int = 0,
+        stage_advertisement_count: int = 0,
+    ) -> None:
         self.calls: list[str] = []
         self.signup_count = 0
         self.advertisement_count = advertisement_count
+        self.stage_free_count = stage_free_count
+        self.stage_advertisement_count = stage_advertisement_count
         self.signup_balances = (900, 2000) if advertisement_count == 0 else (900, 1000)
 
     def unary(self, path, message, metadata=None):
@@ -139,7 +265,52 @@ class FakeDailyClient:
             balance = self.signup_balances[self.signup_count]
             self.signup_count += 1
             return GrpcResponse(
-                signup_response(balance, self.advertisement_count), {}, {}
+                signup_response(
+                    balance,
+                    self.advertisement_count,
+                    stage_free_count=self.stage_free_count,
+                    stage_advertisement_count=self.stage_advertisement_count,
+                ),
+                {},
+                {},
+            )
+        if path == RECEIVE_STAGE_AUTO_PRODUCTION_REWARDS_PATH:
+            receive_type = next(
+                (
+                    int(value)
+                    for field_number, wire_type, value in pb.decode_fields(message)
+                    if field_number == 1 and wire_type == 0
+                ),
+                0,
+            )
+            if receive_type == STAGE_AUTO_PRODUCTION_RECEIVE_TYPE_OFFLINE_STACK:
+                return GrpcResponse(stage_auto_stack_response(), {}, {})
+            if receive_type == STAGE_AUTO_PRODUCTION_RECEIVE_TYPE_OFFLINE:
+                return GrpcResponse(stage_auto_claim_response(), {}, {})
+            raise AssertionError(f"unexpected auto production type: {receive_type}")
+        if path == RECEIVE_STAGE_BONUS_AUTO_PRODUCTION_REWARDS_PATH:
+            if not message:
+                self.stage_free_count += 1
+                return GrpcResponse(
+                    stage_bonus_response(
+                        free_count=self.stage_free_count,
+                        advertisement_count=self.stage_advertisement_count,
+                        bonus_type=1,
+                    ),
+                    {},
+                    {},
+                )
+            viewed = bytes(pb.decode_fields(message)[0][2])
+            if pb.decode_fields(viewed) != [(1, 0, STAGE_BONUS_ADVERTISEMENT_DATA_ID)]:
+                raise AssertionError("unexpected stage advertisement request")
+            self.stage_advertisement_count += 1
+            return GrpcResponse(
+                stage_bonus_response(
+                    free_count=self.stage_free_count,
+                    advertisement_count=self.stage_advertisement_count,
+                ),
+                {},
+                {},
             )
         if path == REFRESH_MAIL_BOX_PATH:
             return GrpcResponse(refresh_mail_box_response(), {}, {})
@@ -156,6 +327,7 @@ class FakeDailyClient:
             viewed = bytes(pb.decode_fields(message)[0][2])
             if pb.decode_fields(viewed) != [(1, 0, MAIL_ADVERTISEMENT_DATA_ID)]:
                 raise AssertionError("unexpected advertisement request")
+            self.advertisement_count += 1
             return GrpcResponse(receive_mail_advertisement_reward_response(), {}, {})
         raise AssertionError(f"unexpected path: {path}")
 
@@ -173,6 +345,21 @@ class DailyRunnerTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertTrue(result.login_completed)
         self.assertEqual(result.diamond_balance_final, 2000)
+        offline = result.stage_rewards.offline
+        self.assertTrue(offline.checked)
+        self.assertEqual(offline.stacked_duration_millis, 28_800_000)
+        self.assertEqual(offline.claim_requested_count, 1)
+        self.assertEqual(offline.claimed_count, 1)
+        self.assertEqual(offline.reward_count, 2)
+        bonus = result.stage_rewards.bonus
+        self.assertTrue(bonus.ok)
+        self.assertEqual(bonus.daily_free_count_before, 0)
+        self.assertEqual(bonus.daily_free_count_after, 1)
+        self.assertEqual(bonus.free_claimed_count, 1)
+        self.assertEqual(bonus.daily_advertisement_count_before, 0)
+        self.assertEqual(bonus.daily_advertisement_count_after, 3)
+        self.assertEqual(bonus.advertisement_claimed_count, 3)
+        self.assertEqual(bonus.bonus_types, [1, 0, 0, 0])
         self.assertEqual(result.mailbox.mail_count, 3)
         self.assertEqual(result.mailbox.claimable_count, 1)
         self.assertEqual(result.mailbox.claimed_count, 1)
@@ -189,6 +376,12 @@ class DailyRunnerTests(unittest.TestCase):
             client.calls,
             [
                 SIGNUP_PATH,
+                RECEIVE_STAGE_AUTO_PRODUCTION_REWARDS_PATH,
+                RECEIVE_STAGE_AUTO_PRODUCTION_REWARDS_PATH,
+                RECEIVE_STAGE_BONUS_AUTO_PRODUCTION_REWARDS_PATH,
+                RECEIVE_STAGE_BONUS_AUTO_PRODUCTION_REWARDS_PATH,
+                RECEIVE_STAGE_BONUS_AUTO_PRODUCTION_REWARDS_PATH,
+                RECEIVE_STAGE_BONUS_AUTO_PRODUCTION_REWARDS_PATH,
                 REFRESH_MAIL_BOX_PATH,
                 RECEIVE_MAIL_REWARDS_PATH,
                 RECEIVE_MAIL_ADVERTISEMENT_REWARD_PATH,
@@ -198,7 +391,11 @@ class DailyRunnerTests(unittest.TestCase):
         self.assertEqual(balances, [900, 2000])
 
     def test_advertisement_at_daily_limit_is_skipped(self) -> None:
-        client = FakeDailyClient(advertisement_count=1)
+        client = FakeDailyClient(
+            advertisement_count=1,
+            stage_free_count=1,
+            stage_advertisement_count=3,
+        )
         result = DailyRunner(
             client,
             AccountState(mid="MID", game_access_token="token").to_session(),
@@ -210,6 +407,80 @@ class DailyRunnerTests(unittest.TestCase):
         self.assertEqual(advertisement.claimable_count, 0)
         self.assertEqual(advertisement.claim_requested_count, 0)
         self.assertNotIn(RECEIVE_MAIL_ADVERTISEMENT_REWARD_PATH, client.calls)
+        stage_bonus = result.stage_rewards.bonus
+        self.assertEqual(stage_bonus.free_claimable_count, 0)
+        self.assertEqual(stage_bonus.advertisement_claimable_count, 0)
+        self.assertEqual(
+            client.calls.count(RECEIVE_STAGE_BONUS_AUTO_PRODUCTION_REWARDS_PATH),
+            0,
+        )
+
+    def test_stage_reward_wire_requests_match_device_capture(self) -> None:
+        self.assertEqual(
+            receive_stage_auto_production_rewards_request(
+                STAGE_AUTO_PRODUCTION_RECEIVE_TYPE_OFFLINE_STACK
+            ),
+            bytes.fromhex("0802"),
+        )
+        self.assertEqual(
+            receive_stage_auto_production_rewards_request(
+                STAGE_AUTO_PRODUCTION_RECEIVE_TYPE_OFFLINE,
+                all_monster_kill_count=86,
+                stage_monster_kill_count=86,
+            ),
+            bytes.fromhex("080110561856"),
+        )
+        self.assertEqual(
+            receive_stage_bonus_auto_production_rewards_request(),
+            b"",
+        )
+        self.assertEqual(
+            receive_stage_bonus_auto_production_rewards_request(
+                STAGE_BONUS_ADVERTISEMENT_DATA_ID
+            ),
+            bytes.fromhex("0a0608bcb1b1d204"),
+        )
+
+    def test_stage_reward_response_parsers_track_rewards_and_daily_counts(
+        self,
+    ) -> None:
+        counters = parse_signup_stage_reward_counters(
+            signup_response(
+                900,
+                stage_free_count=1,
+                stage_advertisement_count=2,
+            )
+        )
+        self.assertEqual(counters.daily_free_count, 1)
+        self.assertEqual(counters.daily_advertisement_count, 2)
+
+        stacked = parse_receive_stage_auto_production_rewards_response(
+            stage_auto_stack_response()
+        )
+        self.assertTrue(stacked.has_stacked_rewards)
+        self.assertEqual(stacked.stacked_duration_millis, 28_800_000)
+        self.assertEqual(len(stacked.stacked_rewards), 2)
+
+        claimed = parse_receive_stage_auto_production_rewards_response(
+            stage_auto_claim_response()
+        )
+        self.assertEqual(claimed.reward_count, 2)
+        self.assertEqual(
+            {(reward.reward_type, reward.item_data_id) for reward in claimed.rewards},
+            {("currency", 1154589354), ("persistent_item", 2004501366)},
+        )
+
+        bonus = parse_receive_stage_bonus_auto_production_rewards_response(
+            stage_bonus_response(
+                free_count=1,
+                advertisement_count=3,
+                bonus_type=1,
+            )
+        )
+        self.assertEqual(bonus.bonus_type, 1)
+        self.assertEqual(bonus.reward_count, 1)
+        self.assertEqual(bonus.daily_free_count, 1)
+        self.assertEqual(bonus.daily_advertisement_count, 3)
 
 
 class DummyClient:
@@ -233,6 +504,13 @@ class FakeDailyRunner:
         return DailyWorkflowResult(
             login_completed=True,
             diamond_balance_final=600,
+            stage_rewards=DailyStageRewardProgress(
+                offline=OfflineStageRewardProgress(
+                    checked=True,
+                    refresh_requested_count=1,
+                ),
+                bonus=StageBonusRewardProgress(checked=True),
+            ),
             mailbox=MailboxProgress(
                 checked=True,
                 diamond_balance_before=600,
@@ -315,6 +593,8 @@ class DailyCommandTests(unittest.TestCase):
             self.assertEqual(summary["skipped_today"], 0)
             self.assertEqual(summary["pool_after"]["completed_today"], 2)
             self.assertEqual(summary["totals"]["login_completed_count"], 2)
+            self.assertEqual(summary["totals"]["stage_offline_checked_count"], 2)
+            self.assertEqual(summary["totals"]["stage_bonus_checked_count"], 2)
             self.assertEqual(summary["totals"]["mailbox_checked_count"], 2)
             self.assertNotIn("guild_progress", summary["results"][0])
             with AccountDB(db_path) as db:

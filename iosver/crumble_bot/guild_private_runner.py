@@ -188,14 +188,7 @@ class PrivateGuildRunner:
             )
 
     def return_master(self, job: GuildPrivateJobRow) -> dict:
-        """Return a completed private batch to its recorded original master."""
-        if job.status != "awaiting_master_return":
-            return self._return_payload(
-                job,
-                ok=False,
-                stopped_reason="job_not_awaiting_master_return",
-                error=f"private job status is {job.status}",
-            )
+        """Explicitly return the guild to its recorded original master."""
         if not job.original_master_mid:
             return self._return_payload(
                 job,

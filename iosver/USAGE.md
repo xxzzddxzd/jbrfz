@@ -45,6 +45,7 @@ guild public      公开公会：直接加入后批量签到、研究、捐赠�
 guild private     审批公会：引导临时会长接管、邀请账号入会捐赠并退出
 guild private return [ID]
                   列出待交还会长任务，或按数据库 ID 交还原会长
+guild joblist     查看 SQLite 中的全部 private 任务清单
 list              查看号池
 ```
 
@@ -57,6 +58,7 @@ list              查看号池
   --count 20 --totalcount 200
 python main.py guild private return
 python main.py guild private return 1
+python main.py guild joblist
 ./main.py list --unused --ready
 ```
 
@@ -95,16 +97,31 @@ python main.py guild private return 1
 |------|------|------|
 | `--db` | 否 | sqlite，默认 `data/accounts.db` |
 
-SOP：重新登录 → `SignUp` 每日登录同步 → 查看邮箱并全部领取普通附件 → 未达到每日上限时领取邮箱广告奖励。
+SOP：重新登录 → `SignUp` 每日登录同步 → 刷新并领取放置奖励 → 补领每日 1 次免费放置加成 → 补领每日 3 次放置广告加成 → 查看邮箱并全部领取普通附件 → 未达到每日上限时领取邮箱广告奖励。
 
 - 账号必须 `ready=1`、`next_stage>30`、`invalid=0`；`used` 和公会冷却均不影响选择。
 - 命令不限制账号数量，会扫描所有符合条件的账号。
 - `accounts.daily` 保存最近一次成功完成整套 daily SOP 的 Unix 时间；同一 `Asia/Shanghai` 自然日已经完成的账号会跳过。
 - 只有整套 SOP 成功才更新时间；中途失败的账号保留为可执行状态，下一次运行会重试。
+- 放置奖励先调用 `AdventureService/ReceiveStageAutoProductionRewards` 的 `OFFLINE_STACK` 刷新服务端累计值；存在可领取累计奖励时，再以 `OFFLINE` 领取。成员函数同时暴露可选的全局/当前关卡未上报击杀数；daily 没有本地战斗增量，因此不发送这两个可选字段。
+- 放置加成使用 `AdventureService/ReceiveStageBonusAutoProductionRewards`。免费请求为空；广告请求携带 10101 广告 ID `1246517436`。`SignUp` 中的当日免费计数和广告计数用于只补领剩余次数，免费上限 1 次、广告上限 3 次。
+- 每个账号的 `stage_rewards.offline` 记录累计时长、待领取/已领取奖励和请求次数；`stage_rewards.bonus` 记录免费及广告计数前后值、实际领取次数、奖励类型与奖励汇总。
 - 每个账号的 `mailbox` 记录信件总数、可领取数、实际领取数、附件汇总及领取前后钻石；普通邮件只批量领取“未领取且有附件”的服务端邮件。
 - `mailbox.advertisement` 记录广告 ID、每日计数前后值、请求/成功次数和响应奖励。10101 的信箱广告 ID 为 `1673636113`、每日上限 1 次、配置奖励 1000 钻石；已达到每日上限时不会请求。
 - 广告领取使用 `CrumbleService/ReceiveMailAdvertisementReward`。成员函数暴露 `advertisement_data_id` 和可选 `skip_count`；SOP 按正常客户端行为不发送 `skip_count`。
-- 最新资源密钥、登录令牌和钻石余额会回写 SQLite。`totals` 汇总登录、普通邮件、广告及钻石变化。
+- 最新资源密钥、登录令牌和钻石余额会回写 SQLite。`totals` 汇总登录、放置奖励、放置免费/广告加成、普通邮件、邮箱广告及钻石变化。
+
+### `guild joblist`
+
+```bash
+python main.py guild joblist
+python main.py guild joblist --db /path/to/accounts.db
+```
+
+- 只读取 SQLite，不登录账号，也不调用游戏接口。
+- `jobs` 输出全部状态的 private 任务，不只限于待退还任务；其中包含稳定的数据库 `id`、公会名称和 ID、代理会长、原会长、当前/目标/剩余有效次数、账号状态汇总和错误信息。
+- `return_pending=true` 表示流程已经达到目标、正在等待交还；无论当前 job 状态为何，`return_command` 都可用于显式要求交还会长。
+- `status_counts` 按状态汇总任务数，便于区分 `awaiting_donors`、`awaiting_recruitment_reset`、`awaiting_master_return` 和 `complete`。
 
 ### `guild public`
 
@@ -163,6 +180,7 @@ SOP：登录鉴权 → 直接加入公开公会 → 领取公会签到奖励 →
 
 - 同一组参数对应一个固定任务；反复执行同一命令会读取原 job 和累计进度，不会从零开始。
 - 未完成任务默认不允许改变 `--count/--totalcount`；确需调整目标时，用新参数重跑并增加 `--confirm`。程序会保留既有累计进度，只更新任务参数后继续。
+- 审批公会每天最多邀请 50 个 B。命令启动时要求 `--totalcount <= --count × 50`；不满足时会在登录、搜索或更新任务前立即退出，并提示当前最大值以及达成目标所需的最小 `--count`。
 - 省略 `--master-mid` 时，程序优先复用该公会已有 job 中的 A；没有 job 时，从满足执行条件的账号中选择钻石余额最低者，并将其 MID 固定写入 `guild_private_jobs.controller_mid`。以后重跑同一命令仍使用该账号。
 - 自动选择会排除原会长、其他进行中 private job 的代理会长和捐赠账号；候选账号须有登录凭据，并满足 `ready=1`、`invalid=0`、`next_stage>30`、当前不在公会且已结束退会冷却。
 - 若该公会存在多个进行中的 private job，省略参数无法唯一确定 A，命令会输出候选 MID 并提示显式传入 `--master-mid`。
@@ -200,7 +218,8 @@ python main.py guild private return 3
 
 - 不带 `ID` 时只读 SQLite，列出 `status=awaiting_master_return` 的记录；输出中的 `id` 就是后续命令使用的稳定索引，不是临时列表序号。
 - 带 `ID` 时登录该记录的临时会长 A，在线核对目标公会、当前会长和原会长成员资格，再调用 `TransferGuildMaster`。
-- 只有当前会长等于记录中的 `controller_mid`，且 `original_master_mid` 仍在成员列表时才会执行，避免误转让。
+- 显式提供 `ID` 就代表用户要求立即交还，不要求 job 必须是 `awaiting_master_return`；`running`、`awaiting_donors` 等状态也可以执行。
+- 仍然只有当前会长等于记录中的 `controller_mid`，且 `original_master_mid` 仍在成员列表时才会执行，避免转错公会或转错人。
 - 成功后再次搜索并确认会长已经变为 `original_master_mid`，随后把任务更新为 `complete`；若此前已人工交还，则不会重复委任，只补记完成状态。
 - 可附加 `--db PATH`；默认数据库仍为 `data/accounts.db`。
 

@@ -17,6 +17,7 @@ from .guild import (
     GuildSearchSummary,
     parse_guild_search_response,
 )
+from .guild_limits import GUILD_PRIVATE_DAILY_INVITATION_LIMIT
 from .guild_runner import GuildRunner, GuildWorkflowResult
 from .guild_private_runner import PrivateGuildRunner
 from .invite import register_friend_inviter
@@ -117,6 +118,41 @@ def _daily_run_totals(workflows: list[DailyWorkflowResult]) -> dict:
     return {
         "login_completed_count": sum(
             1 for workflow in workflows if workflow.login_completed
+        ),
+        "stage_offline_checked_count": sum(
+            1 for workflow in workflows if workflow.stage_rewards.offline.checked
+        ),
+        "stage_offline_claim_requested_count": sum(
+            workflow.stage_rewards.offline.claim_requested_count
+            for workflow in workflows
+        ),
+        "stage_offline_claimed_count": sum(
+            workflow.stage_rewards.offline.claimed_count for workflow in workflows
+        ),
+        "stage_offline_reward_count": sum(
+            workflow.stage_rewards.offline.reward_count for workflow in workflows
+        ),
+        "stage_bonus_checked_count": sum(
+            1 for workflow in workflows if workflow.stage_rewards.bonus.checked
+        ),
+        "stage_bonus_free_claim_requested_count": sum(
+            workflow.stage_rewards.bonus.free_claim_requested_count
+            for workflow in workflows
+        ),
+        "stage_bonus_free_claimed_count": sum(
+            workflow.stage_rewards.bonus.free_claimed_count
+            for workflow in workflows
+        ),
+        "stage_bonus_advertisement_claim_requested_count": sum(
+            workflow.stage_rewards.bonus.advertisement_claim_requested_count
+            for workflow in workflows
+        ),
+        "stage_bonus_advertisement_claimed_count": sum(
+            workflow.stage_rewards.bonus.advertisement_claimed_count
+            for workflow in workflows
+        ),
+        "stage_bonus_reward_count": sum(
+            workflow.stage_rewards.bonus.reward_count for workflow in workflows
         ),
         "mailbox_checked_count": sum(
             1 for workflow in workflows if workflow.mailbox.checked
@@ -859,6 +895,20 @@ def cmd_guild(args: argparse.Namespace) -> int:
     """Dispatch the public or private guild SOP."""
     action = str(getattr(args, "guild_action", "") or "")
     private_action = str(getattr(args, "private_action", "") or "")
+    if action == "joblist":
+        if private_action or getattr(args, "private_job_id", None) is not None:
+            raise SystemExit("guild joblist 不接受 private return 参数")
+        unsupported = [
+            name
+            for name in ("gname", "gmname", "count", "totalcount", "master_mid")
+            if getattr(args, name, None) not in (None, "")
+        ]
+        if unsupported:
+            formatted = ", ".join(f"--{name.replace('_', '-')}" for name in unsupported)
+            raise SystemExit(f"guild joblist 不接受参数: {formatted}")
+        if bool(getattr(args, "confirm", False)):
+            raise SystemExit("--confirm 只能用于 guild private")
+        return _cmd_guild_joblist(args)
     if action == "private":
         if private_action == "return":
             if bool(getattr(args, "confirm", False)):
@@ -954,6 +1004,57 @@ def _private_return_job_payload(job) -> dict:
     }
 
 
+def _guild_joblist_item_payload(db: AccountDB, job) -> dict:
+    accounts = db.list_private_accounts(job.id)
+    account_states: dict[str, int] = {}
+    for account in accounts:
+        state = str(account["state"])
+        account_states[state] = account_states.get(state, 0) + 1
+    remaining = max(0, job.total_count_limit - job.effective_count)
+    return {
+        **_private_cli_job_payload(job),
+        "application_id": job.application_id,
+        "remaining_totalcount": remaining,
+        "totalcount_reached": job.effective_count >= job.total_count_limit,
+        "master_acquired_at": job.master_acquired_at,
+        "master_acquired_at_local": _local_timestamp(job.master_acquired_at),
+        "completed_at": job.completed_at,
+        "completed_at_local": _local_timestamp(job.completed_at),
+        "created_at": job.created_at,
+        "created_at_local": _local_timestamp(job.created_at),
+        "updated_at": job.updated_at,
+        "updated_at_local": _local_timestamp(job.updated_at),
+        "account_count": len(accounts),
+        "account_states": account_states,
+        "return_pending": job.status == "awaiting_master_return",
+        "return_command": f"python main.py guild private return {job.id}",
+        "error": job.error,
+    }
+
+
+def _cmd_guild_joblist(args: argparse.Namespace) -> int:
+    """List every private guild job from SQLite."""
+    with AccountDB(args.db) as db:
+        jobs = db.list_private_jobs()
+        status_counts: dict[str, int] = {}
+        for job in jobs:
+            status_counts[job.status] = status_counts.get(job.status, 0) + 1
+        payload = {
+            "ok": True,
+            "mode": "guild_joblist",
+            "db": str(Path(args.db).expanduser().resolve()),
+            "index_field": "guild_private_jobs.id",
+            "count": len(jobs),
+            "pending_master_return_count": sum(
+                1 for job in jobs if job.status == "awaiting_master_return"
+            ),
+            "status_counts": status_counts,
+            "jobs": [_guild_joblist_item_payload(db, job) for job in jobs],
+        }
+    print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+    return 0
+
+
 def _cmd_guild_private_return(args: argparse.Namespace) -> int:
     """List pending master returns or execute one by private-job row id."""
     job_id = getattr(args, "private_job_id", None)
@@ -1035,6 +1136,18 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
         raise SystemExit("--count 必须 >= 1")
     if totalcount < 1:
         raise SystemExit("--totalcount 必须 >= 1")
+    daily_capacity = count * GUILD_PRIVATE_DAILY_INVITATION_LIMIT
+    if daily_capacity < totalcount:
+        minimum_count = (
+            totalcount + GUILD_PRIVATE_DAILY_INVITATION_LIMIT - 1
+        ) // GUILD_PRIVATE_DAILY_INVITATION_LIMIT
+        raise SystemExit(
+            f"--totalcount={totalcount} 超出 guild private 单日有效上限："
+            f"--count={count} × 每日最多邀请 "
+            f"{GUILD_PRIVATE_DAILY_INVITATION_LIMIT} 个账号 = {daily_capacity}；"
+            f"请将 --totalcount 调整为 <= {daily_capacity}，"
+            f"或将 --count 调整为 >= {minimum_count}"
+        )
 
     with AccountDB(args.db) as db:
         target = db.get_guild_target(gname, gmname)
@@ -1864,11 +1977,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--db", default=str(DEFAULT_DB), help="sqlite 路径")
     sp.set_defaults(func=cmd_daily)
 
-    sp = sub.add_parser("guild", help="公开或审批公会 SOP")
+    sp = sub.add_parser("guild", help="公开、审批公会 SOP 或查看公会数据")
     sp.add_argument(
         "guild_action",
-        choices=("public", "private"),
-        help="公会流程类型",
+        choices=("public", "private", "joblist"),
+        help="公会流程类型，或 joblist 查看 SQLite 任务清单",
     )
     sp.add_argument(
         "private_action",

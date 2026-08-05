@@ -1,4 +1,5 @@
 """Protobuf request builders for game RPCs."""
+
 from __future__ import annotations
 
 import random
@@ -300,6 +301,70 @@ def receive_mail_advertisement_reward_request(
     skip_count: Optional[int] = None,
 ) -> bytes:
     """Build ``ReceiveMailAdvertisementRewardRequest``."""
+    return pb.encode_message_field(
+        1,
+        viewed_advertisement(
+            advertisement_data_id,
+            skip_count=skip_count,
+        ),
+    )
+
+
+def receive_stage_auto_production_rewards_request(
+    receive_type: int,
+    *,
+    all_monster_kill_count: Optional[int] = None,
+    stage_monster_kill_count: Optional[int] = None,
+) -> bytes:
+    """Build ``ReceiveStageAutoProductionRewardsRequest``.
+
+    ``all_monster_kill_count`` and ``stage_monster_kill_count`` are proto3
+    optional fields.  ``None`` omits them; an explicit zero preserves field
+    presence just like the generated 10101 message would.
+    """
+    if (
+        isinstance(receive_type, bool)
+        or not isinstance(receive_type, int)
+        or receive_type not in {0, 1, 2}
+    ):
+        raise ValueError("receive_type must be 0, 1, or 2")
+    parts = [pb.encode_int32_field(1, receive_type)]
+    for field_number, value in (
+        (2, all_monster_kill_count),
+        (3, stage_monster_kill_count),
+    ):
+        if value is not None:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("monster kill counts must be non-negative integers")
+            parts.append(pb.tag(field_number, 0) + pb._varint(value))
+    return b"".join(parts)
+
+
+def receive_stage_bonus_auto_production_rewards_request(
+    advertisement_data_id: Optional[int] = None,
+    *,
+    skip_count: Optional[int] = None,
+) -> bytes:
+    """Build ``ReceiveStageBonusAutoProductionRewardsRequest``.
+
+    The daily free claim is the empty request.  Advertisement claims carry a
+    ``ViewedAdvertisement`` in field 1.
+    """
+    if advertisement_data_id is None:
+        return b""
+    if isinstance(advertisement_data_id, bool) or not isinstance(
+        advertisement_data_id,
+        int,
+    ):
+        raise ValueError("advertisement_data_id must be an integer or None")
+    if advertisement_data_id <= 0:
+        raise ValueError("advertisement_data_id must be positive")
+    if skip_count is not None and (
+        isinstance(skip_count, bool)
+        or not isinstance(skip_count, int)
+        or skip_count < 0
+    ):
+        raise ValueError("skip_count must be a non-negative integer or None")
     return pb.encode_message_field(
         1,
         viewed_advertisement(

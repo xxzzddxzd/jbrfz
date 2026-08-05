@@ -1,6 +1,9 @@
 """Guild lab limits extracted from the 10101 patch-data tables."""
 from __future__ import annotations
 
+# A private guild can recruit at most 50 donor accounts per server day.
+GUILD_PRIVATE_DAILY_INVITATION_LIMIT = 50
+
 # ``GuildLevels.bytes`` field 5: DailyFreeResearchCount.
 GUILD_DAILY_FREE_RESEARCH_LIMITS: dict[int, int] = {
     1: 3,
