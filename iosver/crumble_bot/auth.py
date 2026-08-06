@@ -149,10 +149,18 @@ class AccountState:
 
     def to_session(self) -> Session:
         d = self.device or {}
+        resource_key = normalize_resource_key(self.resource_key)
+        # A state loaded directly from an old DB/config may be converted to a
+        # session without passing through guest_login(). Resolve that legacy
+        # value from the same metadata/manifest flow instead of using the
+        # hardcoded fallback in the request.
+        if resource_key != str(self.resource_key or "").strip():
+            resource_key = fetch_resource_key()
+            self.resource_key = resource_key
         return Session(
             mid=self.mid,
             game_access_token=self.game_access_token,
-            resource_key=normalize_resource_key(self.resource_key),
+            resource_key=resource_key,
             device=DeviceIds(
                 fgs_id=d.get("fgs_id", ""),
                 anonymous_id=d.get("anonymous_id", ""),
@@ -420,7 +428,6 @@ def relogin(state: AccountState) -> AccountState:
         guest_secret=state.guest_secret,
         device=state.device,
         inviter_mid=state.inviter_mid,
-        resource_key=state.resource_key,
         endpoint=state.endpoint,
     )
     # preserve progress fields
