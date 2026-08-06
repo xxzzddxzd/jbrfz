@@ -1,5 +1,4 @@
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
 #import "JBRFZPanel.h"
 
 #include <dlfcn.h>
@@ -11,7 +10,6 @@
 #include <stdarg.h>
 #include <string.h>
 #include <time.h>
-#include <objc/runtime.h>
 #include <substrate.h>
 
 // Bridge so the panel (other TU) can cancel delayed auto actions.
@@ -99,87 +97,6 @@ static void JbrfzLog(NSString *fmt, ...) {
         [fh closeFile];
     } @catch (__unused NSException *e) {
     }
-}
-
-// Unity 6 keeps the app's orientation policy in native view controllers. The
-// 1.0.101 app plist declares portrait only, so the stock Unity controllers
-// never advertise landscape even though the renderer itself is orientation
-// agnostic. Keep portrait and enable both landscape directions; upside-down
-// portrait remains disabled to match the game's normal phone behavior.
-static constexpr UIInterfaceOrientationMask
-    kJbrfzSupportedGameOrientations =
-        UIInterfaceOrientationMaskPortrait |
-        UIInterfaceOrientationMaskLandscapeLeft |
-        UIInterfaceOrientationMaskLandscapeRight;
-
-static IMP gOriginalUnityAppSupportedOrientations = nullptr;
-static IMP gOriginalUnityDefaultSupportedOrientations = nullptr;
-static IMP gOriginalUnityFixedSupportedOrientations = nullptr;
-static IMP gOriginalUnityShouldAutorotate = nullptr;
-
-static UIInterfaceOrientationMask
-JbrfzUnityAppSupportedOrientations(id self, SEL selector,
-                                   UIApplication *application,
-                                   UIWindow *window) {
-    (void)self;
-    (void)selector;
-    (void)application;
-    (void)window;
-    return kJbrfzSupportedGameOrientations;
-}
-
-static UIInterfaceOrientationMask
-JbrfzUnityViewControllerSupportedOrientations(id self, SEL selector) {
-    (void)self;
-    (void)selector;
-    return kJbrfzSupportedGameOrientations;
-}
-
-static BOOL JbrfzUnityShouldAutorotate(id self, SEL selector) {
-    (void)self;
-    (void)selector;
-    return YES;
-}
-
-static bool JbrfzHookOrientationMethod(Class cls, SEL selector, IMP hook,
-                                        IMP *original) {
-    if (cls == Nil || class_getInstanceMethod(cls, selector) == NULL) {
-        return false;
-    }
-    MSHookMessageEx(cls, selector, hook, original);
-    return true;
-}
-
-static void InstallUnityOrientationHooks(void) {
-    Class appController = objc_getClass("UnityAppController");
-    Class defaultController = objc_getClass("UnityDefaultViewController");
-    Class fixedController = objc_getClass("UnityFixedOrientationViewController");
-    Class baseController = objc_getClass("UnityViewControllerBase");
-
-    const bool appHooked = JbrfzHookOrientationMethod(
-        appController,
-        @selector(application:supportedInterfaceOrientationsForWindow:),
-        reinterpret_cast<IMP>(&JbrfzUnityAppSupportedOrientations),
-        &gOriginalUnityAppSupportedOrientations);
-    const bool defaultHooked = JbrfzHookOrientationMethod(
-        defaultController, @selector(supportedInterfaceOrientations),
-        reinterpret_cast<IMP>(&JbrfzUnityViewControllerSupportedOrientations),
-        &gOriginalUnityDefaultSupportedOrientations);
-    const bool fixedHooked = JbrfzHookOrientationMethod(
-        fixedController, @selector(supportedInterfaceOrientations),
-        reinterpret_cast<IMP>(&JbrfzUnityViewControllerSupportedOrientations),
-        &gOriginalUnityFixedSupportedOrientations);
-    const bool autorotateHooked = JbrfzHookOrientationMethod(
-        baseController, @selector(shouldAutorotate),
-        reinterpret_cast<IMP>(&JbrfzUnityShouldAutorotate),
-        &gOriginalUnityShouldAutorotate);
-
-    JbrfzLog(
-        @"[JBRFZBypass] Unity orientation hooks app=%d default=%d fixed=%d "
-         @"autorotate=%d mask=0x%lx",
-        appHooked ? 1 : 0, defaultHooked ? 1 : 0, fixedHooked ? 1 : 0,
-        autorotateHooked ? 1 : 0,
-        static_cast<unsigned long>(kJbrfzSupportedGameOrientations));
 }
 
 using IntegrityCheck = int (*)(void);
@@ -1989,8 +1906,6 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
               "skipping version-specific managed hooks");
         return;
     }
-
-    InstallUnityOrientationHooks();
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(header);
 
