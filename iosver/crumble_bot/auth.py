@@ -150,7 +150,10 @@ class AccountState:
         return Session(
             mid=self.mid,
             game_access_token=self.game_access_token,
-            resource_key=self.resource_key,
+            # Resource keys stored in older account snapshots/SQLite rows are
+            # intentionally ignored.  The current live key is global and is
+            # the only key accepted by the 10101 game server.
+            resource_key=DEFAULT_RESOURCE_KEY,
             device=DeviceIds(
                 fgs_id=d.get("fgs_id", ""),
                 anonymous_id=d.get("anonymous_id", ""),
@@ -392,7 +395,9 @@ def guest_login(
         refresh_token=data.get("refresh_token") or "",
         game_access_token=data.get("game_access_token") or "",
         oven_access_token=data.get("oven_access_token") or "",
-        resource_key=resource_key,
+        # Do not reuse a stale per-account value from SQLite/config.  The
+        # current 10101 resource is global and must be sent on the first RPC.
+        resource_key=DEFAULT_RESOURCE_KEY,
         device=dev,
         endpoint=endpoint,
         inviter_mid=inviter_mid,
