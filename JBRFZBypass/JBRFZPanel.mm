@@ -60,6 +60,8 @@ static void JbrfzPanelLog(NSString *fmt, ...) {
 static NSString *const kJbrfzAutoFeaturesKey = @"JBRFZBypass.autoFeaturesEnabled";
 static NSString *const kJbrfzFloatingEdgeLeftKey = @"JBRFZBypass.floatingEdgeLeft";
 static NSString *const kJbrfzFloatingYRatioKey = @"JBRFZBypass.floatingYRatio";
+static NSString *const kJbrfzForceLandscapeKey =
+    @"JBRFZBypass.forceLandscapeEnabled";
 
 static const NSTimeInterval kFloatingCollapseDelay = 2.5;
 static const CGFloat kFloatingButtonSize = 48.0;
@@ -124,6 +126,7 @@ static void JbrfzSetAutoFeaturesEnabled(bool enabled, bool persist) {
 @interface JBRFZRootViewController : UIViewController
 @property(nonatomic, weak) UIWindow *orientationSourceWindow;
 @property(nonatomic, copy) void (^layoutHandler)(void);
+@property(nonatomic, assign) BOOL forceLandscape;
 @end
 
 @implementation JBRFZRootViewController
@@ -158,6 +161,9 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
     return UIStatusBarStyleLightContent;
 }
 - (BOOL)shouldAutorotate {
+    if (self.forceLandscape) {
+        return YES;
+    }
     UIViewController *source = [self orientationSourceViewController];
     if (source != nil && [source respondsToSelector:_cmd]) {
         return [source shouldAutorotate];
@@ -168,6 +174,9 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
     return NO;
 }
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
+    if (self.forceLandscape) {
+        return UIInterfaceOrientationMaskLandscape;
+    }
     UIViewController *source = [self orientationSourceViewController];
     if (source != nil && [source respondsToSelector:_cmd]) {
         UIInterfaceOrientationMask mask = [source supportedInterfaceOrientations];
@@ -201,6 +210,7 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
 @property(nonatomic, strong) UIButton *floatingButton;
 @property(nonatomic, strong) UIView *panel;
 @property(nonatomic, strong) UISwitch *autoSwitch;
+@property(nonatomic, strong) UISwitch *landscapeSwitch;
 @property(nonatomic, strong) UILabel *statusLabel;
 @property(nonatomic, assign) BOOL floatingButtonWasDragged;
 @property(nonatomic, assign) BOOL floatingExpandedOnTouch;
@@ -211,6 +221,7 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
 + (instancetype)sharedOverlay;
 - (void)installWhenReady;
 - (void)syncOrientationSource;
+- (void)setForceLandscapeEnabled:(BOOL)enabled;
 - (void)refreshUI;
 @end
 
@@ -333,6 +344,88 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
     }
 }
 
+- (void)requestInterfaceOrientation:(UIInterfaceOrientationMask)mask {
+    UIWindowScene *scene = self.overlayWindow.windowScene;
+    if (scene == nil) {
+        return;
+    }
+
+    JBRFZRootViewController *root = nil;
+    if ([self.overlayWindow.rootViewController
+            isKindOfClass:JBRFZRootViewController.class]) {
+        root = (JBRFZRootViewController *)self.overlayWindow.rootViewController;
+    }
+    if (@available(iOS 16.0, *)) {
+        if (root != nil) {
+            [root setNeedsUpdateOfSupportedInterfaceOrientations];
+        }
+        UIWindowSceneGeometryPreferencesIOS *preferences =
+            [[UIWindowSceneGeometryPreferencesIOS alloc]
+                initWithInterfaceOrientations:mask];
+        [scene requestGeometryUpdateWithPreferences:preferences
+                                        errorHandler:^(NSError *error) {
+            JbrfzPanelLog(
+                @"[JBRFZBypass] Orientation request rejected mask=0x%lx %@",
+                (unsigned long)mask, error.localizedDescription ?: @"unknown");
+            // Older Unity/iOS combinations can reject a scene geometry request
+            // because the original plist is portrait-only. Keep a compatible
+            // fallback for jailbroken devices in that case.
+            UIDeviceOrientation deviceOrientation =
+                (mask & UIInterfaceOrientationMaskLandscape)
+                    ? UIDeviceOrientationLandscapeRight
+                    : UIDeviceOrientationPortrait;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            [[UIDevice currentDevice] setValue:@(deviceOrientation)
+                                        forKey:@"orientation"];
+            [UIViewController attemptRotationToDeviceOrientation];
+#pragma clang diagnostic pop
+        }];
+        return;
+    }
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    UIDeviceOrientation deviceOrientation =
+        (mask & UIInterfaceOrientationMaskLandscape)
+            ? UIDeviceOrientationLandscapeRight
+            : UIDeviceOrientationPortrait;
+    [[UIDevice currentDevice] setValue:@(deviceOrientation)
+                                forKey:@"orientation"];
+    [UIViewController attemptRotationToDeviceOrientation];
+#pragma clang diagnostic pop
+}
+
+- (void)setForceLandscapeEnabled:(BOOL)enabled {
+    if (self.overlayWindow == nil || self.landscapeSwitch == nil) {
+        return;
+    }
+
+    JBRFZRootViewController *root = nil;
+    if ([self.overlayWindow.rootViewController
+            isKindOfClass:JBRFZRootViewController.class]) {
+        root = (JBRFZRootViewController *)self.overlayWindow.rootViewController;
+    }
+    if (root != nil) {
+        root.forceLandscape = enabled;
+        if (@available(iOS 16.0, *)) {
+            [root setNeedsUpdateOfSupportedInterfaceOrientations];
+        }
+    }
+
+    self.landscapeSwitch.on = enabled;
+    [NSUserDefaults.standardUserDefaults setBool:enabled
+                                           forKey:kJbrfzForceLandscapeKey];
+    [NSUserDefaults.standardUserDefaults synchronize];
+    [self requestInterfaceOrientation:enabled
+                                      ? UIInterfaceOrientationMaskLandscape
+                                      : UIInterfaceOrientationMaskPortrait];
+    [self positionPanel];
+    [self refreshUI];
+    JbrfzPanelLog(@"[JBRFZBypass] Manual landscape %@",
+                  enabled ? @"ENABLED" : @"DISABLED");
+}
+
 - (void)installWhenReady {
     NSAssert(NSThread.isMainThread,
              @"JBRFZPluginOverlay must be installed on main thread");
@@ -403,7 +496,7 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
 
     UIView *host = window.rootViewController.view;
 
-    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 300, 220)];
+    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 300, 260)];
     panel.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.96];
     panel.layer.cornerRadius = 16.0;
     panel.layer.borderWidth = 1.0;
@@ -455,8 +548,27 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
     [panel addSubview:autoSwitch];
     self.autoSwitch = autoSwitch;
 
+    UILabel *landscapeLabel =
+        [[UILabel alloc] initWithFrame:CGRectMake(18, 146, 210, 28)];
+    landscapeLabel.text = @"手动强制横屏";
+    landscapeLabel.textColor = UIColor.whiteColor;
+    landscapeLabel.font =
+        [UIFont systemFontOfSize:16.0 weight:UIFontWeightMedium];
+    [panel addSubview:landscapeLabel];
+
+    UISwitch *landscapeSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
+    landscapeSwitch.on =
+        [NSUserDefaults.standardUserDefaults boolForKey:kJbrfzForceLandscapeKey];
+    landscapeSwitch.onTintColor =
+        [UIColor colorWithRed:0.19 green:0.68 blue:1.0 alpha:1.0];
+    [landscapeSwitch addTarget:self
+                        action:@selector(landscapeSwitchChanged:)
+              forControlEvents:UIControlEventValueChanged];
+    [panel addSubview:landscapeSwitch];
+    self.landscapeSwitch = landscapeSwitch;
+
     UILabel *status =
-        [[UILabel alloc] initWithFrame:CGRectMake(18, 156, 264, 40)];
+        [[UILabel alloc] initWithFrame:CGRectMake(18, 190, 264, 52)];
     status.textColor = [UIColor colorWithWhite:0.72 alpha:1.0];
     status.font = [UIFont monospacedDigitSystemFontOfSize:12.0
                                                    weight:UIFontWeightRegular];
@@ -496,6 +608,7 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
     self.panel = panel;
     self.floatingButton = button;
     self.overlayWindow = window;
+    root.forceLandscape = landscapeSwitch.isOn;
     [self syncOrientationSource];
     [host addSubview:panel];
     [host addSubview:button];
@@ -536,6 +649,11 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
     [self restoreFloatingButtonPositionAnimated:NO collapsed:NO];
     [self positionPanel];
     [self refreshUI];
+    if (landscapeSwitch.isOn) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self requestInterfaceOrientation:UIInterfaceOrientationMaskLandscape];
+        });
+    }
     // Keep expanded longer on first install so user can find it.
     [self scheduleFloatingCollapse];
 
@@ -754,18 +872,25 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
     CGFloat y = safe.top + 74.0;
     CGFloat availableHeight =
         CGRectGetHeight(host.bounds) - safe.bottom - y - 12.0;
-    CGFloat panelHeight = MIN(220.0, MAX(190.0, availableHeight));
+    CGFloat panelHeight = MIN(260.0, MAX(220.0, availableHeight));
     self.panel.frame = CGRectMake(x, y, panelWidth, panelHeight);
     self.autoSwitch.center = CGPointMake(panelWidth - 46.0, 72.0);
-    self.statusLabel.frame = CGRectMake(18.0, 156.0, panelWidth - 36.0, 40.0);
+    self.landscapeSwitch.center = CGPointMake(panelWidth - 46.0, 160.0);
+    self.statusLabel.frame = CGRectMake(18.0, 190.0, panelWidth - 36.0, 52.0);
 }
 
 - (void)refreshUI {
     const bool enabled = JbrfzAutoFeaturesEnabled();
     self.autoSwitch.on = enabled;
+    self.landscapeSwitch.on =
+        [NSUserDefaults.standardUserDefaults boolForKey:kJbrfzForceLandscapeKey];
     self.statusLabel.text =
         enabled ? @"状态：自动已开启（领任务 / 烤箱 / 十连 / 开箱）"
                 : @"状态：自动已关闭（仅兼容/采集，适合新手号）";
+    if (self.landscapeSwitch.isOn) {
+        self.statusLabel.text = [self.statusLabel.text
+            stringByAppendingString:@"\n方向：强制横屏"];
+    }
     self.floatingButton.accessibilityValue =
         enabled ? @"自动已开启" : @"自动已关闭";
     self.floatingButton.backgroundColor =
@@ -791,6 +916,10 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
 - (void)autoSwitchChanged:(UISwitch *)sender {
     JbrfzSetAutoFeaturesEnabled(sender.isOn, true);
     [self refreshUI];
+}
+
+- (void)landscapeSwitchChanged:(UISwitch *)sender {
+    [self setForceLandscapeEnabled:sender.isOn];
 }
 
 - (void)floatingButtonTouchDown:(UIButton *)sender {
