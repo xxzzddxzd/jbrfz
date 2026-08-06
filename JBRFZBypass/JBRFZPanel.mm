@@ -122,9 +122,35 @@ static void JbrfzSetAutoFeaturesEnabled(bool enabled, bool persist) {
 @end
 
 @interface JBRFZRootViewController : UIViewController
+@property(nonatomic, weak) UIWindow *orientationSourceWindow;
+@property(nonatomic, copy) void (^layoutHandler)(void);
 @end
 
 @implementation JBRFZRootViewController
+
+static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
+    UIInterfaceOrientation orientation) {
+    switch (orientation) {
+        case UIInterfaceOrientationLandscapeLeft:
+            return UIInterfaceOrientationMaskLandscapeLeft;
+        case UIInterfaceOrientationLandscapeRight:
+            return UIInterfaceOrientationMaskLandscapeRight;
+        case UIInterfaceOrientationPortraitUpsideDown:
+            return UIInterfaceOrientationMaskPortraitUpsideDown;
+        case UIInterfaceOrientationPortrait:
+        default:
+            return UIInterfaceOrientationMaskPortrait;
+    }
+}
+
+- (UIViewController *)orientationSourceViewController {
+    UIWindow *sourceWindow = self.orientationSourceWindow;
+    if (sourceWindow == nil || sourceWindow == self.view.window) {
+        return nil;
+    }
+    return sourceWindow.rootViewController;
+}
+
 - (BOOL)prefersStatusBarHidden {
     return NO;
 }
@@ -132,10 +158,39 @@ static void JbrfzSetAutoFeaturesEnabled(bool enabled, bool persist) {
     return UIStatusBarStyleLightContent;
 }
 - (BOOL)shouldAutorotate {
-    return YES;
+    UIViewController *source = [self orientationSourceViewController];
+    if (source != nil && [source respondsToSelector:_cmd]) {
+        return [source shouldAutorotate];
+    }
+    // A standalone overlay must never be the reason the scene starts
+    // rotating. If the game root cannot be found, keep the current scene
+    // orientation instead of advertising all orientations.
+    return NO;
 }
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-    return UIInterfaceOrientationMaskAll;
+    UIViewController *source = [self orientationSourceViewController];
+    if (source != nil && [source respondsToSelector:_cmd]) {
+        UIInterfaceOrientationMask mask = [source supportedInterfaceOrientations];
+        if (mask != 0) {
+            return mask;
+        }
+    }
+
+    if (@available(iOS 13.0, *)) {
+        UIWindowScene *scene = self.view.window.windowScene;
+        if (scene != nil &&
+            scene.interfaceOrientation != UIInterfaceOrientationUnknown) {
+            return JbrfzMaskForInterfaceOrientation(scene.interfaceOrientation);
+        }
+    }
+    return UIInterfaceOrientationMaskPortrait;
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    if (self.layoutHandler != nil) {
+        self.layoutHandler();
+    }
 }
 @end
 
@@ -155,6 +210,7 @@ static void JbrfzSetAutoFeaturesEnabled(bool enabled, bool persist) {
 @property(nonatomic, assign) NSUInteger installAttempts;
 + (instancetype)sharedOverlay;
 - (void)installWhenReady;
+- (void)syncOrientationSource;
 - (void)refreshUI;
 @end
 
@@ -212,6 +268,71 @@ static void JbrfzSetAutoFeaturesEnabled(bool enabled, bool persist) {
         });
 }
 
+- (UIWindow *)gameWindowForScene:(UIWindowScene *)scene {
+    if (scene == nil) {
+        return nil;
+    }
+
+    UIWindow *fallback = nil;
+    for (UIWindow *candidate in scene.windows) {
+        if (candidate == self.overlayWindow || candidate.hidden ||
+            candidate.rootViewController == nil || candidate.alpha <= 0.01) {
+            continue;
+        }
+        if (candidate.isKeyWindow) {
+            return candidate;
+        }
+        if (fallback == nil) {
+            fallback = candidate;
+        }
+    }
+    return fallback;
+}
+
+- (void)syncOrientationSource {
+    if (self.overlayWindow == nil ||
+        ![self.overlayWindow.rootViewController
+            isKindOfClass:JBRFZRootViewController.class]) {
+        return;
+    }
+
+    JBRFZRootViewController *root =
+        (JBRFZRootViewController *)self.overlayWindow.rootViewController;
+    UIWindow *gameWindow = nil;
+    if (@available(iOS 13.0, *)) {
+        gameWindow = [self gameWindowForScene:self.overlayWindow.windowScene];
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        for (UIWindow *candidate in UIApplication.sharedApplication.windows) {
+            if (candidate != self.overlayWindow && !candidate.hidden &&
+                candidate.rootViewController != nil) {
+                gameWindow = candidate;
+                if (candidate.isKeyWindow) {
+                    break;
+                }
+            }
+        }
+#pragma clang diagnostic pop
+    }
+
+    root.orientationSourceWindow = gameWindow;
+    __weak typeof(self) weakSelf = self;
+    root.layoutHandler = ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if (self == nil) {
+            return;
+        }
+        [self positionPanel];
+        [self restoreFloatingButtonPositionAnimated:NO
+                                           collapsed:self.floatingCollapsed];
+    };
+
+    if (@available(iOS 16.0, *)) {
+        [root setNeedsUpdateOfSupportedInterfaceOrientations];
+    }
+}
+
 - (void)installWhenReady {
     NSAssert(NSThread.isMainThread,
              @"JBRFZPluginOverlay must be installed on main thread");
@@ -232,6 +353,7 @@ static void JbrfzSetAutoFeaturesEnabled(bool enabled, bool persist) {
         self.overlayWindow.windowLevel = UIWindowLevelStatusBar + 120.0;
         [self.overlayWindow bringSubviewToFront:self.panel];
         [self.overlayWindow bringSubviewToFront:self.floatingButton];
+        [self syncOrientationSource];
         [self restoreFloatingButtonPositionAnimated:NO
                                           collapsed:self.floatingCollapsed];
         return;
@@ -265,11 +387,18 @@ static void JbrfzSetAutoFeaturesEnabled(bool enabled, bool persist) {
         window = [[JBRFZPassthroughWindow alloc] initWithFrame:bounds];
     }
 
+    UIWindow *gameWindow = nil;
+    if (@available(iOS 13.0, *)) {
+        gameWindow = [self gameWindowForScene:window.windowScene];
+    }
+
     window.windowLevel = UIWindowLevelStatusBar + 120.0;
     window.backgroundColor = UIColor.clearColor;
     window.opaque = NO;
     window.userInteractionEnabled = YES;
-    window.rootViewController = [JBRFZRootViewController new];
+    JBRFZRootViewController *root = [JBRFZRootViewController new];
+    root.orientationSourceWindow = gameWindow;
+    window.rootViewController = root;
     window.rootViewController.view.backgroundColor = UIColor.clearColor;
 
     UIView *host = window.rootViewController.view;
@@ -367,6 +496,7 @@ static void JbrfzSetAutoFeaturesEnabled(bool enabled, bool persist) {
     self.panel = panel;
     self.floatingButton = button;
     self.overlayWindow = window;
+    [self syncOrientationSource];
     [host addSubview:panel];
     [host addSubview:button];
 
@@ -742,6 +872,14 @@ void JbrfzStartPluginPanel(void) {
                              queue:NSOperationQueue.mainQueue
                         usingBlock:^(__unused NSNotification *notification) {
                             [overlay installWhenReady];
+                        }];
+            [NSNotificationCenter.defaultCenter
+                addObserverForName:UIDeviceOrientationDidChangeNotification
+                            object:nil
+                             queue:NSOperationQueue.mainQueue
+                        usingBlock:^(__unused NSNotification *notification) {
+                            [overlay syncOrientationSource];
+                            [overlay positionPanel];
                         }];
             if (@available(iOS 13.0, *)) {
                 [NSNotificationCenter.defaultCenter
