@@ -13,3 +13,19 @@ DEFAULT_RESOURCE_KEY = "dev-0000000000"
 # Last known live key used as warm start (updated from responses when present).
 # Captured from the game after the 10101 update/restart on 2026-08-06.
 FALLBACK_RESOURCE_KEY = "game-data-9db3ba-0ca6ad"
+
+# Resource keys are global for the live game server.  These values were
+# persisted by older account databases and must never override provisioning.
+LEGACY_RESOURCE_KEYS = frozenset(
+    {
+        "",
+        "dev-0000000000",
+        "game-data-8319a6-a64b0c",
+    }
+)
+
+
+def normalize_resource_key(value: object) -> str:
+    """Return a usable key without allowing known stale values through."""
+    key = str(value or "").strip()
+    return FALLBACK_RESOURCE_KEY if key in LEGACY_RESOURCE_KEYS else key

@@ -19,6 +19,8 @@ import httpx
 
 from .constants import ENDPOINT as DEFAULT_ENDPOINT
 from .constants import FALLBACK_RESOURCE_KEY as DEFAULT_RESOURCE_KEY
+from .constants import normalize_resource_key
+from .resource import fetch_resource_key
 
 from .headers import DeviceIds, Session
 
@@ -26,8 +28,8 @@ LOGIN_URL = "https://account.devplay.com/v3/login"
 API_KEY = "wUsUkXPVSujBcOt4mDJX"
 
 # App constants from capture (CookieRun Crumble iOS)
-APP_BUILD = "16"
-APP_VERSION = "1.0.001"
+APP_BUILD = "19"
+APP_VERSION = "1.0.101"
 SDK_VERSION = "1.6.3-hotfix1"
 BUNDLE_ID = "com.devsisters.cc"
 UNITY_VERSION = "6000.3.15f1"
@@ -150,10 +152,7 @@ class AccountState:
         return Session(
             mid=self.mid,
             game_access_token=self.game_access_token,
-            # Resource keys stored in older account snapshots/SQLite rows are
-            # intentionally ignored.  The current live key is global and is
-            # the only key accepted by the 10101 game server.
-            resource_key=DEFAULT_RESOURCE_KEY,
+            resource_key=normalize_resource_key(self.resource_key),
             device=DeviceIds(
                 fgs_id=d.get("fgs_id", ""),
                 anonymous_id=d.get("anonymous_id", ""),
@@ -365,6 +364,9 @@ def guest_login(
     endpoint: str = DEFAULT_ENDPOINT,
 ) -> AccountState:
     """Create (empty secret) or re-login (with secret) a guest via /v3/login."""
+    # The game performs this CDN request before its account/login RPC.  Resolve
+    # it here as well, so the first gRPC request uses the server's current key.
+    resolved_resource_key = fetch_resource_key(timeout=timeout)
     dev = dict(device or new_device_ids())
     # ensure device_id exists for re-login body
     if not dev.get("device_id"):
@@ -395,9 +397,7 @@ def guest_login(
         refresh_token=data.get("refresh_token") or "",
         game_access_token=data.get("game_access_token") or "",
         oven_access_token=data.get("oven_access_token") or "",
-        # Do not reuse a stale per-account value from SQLite/config.  The
-        # current 10101 resource is global and must be sent on the first RPC.
-        resource_key=DEFAULT_RESOURCE_KEY,
+        resource_key=resolved_resource_key,
         device=dev,
         endpoint=endpoint,
         inviter_mid=inviter_mid,
