@@ -218,6 +218,66 @@ class ResidentGuildTests(unittest.TestCase):
                 ["bot-1", "bot-2", "bot-3"],
             )
 
+    def test_support_is_standalone_and_does_not_create_daily_action(self) -> None:
+        with AccountDB(self.db_path) as db:
+            self._add_accounts(db, count=1)
+            guild = db.upsert_managed_guild(
+                guild_id="G1",
+                gname="ahhhha",
+                gmname="absdbld",
+                capacity=5,
+            )
+            db.upsert_guild_membership(
+                guild.id,
+                "BOT0",
+                slot_no=1,
+                member_type="managed",
+                status="active",
+                details={"name": "bot-0"},
+            )
+
+            class _NoopClient:
+                def __init__(self, _endpoint: str) -> None:
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args) -> None:
+                    return None
+
+            runner = ResidentGuildRunner(
+                db,
+                self._login,
+                client_factory=_NoopClient,
+            )
+            calls = []
+
+            def fake_support(guild_row, supporter_mid, api, day_key):
+                calls.append((guild_row.guild_id, supporter_mid, day_key))
+                return {
+                    "ok": True,
+                    "attempted": 2,
+                    "count": 2,
+                    "available": 2,
+                    "requests": [],
+                }
+
+            runner._support_one = fake_support
+            result = runner.support(guild)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["count"], 2)
+            self.assertEqual(result["attempted"], 2)
+            self.assertEqual(result["accounts_attempted"], 1)
+            self.assertEqual(calls[0][0:2], ("G1", "BOT0"))
+            self.assertIsNone(
+                db.get_daily_guild_action(guild.id, result["day"], "BOT0")
+            )
+            membership = db.get_guild_membership(guild.id, "BOT0")
+            self.assertEqual(membership.details["name"], "bot-0")
+            self.assertEqual(membership.details["last_support_day"], result["day"])
+
 
 if __name__ == "__main__":
     unittest.main()

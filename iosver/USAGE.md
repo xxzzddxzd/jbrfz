@@ -45,6 +45,7 @@ guild public      公开公会：直接加入后批量签到、研究、捐赠�
 guild private     审批公会：引导临时会长接管、邀请账号入会捐赠并退出
 guild init/status/fill/daily/maintain
                   常驻公会：初始化、同步状态、补位、执行每日公会动作、维护
+guild support      常驻公会：仅执行支援中心动作
 guild private return [ID]
                   列出待交还会长任务，或按数据库 ID 交还原会长
 guild joblist     查看 SQLite 中的全部 private 任务清单
@@ -68,6 +69,7 @@ python main.py guild --gname 'ahhhha' init --gmname 'absdbld' --capacity 30
 python main.py guild --gname 'ahhhha' status
 python main.py guild --gname 'ahhhha' fill
 python main.py guild --gname 'ahhhha' daily
+python main.py guild --gname 'ahhhha' support
 python main.py guild --gname 'ahhhha' maintain
 ```
 
@@ -83,6 +85,7 @@ python main.py guild --gname 'ahhhha' init --gmname 'absdbld' --capacity 30
 python main.py guild --gname 'ahhhha' status
 python main.py guild --gname 'ahhhha' fill       # 只补充缺少的常驻账号
 python main.py guild --gname 'ahhhha' daily      # 签到、免费研究、钻石捐赠、支援
+python main.py guild --gname 'ahhhha' support    # 只执行支援中心
 python main.py guild --gname 'ahhhha' maintain   # status → fill → daily
 ```
 
@@ -96,6 +99,8 @@ python main.py guild --gname 'ahhhha' maintain   # status → fill → daily
 - `daily` 每个常驻账号每天只执行一次；重复执行会读取 `guild_daily_actions` 并跳过已完成账号。
   公会等级升级后的免费次数、钻石余额和支援请求都会写回 SQLite；付费捐赠在下一次
   单次成本超过 300 钻石前停止。
+- `support` 只执行支援中心，不会触发登录奖励、邮箱、碎屑副本、签到或研究；同一天
+  已成功支援的请求会从 `guild_support_actions` 去重。
 - `maintain` 遇到容量不足、招募 50 人上限、待审批申请或缺少账号时不会等待，直接返回
   `state` 与 `next_action`，按提示处理后重跑同一命令。
 

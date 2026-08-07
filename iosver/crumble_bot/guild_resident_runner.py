@@ -401,6 +401,137 @@ class ResidentGuildRunner:
             "results": results,
         }
 
+    def support(self, guild: ManagedGuildRow) -> dict:
+        """Support pending guild-center requests using active local members.
+
+        This is deliberately narrower than :meth:`daily`: it does not run the
+        account daily workflow, attendance, research, or the crumble dungeon.
+        Each member's successful request ids are persisted in
+        ``guild_support_actions`` so rerunning the command on the same server
+        day does not support the same request twice.
+        """
+        day_key = resident_day_key()
+        memberships = self.db.list_guild_memberships(
+            guild.id,
+            member_type="managed",
+            status="active",
+        )
+        if not memberships:
+            return {
+                "ok": False,
+                "mode": "resident_support",
+                "day": day_key,
+                "state": "no_active_members",
+                "stopped_reason": "no_active_members",
+                "count": 0,
+                "attempted": 0,
+                "accounts_attempted": 0,
+                "failed": 0,
+                "results": [],
+                "next_action": {
+                    "action": "fill",
+                    "message": "当前没有可登录的常驻成员；先执行 guild --gname <name> fill。",
+                },
+            }
+
+        results: list[dict] = []
+        support_count = 0
+        support_attempted = 0
+        failed = 0
+        for membership in memberships:
+            row = self.db.get(membership.mid)
+            item = {
+                "ok": False,
+                "mid": membership.mid,
+                "name": str(membership.details.get("name") or ""),
+                "support": None,
+            }
+            if row is None:
+                message = "account_not_found"
+                item["error"] = message
+                self.db.update_guild_membership(
+                    guild.id,
+                    membership.mid,
+                    status="active",
+                    last_error=message,
+                )
+                results.append(item)
+                failed += 1
+                continue
+
+            try:
+                state = self.login_account(row)
+                self._persist_logged_in(
+                    row, state, note=f"resident:{guild.guild_id}"
+                )
+                session = state.to_session()
+                with self.client_factory(state.endpoint or ENDPOINT) as client:
+                    api = Guild(client, session)
+                    support_result = self._support_one(
+                        guild, membership.mid, api, day_key
+                    )
+                    state.resource_key = api.session.resource_key
+                self._persist_logged_in(row, state)
+
+                support_count += int(support_result.get("count", 0) or 0)
+                support_attempted += int(
+                    support_result.get("attempted", 0) or 0
+                )
+                support_error = str(support_result.get("error") or "")
+                now = time.time()
+                self.db.update_guild_membership(
+                    guild.id,
+                    membership.mid,
+                    status="active",
+                    last_seen_at=now,
+                    last_support_at=(
+                        now
+                        if int(support_result.get("attempted", 0) or 0) > 0
+                        else membership.last_support_at
+                    ),
+                    last_error=support_error,
+                    details={
+                        **membership.details,
+                        "last_support_day": day_key,
+                    },
+                )
+                item.update(
+                    {
+                        "ok": bool(support_result.get("ok", False)),
+                        "support": support_result,
+                    }
+                )
+                if not item["ok"]:
+                    item["error"] = support_error or "support_failed"
+                    failed += 1
+            except Exception as error:
+                message = f"{type(error).__name__}: {error}"
+                item["error"] = message
+                self.db.update_guild_membership(
+                    guild.id,
+                    membership.mid,
+                    status="active",
+                    last_error=message,
+                )
+                failed += 1
+            results.append(item)
+
+        self.db.update_managed_guild(
+            guild.id,
+            status="active" if failed == 0 else "degraded",
+        )
+        return {
+            "ok": failed == 0,
+            "mode": "resident_support",
+            "day": day_key,
+            "state": "completed" if failed == 0 else "partial_failure",
+            "count": support_count,
+            "attempted": support_attempted,
+            "accounts_attempted": len(results),
+            "failed": failed,
+            "results": results,
+        }
+
     @staticmethod
     def _daily_action_has_account_workflows(action: dict) -> bool:
         """Return whether a completed action includes the current daily SOP.

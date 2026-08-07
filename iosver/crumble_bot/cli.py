@@ -746,6 +746,17 @@ def _cmd_guild_resident_daily(args: argparse.Namespace) -> int:
     return 0 if payload.get("ok") else 1
 
 
+def _cmd_guild_resident_support(args: argparse.Namespace) -> int:
+    with AccountDB(args.db) as db:
+        target = _resident_target(db, args)
+        runner = ResidentGuildRunner(db, _login_account)
+        payload = runner.support(target)
+        current = db.get_managed_guild(target.guild_id) or target
+        payload["status"] = runner.status(current)
+        print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+    return 0 if payload.get("ok") else 1
+
+
 def _cmd_guild_resident_maintain(args: argparse.Namespace) -> int:
     with AccountDB(args.db) as db:
         target = _resident_target(db, args)
@@ -1239,7 +1250,7 @@ def cmd_guild(args: argparse.Namespace) -> int:
     private_action = str(getattr(args, "private_action", "") or "")
     if not action and str(getattr(args, "gname", "") or "").strip():
         action = "status"
-    resident_actions = {"init", "status", "fill", "daily", "maintain"}
+    resident_actions = {"init", "status", "fill", "daily", "support", "maintain"}
     if action in resident_actions:
         if private_action or getattr(args, "private_job_id", None) is not None:
             raise SystemExit("常驻公会命令不接受 private return 参数")
@@ -1257,6 +1268,8 @@ def cmd_guild(args: argparse.Namespace) -> int:
             return _cmd_guild_resident_fill(args)
         if action == "daily":
             return _cmd_guild_resident_daily(args)
+        if action == "support":
+            return _cmd_guild_resident_support(args)
         return _cmd_guild_resident_maintain(args)
     if action == "joblist":
         if private_action or getattr(args, "private_job_id", None) is not None:
@@ -2440,10 +2453,11 @@ def build_parser() -> argparse.ArgumentParser:
             "status",
             "fill",
             "daily",
+            "support",
             "maintain",
         ),
         help=(
-            "公会流程或常驻管理动作：init/status/fill/daily/maintain；"
+            "公会流程或常驻管理动作：init/status/fill/daily/support/maintain；"
             "joblist 查看旧 private 任务"
         ),
     )
