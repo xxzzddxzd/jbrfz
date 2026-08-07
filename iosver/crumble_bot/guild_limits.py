@@ -31,6 +31,28 @@ GUILD_DAILY_FREE_RESEARCH_LIMITS: dict[int, int] = {
     15: 8,
 }
 
+# ``GuildLevels.bytes`` field 3: MaximumGuildMember.  This is the same table
+# used by the game client (``GuildLevelTable.GetMaxMemberCount``).  Keeping it
+# here lets resident-guild filling follow the live guild level instead of a
+# capacity that may have been supplied during an earlier ``init``.
+GUILD_MAX_MEMBER_COUNTS: dict[int, int] = {
+    1: 15,
+    2: 16,
+    3: 17,
+    4: 18,
+    5: 20,
+    6: 22,
+    7: 24,
+    8: 26,
+    9: 28,
+    10: 29,
+    11: 30,
+    12: 30,
+    13: 30,
+    14: 30,
+    15: 30,
+}
+
 # ``GuildLabPaidResearchs.bytes`` field 3, indexed by the one-based daily
 # paid-research count.  The item id for every row is the diamond currency
 # data id (1464007916).
@@ -97,6 +119,18 @@ def guild_daily_free_research_limit(guild_level: int) -> int | None:
     # client is updated.  The last known tier is safer than reverting to three.
     if level > max(GUILD_DAILY_FREE_RESEARCH_LIMITS):
         return GUILD_MAX_DAILY_FREE_RESEARCH_LIMIT
+    return None
+
+
+def guild_max_member_count(guild_level: int) -> int | None:
+    """Return the client-table member capacity for a guild level."""
+    level = int(guild_level)
+    if level <= 0:
+        return None
+    if level in GUILD_MAX_MEMBER_COUNTS:
+        return GUILD_MAX_MEMBER_COUNTS[level]
+    if level > max(GUILD_MAX_MEMBER_COUNTS):
+        return max(GUILD_MAX_MEMBER_COUNTS.values())
     return None
 
 

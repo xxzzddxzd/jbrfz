@@ -30,6 +30,7 @@ from .guild import (
 from .guild_limits import (
     GUILD_DAILY_RECRUITMENT_ACCOUNT_LIMIT,
     GUILD_PRIVATE_DAILY_INVITATION_LIMIT,
+    guild_max_member_count,
     parse_guild_daily_recruitment_limit,
 )
 from .guild_runner import GuildRunner, GuildWorkflowResult
@@ -122,6 +123,263 @@ def _guild_pool_payload(status: dict) -> dict:
         _local_timestamp(float(next_available)) if next_available else None
     )
     return payload
+
+
+def _guild_human_output(payload: object) -> str:
+    """Render the small, actionable summary used by the interactive CLI.
+
+    The command handlers still build the complete structured payload so callers
+    can request it with ``guild --json``.  The default terminal view only shows
+    the state, progress, failure reason, and the next manual action.
+    """
+    if not isinstance(payload, dict):
+        return str(payload)
+
+    status = payload.get("status")
+    status = status if isinstance(status, dict) else {}
+    operation_name = ""
+    if isinstance(payload.get("fill"), dict) and isinstance(
+        payload.get("daily"), dict
+    ):
+        operation_name = "maintain"
+    elif isinstance(payload.get("fill"), dict):
+        operation_name = "fill"
+    elif isinstance(payload.get("daily"), dict):
+        operation_name = "daily"
+    elif isinstance(payload.get("support"), dict):
+        operation_name = "support"
+    elif isinstance(payload.get("before"), dict):
+        operation_name = "maintain"
+    operation = (
+        payload
+        if operation_name == "maintain"
+        else payload.get(operation_name)
+    )
+    operation = operation if isinstance(operation, dict) else {}
+
+    raw_mode = str(payload.get("mode") or "guild")
+    if raw_mode == "resident" and operation_name:
+        mode = f"resident {operation_name}"
+    elif raw_mode == "resident_support":
+        mode = "resident support"
+    elif raw_mode == "guild" and payload.get("day") is not None:
+        mode = "resident daily"
+    else:
+        mode = raw_mode
+
+    ok_value = operation.get("ok") if operation else payload.get("ok", True)
+    ok = bool(ok_value)
+    complete = bool(payload.get("complete"))
+    state = str(
+        payload.get("state")
+        or payload.get("stopped_reason")
+        or operation.get("state")
+        or operation.get("stopped_reason")
+        or status.get("state")
+        or status.get("stopped_reason")
+        or ""
+    )
+    if complete or state in {"complete", "target_already_complete"}:
+        result = "完成"
+    elif ok:
+        result = "已处理"
+    else:
+        result = "失败"
+
+    lines = [f"公会 {mode}：{result}"]
+    guild = payload.get("guild")
+    if not isinstance(guild, dict):
+        guild = status.get("guild")
+    if not isinstance(guild, dict):
+        after = payload.get("after")
+        guild = after.get("guild") if isinstance(after, dict) else None
+    if not isinstance(guild, dict):
+        before = payload.get("before")
+        guild = before.get("guild") if isinstance(before, dict) else None
+    if isinstance(guild, dict):
+        name = str(guild.get("name") or guild.get("gname") or "")
+        master = str(
+            guild.get("master_name")
+            or guild.get("original_master_name")
+            or ""
+        )
+        if name or master:
+            lines.append(
+                f"公会：{name or '-'}"
+                + (f"（会长：{master}）" if master else "")
+            )
+        member_count = guild.get("member_count")
+        capacity = guild.get("capacity")
+        if member_count is not None or capacity is not None:
+            lines.append(
+                f"成员：{member_count if member_count is not None else 0}/"
+                f"{capacity if capacity is not None else '?'}"
+            )
+        capacity_source = str(guild.get("capacity_source") or "")
+        capacity_level = guild.get("capacity_level")
+        if capacity_source == "guild_level":
+            lines.append(f"容量来源：公会等级 {capacity_level or '-'}")
+        target = guild.get("target_managed_count")
+        if target is not None:
+            roster = status.get("roster")
+            active = (
+                roster.get("managed_active")
+                if isinstance(roster, dict)
+                else None
+            )
+            if active is not None:
+                lines.append(
+                    f"常驻：{active}/{target}，"
+                    f"缺口 {max(0, int(target) - int(active))}"
+                )
+
+    roster = status.get("roster")
+    if isinstance(roster, dict) and operation_name == "fill":
+        active = roster.get("managed_active")
+        target = roster.get("managed_target")
+        if active is not None and target is not None and not isinstance(guild, dict):
+            lines.append(f"常驻：{active}/{target}，缺口 {roster.get('vacancy', 0)}")
+
+    fill = payload.get("fill")
+    if isinstance(fill, dict):
+        requested = fill.get("requested", 0)
+        joined = fill.get("joined", 0)
+        applied = fill.get("applied", 0)
+        filled = fill.get("filled", joined + applied)
+        lines.append(
+            f"补位：请求 {requested}，已入会 {joined}，待审批 {applied}，完成 {filled}"
+        )
+        if fill.get("daily_recruit_remaining") is not None:
+            lines.append(f"今日招募剩余：{fill['daily_recruit_remaining']}")
+
+    daily = payload.get("daily")
+    if (
+        not isinstance(daily, dict)
+        and payload.get("day") is not None
+        and raw_mode != "resident_support"
+    ):
+        daily = payload
+    if isinstance(daily, dict):
+        lines.append(
+            f"每日：完成 {daily.get('count', 0)}/{daily.get('attempted', 0)}，"
+            f"失败 {daily.get('failed', 0)}"
+        )
+
+    support = payload.get("support")
+    if not isinstance(support, dict) and raw_mode == "resident_support":
+        support = payload
+    if isinstance(support, dict):
+        lines.append(
+            f"支援：完成 {support.get('count', 0)}，"
+            f"尝试 {support.get('attempted', 0)}，失败 {support.get('failed', 0)}"
+        )
+
+    if payload.get("mode") in {"guild_joblist", "private_return_list"}:
+        jobs = payload.get("jobs")
+        if isinstance(jobs, list):
+            lines.append(f"任务数：{len(jobs)}")
+            for item in jobs:
+                if not isinstance(item, dict):
+                    continue
+                job_id = item.get("id", "?")
+                name = item.get("gname") or item.get("name") or "-"
+                job_status = item.get("status") or "-"
+                effective = item.get("totalcount")
+                target = item.get("requested_totalcount")
+                progress = (
+                    f"，有效 {effective}/{target}"
+                    if effective is not None and target
+                    else ""
+                )
+                lines.append(f"#{job_id} {name}：{job_status}{progress}")
+
+    job = payload.get("job")
+    if isinstance(job, dict):
+        job_id = job.get("id")
+        if job_id is not None:
+            lines.append(f"任务：#{job_id}，状态 {job.get('status') or state or '-'}")
+
+    controller = payload.get("controller")
+    if isinstance(controller, dict):
+        controller_name = str(controller.get("name") or "")
+        controller_mid = str(controller.get("mid") or "")
+        label = controller_name or controller_mid or "-"
+        if controller_name and controller_mid:
+            label = f"{controller_name}（{controller_mid}）"
+        lines.append(f"代理会长：{label}")
+
+    progress = payload.get("progress")
+    if isinstance(progress, dict):
+        current = progress.get("current")
+        target = progress.get("target")
+        remaining = progress.get("remaining")
+    else:
+        current = payload.get("totalcount")
+        target = payload.get("requested_totalcount")
+        remaining = payload.get("remaining_totalcount")
+    if current is not None or target is not None:
+        target_text = str(target) if target not in (None, 0) else "不限"
+        line = f"有效次数：{current if current is not None else 0}/{target_text}"
+        if remaining is not None:
+            line += f"，剩余 {remaining}"
+        lines.append(line)
+
+    attempted = payload.get("accounts_attempted")
+    failed = payload.get("accounts_failed")
+    added = payload.get("account_count_added")
+    if attempted is not None or failed is not None:
+        line = f"账号：执行 {attempted or 0} 个，失败 {failed or 0} 个"
+        if added is not None:
+            line += f"，本次完成 {added} 个"
+        lines.append(line)
+
+    totals = payload.get("totals")
+    if isinstance(totals, dict):
+        effective = totals.get("effective_research_count")
+        spent = totals.get("diamond_spent")
+        if effective is not None or spent is not None:
+            bits = []
+            if effective is not None:
+                bits.append(f"有效 {effective} 次")
+            if spent is not None:
+                bits.append(f"消耗 {spent} 钻")
+            lines.append("本次：" + "，".join(bits))
+
+    if state:
+        lines.append(f"状态：{state}")
+
+    error = str(payload.get("error") or operation.get("error") or "")
+    if error:
+        lines.append(f"原因：{error}")
+
+    next_action = payload.get("next_action")
+    if not next_action and operation_name:
+        next_action = operation.get("next_action")
+    if isinstance(next_action, dict):
+        message = str(next_action.get("message") or "")
+        command = str(next_action.get("command") or "")
+        if message:
+            lines.append(f"下一步：{message}")
+        if command and command != message:
+            lines.append(f"命令：{command}")
+    elif isinstance(payload.get("next_action"), str):
+        lines.append(f"下一步：{payload['next_action']}")
+
+    manual = payload.get("manual_master_return")
+    if isinstance(manual, dict) and manual.get("command"):
+        command = str(manual["command"])
+        if not any(command in line for line in lines):
+            lines.append(f"命令：{command}")
+
+    return "\n".join(lines)
+
+
+def _print_guild_payload(payload: object, args: argparse.Namespace) -> None:
+    """Print JSON for library/tests, or a concise summary for the CLI."""
+    if bool(getattr(args, "_human_output", False)):
+        print(_guild_human_output(payload), flush=True)
+    else:
+        print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
 
 
 def _numeric_change(before: int | None, after: int | None) -> int | None:
@@ -354,10 +612,19 @@ def _guild_confirmation_payload(summary: GuildSearchSummary) -> dict:
 
 
 def _confirm_guild(payload: dict) -> bool:
-    print(
-        json.dumps({"guild_confirmation": payload}, ensure_ascii=False, indent=2),
-        flush=True,
-    )
+    name = str(payload.get("name") or "-")
+    master = str(payload.get("master_name") or "-")
+    level = payload.get("guild_level")
+    members = payload.get("member_count")
+    join_method = payload.get("join_method_name") or payload.get("join_method")
+    details = [f"公会：{name}", f"会长：{master}"]
+    if level is not None:
+        details.append(f"等级：{level}")
+    if members is not None:
+        details.append(f"成员：{members}")
+    if join_method is not None:
+        details.append(f"入会：{join_method}")
+    print("目标公会确认：" + "，".join(details), flush=True)
     try:
         answer = input("确认使用这个公会？[y/N]: ").strip().lower()
     except EOFError:
@@ -671,7 +938,7 @@ def _cmd_guild_resident_init(args: argparse.Namespace) -> int:
                     "message": "需要一个 ready=1、invalid=0、next_stage>30 且有登录凭据的账号。",
                 },
             }
-            print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+            _print_guild_payload(payload, args)
             return 1
         try:
             state, summary = _resident_search_summary(
@@ -687,19 +954,39 @@ def _cmd_guild_resident_init(args: argparse.Namespace) -> int:
                 "stopped_reason": "guild_search_failed",
                 "error": f"{type(error).__name__}: {error}",
             }
-            print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+            _print_guild_payload(payload, args)
             return 1
 
+        level_capacity = guild_max_member_count(summary.guild_level)
         capacity = int(
-            capacity_arg
-            if capacity_arg is not None
-            else (existing.capacity if existing is not None else 0)
+            level_capacity
+            if level_capacity is not None
+            else (
+                capacity_arg
+                if capacity_arg is not None
+                else (existing.capacity if existing is not None else 0)
+            )
         )
         details = {
             **(existing.details if existing is not None else {}),
             "search_summary": _guild_confirmation_payload(summary),
-            "capacity_source": "argument" if capacity_arg is not None else (
-                "cached" if existing is not None and existing.capacity else "unknown"
+            "capacity_source": (
+                "guild_level"
+                if level_capacity is not None
+                else (
+                    "argument"
+                    if capacity_arg is not None
+                    else (
+                        "cached"
+                        if existing is not None and existing.capacity
+                        else "unknown"
+                    )
+                )
+            ),
+            **(
+                {"capacity_level": int(summary.guild_level)}
+                if level_capacity is not None
+                else {}
             ),
         }
         current_master_mid = str(summary.master_user_id or "").strip().upper()
@@ -793,7 +1080,9 @@ def _cmd_guild_resident_init(args: argparse.Namespace) -> int:
         if not capacity:
             payload["next_action"] = {
                 "action": "rerun_init_with_capacity",
-                "message": "GetGuild 未直接返回容量，请补充 --capacity x 后重跑 init。",
+                "message": (
+                    "暂时无法从公会等级确定容量，请补充 --capacity x 后重跑 init。"
+                ),
             }
         else:
             payload["next_action"] = {
@@ -803,7 +1092,7 @@ def _cmd_guild_resident_init(args: argparse.Namespace) -> int:
                     "开始补充常驻成员。"
                 ),
             }
-        print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+        _print_guild_payload(payload, args)
     return 0 if init_ok else 1
 
 
@@ -817,7 +1106,7 @@ def _cmd_guild_resident_status(args: argparse.Namespace) -> int:
         if not payload.get("ok"):
             payload = {**runner.status(current), **payload}
         payload["name_refresh"] = name_refresh
-        print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+        _print_guild_payload(payload, args)
     return 0
 
 
@@ -846,7 +1135,7 @@ def _cmd_guild_resident_fill(args: argparse.Namespace) -> int:
         }
         current = db.get_managed_guild(target.guild_id) or target
         payload["status"] = runner.status(current)
-        print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+        _print_guild_payload(payload, args)
     return 0 if payload.get("ok") else 1
 
 
@@ -856,7 +1145,7 @@ def _cmd_guild_resident_daily(args: argparse.Namespace) -> int:
         payload = ResidentGuildRunner(db, _login_account).daily(target)
         current = db.get_managed_guild(target.guild_id) or target
         payload["status"] = ResidentGuildRunner(db, _login_account).status(current)
-        print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+        _print_guild_payload(payload, args)
     return 0 if payload.get("ok") else 1
 
 
@@ -867,7 +1156,7 @@ def _cmd_guild_resident_support(args: argparse.Namespace) -> int:
         payload = runner.support(target)
         current = db.get_managed_guild(target.guild_id) or target
         payload["status"] = runner.status(current)
-        print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+        _print_guild_payload(payload, args)
     return 0 if payload.get("ok") else 1
 
 
@@ -879,7 +1168,7 @@ def _cmd_guild_resident_maintain(args: argparse.Namespace) -> int:
         current = db.get_managed_guild(target.guild_id) or target
         payload["name_refresh"] = runner.enrich_member_names(current)
         payload["status"] = runner.status(current)
-        print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+        _print_guild_payload(payload, args)
     return 0 if payload.get("ok") else 1
 
 
@@ -1577,7 +1866,7 @@ def _cmd_guild_joblist(args: argparse.Namespace) -> int:
             "status_counts": status_counts,
             "jobs": [_guild_joblist_item_payload(db, job) for job in jobs],
         }
-    print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+    _print_guild_payload(payload, args)
     return 0
 
 
@@ -1597,7 +1886,7 @@ def _cmd_guild_private_return(args: argparse.Namespace) -> int:
                 "count": len(jobs),
                 "jobs": [_private_return_job_payload(job) for job in jobs],
             }
-            print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+            _print_guild_payload(payload, args)
             return 0
 
         job = db.get_private_job(int(job_id))
@@ -1609,7 +1898,7 @@ def _cmd_guild_private_return(args: argparse.Namespace) -> int:
                 "job_id": int(job_id),
                 "error": f"guild_private_jobs 中没有 id={int(job_id)} 的记录",
             }
-            print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+            _print_guild_payload(payload, args)
             return 1
 
         runner = PrivateGuildRunner(
@@ -1631,7 +1920,7 @@ def _cmd_guild_private_return(args: argparse.Namespace) -> int:
                 "error": message,
             }
 
-    print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+    _print_guild_payload(payload, args)
     return 0 if payload.get("ok") else 1
 
 
@@ -1691,7 +1980,7 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                         "message": "该公会存在多个未完成任务，请使用 --master-mid 指定代理会长。",
                     },
                 }
-                print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+                _print_guild_payload(payload, args)
                 return 1
             if active_jobs:
                 controller_mid = active_jobs[0].controller_mid
@@ -1713,14 +2002,7 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                 excluded.add(target.original_master_mid or target.master_user_id)
             selected = _select_private_controller(db, exclude_mids=excluded)
             if selected is None:
-                print(
-                    json.dumps(
-                        _private_controller_candidate_error(),
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    flush=True,
-                )
+                _print_guild_payload(_private_controller_candidate_error(), args)
                 return 1
             controller_mid = selected.mid
             controller_source = "auto"
@@ -1739,7 +2021,7 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                     "message": f"请先把临时会长账号 {controller_mid} 补回 SQLite。",
                 },
             }
-            print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+            _print_guild_payload(payload, args)
             return 1
 
         if target is None:
@@ -1761,65 +2043,53 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                 if item.name == gname and item.master_name == gmname
             ]
             if len(matches) != 1:
-                print(
-                    json.dumps(
-                        {
-                            "ok": False,
-                            "mode": "private",
-                            "state": "guild_target_not_unique",
-                            "stopped_reason": "guild_target_not_unique",
-                            "match_count": len(matches),
-                            "search_result_count": len(summaries),
-                            "next_action": {
-                                "action": "verify_guild_identity",
-                                "message": "请核对 --gname 和 --gmname，确保只匹配一个公会。",
-                            },
+                _print_guild_payload(
+                    {
+                        "ok": False,
+                        "mode": "private",
+                        "state": "guild_target_not_unique",
+                        "stopped_reason": "guild_target_not_unique",
+                        "match_count": len(matches),
+                        "search_result_count": len(summaries),
+                        "next_action": {
+                            "action": "verify_guild_identity",
+                            "message": "请核对 --gname 和 --gmname，确保只匹配一个公会。",
                         },
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    flush=True,
+                    },
+                    args,
                 )
                 return 1
             matched = matches[0]
             confirmation = _guild_confirmation_payload(matched)
             if not _confirm_guild(confirmation):
-                print(
-                    json.dumps(
-                        {
-                            "ok": True,
-                            "mode": "private",
-                            "state": "not_confirmed",
-                            "stopped_reason": "not_confirmed",
-                            "next_action": {
-                                "action": "confirm_guild",
-                                "message": "确认目标信息后，重跑原命令并输入 y。",
-                            },
+                _print_guild_payload(
+                    {
+                        "ok": True,
+                        "mode": "private",
+                        "state": "not_confirmed",
+                        "stopped_reason": "not_confirmed",
+                        "next_action": {
+                            "action": "confirm_guild",
+                            "message": "确认目标信息后，重跑原命令并输入 y。",
                         },
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    flush=True,
+                    },
+                    args,
                 )
                 return 0
             if matched.join_method != 1:
-                print(
-                    json.dumps(
-                        {
-                            "ok": False,
-                            "mode": "private",
-                            "state": "guild_is_public",
-                            "stopped_reason": "guild_is_public",
-                            "join_method": matched.join_method,
-                            "next_action": {
-                                "action": "use_public_flow",
-                                "message": "该公会可直接加入，请改用 guild public。",
-                            },
+                _print_guild_payload(
+                    {
+                        "ok": False,
+                        "mode": "private",
+                        "state": "guild_is_public",
+                        "stopped_reason": "guild_is_public",
+                        "join_method": matched.join_method,
+                        "next_action": {
+                            "action": "use_public_flow",
+                            "message": "该公会可直接加入，请改用 guild public。",
                         },
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    flush=True,
+                    },
+                    args,
                 )
                 return 1
             target = db.upsert_guild_target(
@@ -1850,45 +2120,37 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                         join_method,
                     )
                 except Exception as error:
-                    print(
-                        json.dumps(
-                            {
-                                "ok": False,
-                                "mode": "private",
-                                "state": "guild_mode_refresh_failed",
-                                "stopped_reason": "guild_mode_refresh_failed",
-                                "cached_join_method": 0,
-                                "error": f"{type(error).__name__}: {error}",
-                                "next_action": {
-                                    "action": "retry_guild_search",
-                                    "message": "在线刷新公会入会方式失败，请检查网络后重跑原命令。",
-                                },
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                        flush=True,
-                    )
-                    return 1
-            if join_method == 0:
-                print(
-                    json.dumps(
+                    _print_guild_payload(
                         {
                             "ok": False,
                             "mode": "private",
-                            "state": "guild_is_public",
-                            "stopped_reason": "guild_is_public",
-                            "join_method": join_method,
-                            "source": "refresh",
+                            "state": "guild_mode_refresh_failed",
+                            "stopped_reason": "guild_mode_refresh_failed",
+                            "cached_join_method": 0,
+                            "error": f"{type(error).__name__}: {error}",
                             "next_action": {
-                                "action": "use_public_flow",
-                                "message": "该公会可直接加入，请改用 guild public。",
+                                "action": "retry_guild_search",
+                                "message": "在线刷新公会入会方式失败，请检查网络后重跑原命令。",
                             },
                         },
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    flush=True,
+                        args,
+                    )
+                    return 1
+            if join_method == 0:
+                _print_guild_payload(
+                    {
+                        "ok": False,
+                        "mode": "private",
+                        "state": "guild_is_public",
+                        "stopped_reason": "guild_is_public",
+                        "join_method": join_method,
+                        "source": "refresh",
+                        "next_action": {
+                            "action": "use_public_flow",
+                            "message": "该公会可直接加入，请改用 guild public。",
+                        },
+                    },
+                    args,
                 )
                 return 1
 
@@ -1961,7 +2223,7 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                     controller_mid,
                     controller_availability,
                 )
-                print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+                _print_guild_payload(payload, args)
                 return 1
 
         if controller_mid == original_master_mid:
@@ -1971,13 +2233,8 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                     exclude_mids={original_master_mid},
                 )
                 if selected is None:
-                    print(
-                        json.dumps(
-                            _private_controller_candidate_error(),
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                        flush=True,
+                    _print_guild_payload(
+                        _private_controller_candidate_error(), args
                     )
                     return 1
                 controller_mid = selected.mid
@@ -1995,7 +2252,7 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                         "message": "代理会长不能是原会长，请改用其他 --master-mid。",
                     },
                 }
-                print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+                _print_guild_payload(payload, args)
                 return 1
         job = db.get_active_private_job(target.guild_id, controller_mid)
         if job is not None and (
@@ -2067,10 +2324,7 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                                 ),
                             },
                         }
-                        print(
-                            json.dumps(payload, ensure_ascii=False, indent=2),
-                            flush=True,
-                        )
+                        _print_guild_payload(payload, args)
                         return 0
                     log.info(
                         "private totalcount batch completed on %s; starting a new "
@@ -2133,7 +2387,7 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
         if parameter_update is not None:
             payload["job_parameters_updated"] = parameter_update
 
-    print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+        _print_guild_payload(payload, args)
     return 0 if payload.get("ok") else 1
 
 
@@ -2188,7 +2442,7 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
                 "pool": pool_before,
                 "results": [],
             }
-            print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+            _print_guild_payload(summary, args)
             return 0
 
         target = db.get_guild_target(gname, gmname)
@@ -2228,7 +2482,7 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
                     "pool": pool_before,
                     "results": [],
                 }
-                print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+                _print_guild_payload(summary, args)
                 return 1
 
             matches = [
@@ -2253,7 +2507,7 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
                     "pool": pool_before,
                     "results": [],
                 }
-                print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+                _print_guild_payload(summary, args)
                 return 1
 
             matched = matches[0]
@@ -2274,7 +2528,7 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
                     "pool": pool_before,
                     "results": [],
                 }
-                print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+                _print_guild_payload(summary, args)
                 return 1
             confirmation = _guild_confirmation_payload(matched)
             if not _confirm_guild(confirmation):
@@ -2292,7 +2546,7 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
                     "pool": pool_before,
                     "results": [],
                 }
-                print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+                _print_guild_payload(summary, args)
                 return 0
 
             target = db.upsert_guild_target(
@@ -2345,10 +2599,7 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
                         "pool": pool_before,
                         "results": [],
                     }
-                    print(
-                        json.dumps(summary, ensure_ascii=False, indent=2),
-                        flush=True,
-                    )
+                    _print_guild_payload(summary, args)
                     return 1
             if join_method == 1:
                 summary = {
@@ -2368,7 +2619,7 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
                     "pool": pool_before,
                     "results": [],
                 }
-                print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+                _print_guild_payload(summary, args)
                 return 1
             log.info(
                 "using cached guild target name=%s master=%s confirmed_at=%s",
@@ -2626,7 +2877,7 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
         }
         if recruitment_limit is not None:
             summary["daily_recruitment_limit"] = recruitment_limit or None
-        print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+        _print_guild_payload(summary, args)
 
     return 0 if failures == 0 else 1
 
@@ -2720,7 +2971,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "--capacity",
         type=int,
-        help="resident init：公会最大容量；GetGuild 未返回容量时必须提供",
+        help=(
+            "resident init：旧版本或未知公会等级时的容量兜底；"
+            "当前版本会按公会等级自动读取"
+        ),
     )
     sp.add_argument(
         "--confirm",
@@ -2729,6 +2983,11 @@ def build_parser() -> argparse.ArgumentParser:
             "private：当 count/totalcount 与未完成任务不一致时，"
             "确认更新原任务参数并继续"
         ),
+    )
+    sp.add_argument(
+        "--json",
+        action="store_true",
+        help="guild：输出完整 JSON；默认输出简明状态摘要",
     )
     sp.add_argument("--db", default=str(DEFAULT_DB), help="sqlite 路径")
     sp.set_defaults(func=cmd_guild)
@@ -2747,6 +3006,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Keep direct ``cmd_guild`` calls/API consumers on the structured output,
+    # while the executable defaults to the readable terminal summary.
+    args._human_output = bool(
+        getattr(args, "cmd", "") == "guild"
+        and not bool(getattr(args, "json", False))
+    )
     _setup_log(
         verbose=bool(getattr(args, "verbose", False)),
         quiet=bool(getattr(args, "quiet", False)),

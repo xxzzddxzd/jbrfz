@@ -64,8 +64,8 @@ python main.py guild private return 1
 python main.py guild joblist
 ./main.py list --unused --ready
 
-# 常驻公会（公会容量 30，保留 2 个空位）
-python main.py guild --gname 'ahhhha' init --gmname 'absdbld' --capacity 30
+# 常驻公会（按公会等级自动读取容量，保留 2 个空位）
+python main.py guild --gname 'ahhhha' init --gmname 'absdbld'
 python main.py guild --gname 'ahhhha' status
 python main.py guild --gname 'ahhhha' fill
 python main.py guild --gname 'ahhhha' daily
@@ -76,17 +76,18 @@ python main.py guild --gname 'ahhhha' maintain
 ### 常驻公会管理
 
 常驻模式与旧的 `public/private` 临时进会流程相互独立。`init` 会搜索并缓存
-公会 ID、会长、加入方式和容量，默认把容量减去 2 作为常驻账号目标；
-`init` 只初始化配置，不选择代理会长，也不发送邀请。容量不能从搜索接口得到时
-必须在 `init` 提供 `--capacity`。
+公会 ID、会长、加入方式、等级和成员容量，默认把容量减去 2 作为常驻账号目标；
+容量按当前客户端的公会等级表读取，`--capacity` 只作为未知等级或旧版本数据库的兜底。
+`init` 只初始化配置，不选择代理会长，也不发送邀请。
 
 ```bash
-python main.py guild --gname 'ahhhha' init --gmname 'absdbld' --capacity 30
+python main.py guild --gname 'ahhhha' init --gmname 'absdbld'
 python main.py guild --gname 'ahhhha' status
 python main.py guild --gname 'ahhhha' fill       # 只补充缺少的常驻账号
 python main.py guild --gname 'ahhhha' daily      # 签到、免费研究、钻石捐赠、支援
 python main.py guild --gname 'ahhhha' support    # 只执行支援中心
 python main.py guild --gname 'ahhhha' maintain   # status → fill → daily
+# 需要完整结构化结果时加 --json；默认终端只显示简明摘要
 ```
 
 - `--gname` 支持已初始化公会名称的唯一前缀；`--gmname` 只在 `init` 用于校验会长。

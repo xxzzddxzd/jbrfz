@@ -40,6 +40,7 @@ from .guild import (
 )
 from .guild_limits import (
     GUILD_DAILY_PAID_RESEARCH_MAX_COST,
+    guild_max_member_count,
     parse_guild_daily_recruitment_limit,
 )
 from .guild_runner import GuildRunner
@@ -132,6 +133,13 @@ class ResidentGuildRunner:
 
             self._persist_logged_in(actor, state)
             self._reconcile_members(guild, members)
+            live_level = (
+                int(summary.guild_level)
+                if summary is not None and summary.guild_level
+                else int(guild.guild_level)
+            )
+            live_capacity = guild_max_member_count(live_level)
+            capacity_source = "guild_level" if live_capacity is not None else ""
             changes = {
                 "member_count": len(members.members),
                 "last_sync_at": time.time(),
@@ -147,6 +155,16 @@ class ResidentGuildRunner:
                     "members": [asdict(member) for member in members.members],
                 },
             }
+            if live_capacity is not None:
+                changes.update(
+                    {
+                        "capacity": live_capacity,
+                        "target_managed_count": max(
+                            0,
+                            live_capacity - int(guild.reserve_slots),
+                        ),
+                    }
+                )
             if summary is not None:
                 changes.update(
                     {
@@ -156,6 +174,9 @@ class ResidentGuildRunner:
                         "guild_level": summary.guild_level,
                     }
                 )
+            if capacity_source:
+                changes["details"]["capacity_source"] = capacity_source
+                changes["details"]["capacity_level"] = live_level
             refreshed = self.db.update_managed_guild(guild.id, **changes)
             payload = self.status(refreshed)
             payload.update({"ok": True, "synced": True})
@@ -178,6 +199,29 @@ class ResidentGuildRunner:
 
     def fill(self, guild: ManagedGuildRow, *, max_accounts: int = 0) -> dict:
         """Fill missing managed slots without removing existing members."""
+        # ``init --capacity`` is only a legacy bootstrap value.  Once the
+        # current guild level is known, always replace it with the capacity
+        # from the same GuildLevels table used by the game.  This also makes
+        # direct runner calls safe when the caller did not run ``sync`` first.
+        level_capacity = guild_max_member_count(guild.guild_level)
+        if level_capacity is not None and (
+            int(guild.capacity) != level_capacity
+            or int(guild.target_managed_count)
+            != max(0, level_capacity - int(guild.reserve_slots))
+        ):
+            guild = self.db.update_managed_guild(
+                guild.id,
+                capacity=level_capacity,
+                target_managed_count=max(
+                    0,
+                    level_capacity - int(guild.reserve_slots),
+                ),
+                details={
+                    **guild.details,
+                    "capacity_source": "guild_level",
+                    "capacity_level": int(guild.guild_level),
+                },
+            )
         memberships = self.db.list_guild_memberships(guild.id)
         active = [
             row
@@ -1271,6 +1315,8 @@ class ResidentGuildRunner:
                 "reserve_slots": guild.reserve_slots,
                 "target_managed_count": guild.target_managed_count,
                 "member_count": guild.member_count,
+                "capacity_source": str(guild.details.get("capacity_source") or ""),
+                "capacity_level": guild.details.get("capacity_level"),
                 "controller_mid": guild.controller_mid,
                 "original_master_mid": guild.original_master_mid,
             },
