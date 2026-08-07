@@ -12,6 +12,7 @@ from .constants import ENDPOINT, FALLBACK_RESOURCE_KEY, TO_STAGE
 from .daily_runner import DailyRunner, DailyWorkflowResult
 from .db import (
     DEFAULT_DB,
+    DAILY_TIMEZONE,
     AccountDB,
     AccountRow,
     GuildTargetRow,
@@ -1373,6 +1374,23 @@ def _private_cli_job_payload(job) -> dict:
     }
 
 
+def _private_job_day_key(job) -> str:
+    """Return the Asia/Shanghai day on which a private batch completed.
+
+    Completed jobs are retained as history.  A totalcount target is a daily
+    batch, so a completed job from a previous local day must not suppress the
+    next day's invocation.
+    """
+    timestamp = float(job.completed_at or job.updated_at or job.created_at or 0)
+    if not timestamp:
+        return ""
+    return datetime.fromtimestamp(timestamp, DAILY_TIMEZONE).date().isoformat()
+
+
+def _private_current_day_key() -> str:
+    return datetime.now(DAILY_TIMEZONE).date().isoformat()
+
+
 def _private_return_job_payload(job) -> dict:
     return {
         **_private_cli_job_payload(job),
@@ -1840,39 +1858,55 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                 and totalcount > 0
             ):
                 if latest.effective_count >= latest.total_count_limit:
-                    payload = {
-                        "ok": True,
-                        "complete": True,
-                        "mode": "private",
-                        "state": "complete",
-                        "stopped_reason": "target_already_complete",
-                        "job": _private_cli_job_payload(latest),
-                        "controller": {
-                            "mid": controller_mid,
-                            "source": controller_source,
-                        },
-                        "progress": {
-                            "current": latest.effective_count,
-                            "target": latest.total_count_limit,
-                            "remaining": 0,
-                            "reached": True,
-                        },
-                        "next_action": {
-                            "action": "none",
-                            "message": "目标已达到且会长已交还，无需继续操作。",
-                        },
-                    }
-                    print(
-                        json.dumps(payload, ensure_ascii=False, indent=2),
-                        flush=True,
+                    latest_day = _private_job_day_key(latest)
+                    current_day = _private_current_day_key()
+                    if latest_day == current_day:
+                        payload = {
+                            "ok": True,
+                            "complete": True,
+                            "mode": "private",
+                            "state": "complete",
+                            "stopped_reason": "target_already_complete",
+                            "run_day": latest_day,
+                            "job": _private_cli_job_payload(latest),
+                            "controller": {
+                                "mid": controller_mid,
+                                "source": controller_source,
+                            },
+                            "progress": {
+                                "current": latest.effective_count,
+                                "target": latest.total_count_limit,
+                                "remaining": 0,
+                                "reached": True,
+                            },
+                            "next_action": {
+                                "action": "none",
+                                "message": (
+                                    "本日目标已达到且会长已交还；下个自然日"
+                                    "重跑同一命令开始新的批次。"
+                                ),
+                            },
+                        }
+                        print(
+                            json.dumps(payload, ensure_ascii=False, indent=2),
+                            flush=True,
+                        )
+                        return 0
+                    log.info(
+                        "private totalcount batch completed on %s; starting a new "
+                        "batch for %s",
+                        latest_day or "unknown day",
+                        current_day,
                     )
-                    return 0
-                job = db.update_private_job(
-                    latest.id,
-                    status="awaiting_donors",
-                    completed_at=0,
-                )
+                else:
+                    job = db.update_private_job(
+                        latest.id,
+                        status="awaiting_donors",
+                        completed_at=0,
+                    )
             else:
+                job = None
+            if job is None:
                 job = db.create_private_job(
                     guild_id=target.guild_id,
                     gname=gname,

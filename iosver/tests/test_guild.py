@@ -2837,6 +2837,93 @@ class GuildCommandTests(unittest.TestCase):
             with AccountDB(db_path) as db:
                 self.assertEqual(len(db.list_private_jobs()), 2)
 
+    def test_private_totalcount_starts_new_daily_batch_after_previous_day(
+        self,
+    ) -> None:
+        parser = cli.build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                db.upsert_state(
+                    AccountState(
+                        mid="CONTROLLER",
+                        guest_secret="secret",
+                        game_access_token="token",
+                        next_stage=31,
+                    ),
+                    used=True,
+                    ready=True,
+                    invalid=False,
+                )
+                db.upsert_guild_target(
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    guild_id="G-ID",
+                    master_user_id="OWNER",
+                    original_master_mid="OWNER",
+                    details={"search_summary": {"join_method": 1}},
+                )
+                previous = db.create_private_job(
+                    guild_id="G-ID",
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    original_master_mid="OWNER",
+                    controller_mid="CONTROLLER",
+                    paid_count_per_account=10,
+                    total_count_limit=100,
+                )
+                db.update_private_job(
+                    previous.id,
+                    status="complete",
+                    effective_count=100,
+                    completed_at=time.time() - (2 * 24 * 60 * 60),
+                )
+
+            args = parser.parse_args(
+                [
+                    "guild",
+                    "private",
+                    "--gname",
+                    "ahhhha",
+                    "--gmname",
+                    "absdbld",
+                    "--count",
+                    "10",
+                    "--totalcount",
+                    "100",
+                    "--db",
+                    str(db_path),
+                ]
+            )
+            output = io.StringIO()
+            with (
+                patch.object(
+                    cli.PrivateGuildRunner,
+                    "run",
+                    return_value={
+                        "ok": True,
+                        "complete": False,
+                        "mode": "private",
+                        "state": "awaiting_donors",
+                        "stopped_reason": "target_not_reached",
+                    },
+                ) as run,
+                redirect_stdout(output),
+            ):
+                code = cli.cmd_guild(args)
+
+            self.assertEqual(code, 0)
+            current = run.call_args.args[0]
+            self.assertNotEqual(current.id, previous.id)
+            self.assertEqual(current.effective_count, 0)
+            self.assertEqual(current.total_count_limit, 100)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["controller"]["source"], "latest_job")
+            with AccountDB(db_path) as db:
+                jobs = db.list_private_jobs()
+                self.assertEqual(len(jobs), 2)
+                self.assertEqual(jobs[-1].status, "created")
+
     def test_private_flow_refreshes_stale_public_cache(self) -> None:
         PrivateWaitingClient.calls = []
         parser = cli.build_parser()
