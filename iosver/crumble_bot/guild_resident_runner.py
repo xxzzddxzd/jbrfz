@@ -239,14 +239,51 @@ class ResidentGuildRunner:
             guild.target_managed_count - len(active) - len(pending),
         )
         if target_vacancy <= 0:
-            return {
+            pending_approval = [
+                row for row in pending if row.status == "applied"
+            ]
+            pending_results = [
+                {
+                    "ok": True,
+                    "joined": False,
+                    "applied": row.status == "applied",
+                    "awaiting_approval": row.status == "applied",
+                    "mid": row.mid,
+                    "name": str(row.details.get("name") or ""),
+                    "slot_no": row.slot_no,
+                    "status": row.status,
+                    **(
+                        {"application_id": row.details["application_id"]}
+                        if row.details.get("application_id")
+                        else {}
+                    ),
+                }
+                for row in pending
+            ]
+            payload = {
                 "ok": True,
-                "state": "at_target",
+                "state": (
+                    "awaiting_approval"
+                    if pending_approval
+                    else "at_target"
+                ),
                 "requested": 0,
                 "joined": 0,
+                "applied": 0,
+                "pending": len(pending),
+                "pending_approval": len(pending_approval),
                 "vacancy": 0,
-                "results": [],
+                "results": pending_results,
             }
+            if pending_approval:
+                payload["next_action"] = {
+                    "action": "approve_applications",
+                    "message": (
+                        "已有常驻账号申请待审批；请在手机同意后重跑 "
+                        "guild --gname <name> fill。"
+                    ),
+                }
+            return payload
         if guild.capacity <= 0 or guild.target_managed_count <= 0:
             return {
                 "ok": False,

@@ -228,9 +228,25 @@ def _guild_human_output(payload: object) -> str:
                 else None
             )
             if active is not None:
+                pending_count = 0
+                members = status.get("members")
+                if isinstance(members, list):
+                    pending_count = sum(
+                        1
+                        for item in members
+                        if isinstance(item, dict)
+                        and item.get("member_type") == "managed"
+                        and item.get("status")
+                        in {"planned", "applied", "invited", "accepted"}
+                    )
+                remaining = max(0, int(target) - int(active) - pending_count)
+                pending_text = (
+                    f"，待审批/处理中 {pending_count}，剩余缺口 {remaining}"
+                    if pending_count
+                    else f"，缺口 {remaining}"
+                )
                 lines.append(
-                    f"常驻：{active}/{target}，"
-                    f"缺口 {max(0, int(target) - int(active))}"
+                    f"常驻：{active}/{target}{pending_text}"
                 )
 
     roster = status.get("roster")
@@ -246,11 +262,15 @@ def _guild_human_output(payload: object) -> str:
         joined = fill.get("joined", 0)
         applied = fill.get("applied", 0)
         filled = fill.get("filled", joined + applied)
+        waiting = fill.get("pending_approval", applied)
         lines.append(
-            f"补位：请求 {requested}，已入会 {joined}，待审批 {applied}，完成 {filled}"
+            f"补位：请求 {requested}，已入会 {joined}，"
+            f"待审批 {waiting}，完成 {filled}"
         )
         if fill.get("daily_recruit_remaining") is not None:
             lines.append(f"今日招募剩余：{fill['daily_recruit_remaining']}")
+        if fill.get("pending_approval"):
+            lines.append(f"当前待审批：{fill['pending_approval']} 个")
         member_names = {}
         members = status.get("members")
         if isinstance(members, list):
@@ -276,6 +296,12 @@ def _guild_human_output(payload: object) -> str:
                     state_label = "已入会"
                 elif item.get("applied"):
                     state_label = "待审批"
+                elif item.get("status") in {
+                    "planned",
+                    "invited",
+                    "accepted",
+                }:
+                    state_label = "处理中"
                 else:
                     state_label = "失败"
                 lines.append(f"  - {label}：{state_label}")
