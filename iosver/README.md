@@ -19,6 +19,10 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 完整说明：[USAGE.md](./USAGE.md)
 
+常驻公会的 `guild --gname <name> daily` 会为每个活跃成员执行完整的日常
+登录奖励（放置/阶段奖励、邮箱及广告）、一次碎屑副本，再执行签到、研究和
+支援；账号日常成功后会同步写入 `daily` 时间戳。
+
 `guild private` 是可重复执行的状态机：相同参数会继续原任务并输出当前进度、卡点和 `next_action`；未达到目标时不会提前交还会长。`--master-mid` 可省略，程序会复用已有任务的代理会长，或自动选择钻石最少的可用账号并将其固定记录到任务中。
 
 入口任选其一：

@@ -15,6 +15,7 @@ from typing import Callable, Optional, Type
 
 from .auth import AccountState
 from .constants import ENDPOINT
+from .crumble_dungeon import CrumbleDungeonRunner
 from .db import (
     DAILY_TIMEZONE,
     AccountDB,
@@ -42,6 +43,7 @@ from .guild_limits import (
     parse_guild_daily_recruitment_limit,
 )
 from .guild_runner import GuildRunner
+from .daily_runner import DailyRunner, DailyWorkflowResult
 from .social import Social, parse_get_user_social_info_response
 
 log = logging.getLogger(__name__)
@@ -565,10 +567,55 @@ class ResidentGuildRunner:
         try:
             state = self.login_account(row)
             self._persist_logged_in(row, state, note=f"resident:{guild.guild_id}")
+            session = state.to_session()
             initial = self._initial_action(guild, membership, day_key)
             attendance_already_claimed = False
+            account_daily: DailyWorkflowResult
+            crumble_dungeon: dict
+            cached_cookie_ids = tuple(
+                int(value)
+                for value in (membership.details.get("cookie_ids") or ())
+                if str(value).strip().isdigit() and int(value) > 0
+            )
             with self.client_factory(state.endpoint or ENDPOINT) as client:
-                api = Guild(client, state.to_session())
+                def persist_balance(balance: int) -> None:
+                    state.diamond_balance = max(0, int(balance))
+                    state.resource_key = session.resource_key
+                    self._persist_logged_in(row, state)
+
+                # Resident-guild daily is the account daily workflow plus the
+                # guild member workflow.  Reuse the same session so the
+                # SignUp response's live resource key and final diamond
+                # balance flow into the subsequent guild requests.
+                if row.daily and resident_day_key(row.daily) == day_key:
+                    account_daily = DailyWorkflowResult(
+                        login_completed=True,
+                        diamond_balance_final=state.diamond_balance,
+                        skipped=True,
+                    )
+                else:
+                    account_daily = DailyRunner(
+                        client,
+                        session,
+                        on_balance=persist_balance,
+                    ).run()
+                if account_daily.login_completed:
+                    crumble_dungeon = CrumbleDungeonRunner(
+                        client,
+                        session,
+                        cookie_ids=account_daily.cookie_ids or cached_cookie_ids,
+                    ).run()
+                else:
+                    crumble_dungeon = {
+                        "ok": False,
+                        "started": False,
+                        "finished": False,
+                        "skipped": True,
+                        "reason": "login_failed",
+                        "error": account_daily.error or "daily_login_failed",
+                    }
+
+                api = Guild(client, session)
                 try:
                     attendance = parse_attend_guild_response(
                         api.attend_guild(guild.guild_id).message
@@ -579,11 +626,6 @@ class ResidentGuildRunner:
                     if not self._is_already_attended(error):
                         raise
                     attendance_already_claimed = True
-
-                def persist_balance(balance: int) -> None:
-                    state.diamond_balance = max(0, int(balance))
-                    state.resource_key = api.session.resource_key
-                    self._persist_logged_in(row, state)
 
                 workflow = GuildRunner(
                     client,
@@ -609,12 +651,34 @@ class ResidentGuildRunner:
             if workflow.diamond_balance_final is not None:
                 state.diamond_balance = workflow.diamond_balance_final
             self._persist_logged_in(row, state)
+            if account_daily.ok and not account_daily.skipped:
+                # Keep the standalone ``daily`` pool in sync.  Otherwise a
+                # later top-level daily invocation would repeat the account
+                # rewards that were already handled as part of this guild run.
+                self.db.mark_daily_completed(row.mid)
             member_state = self._member_state_after(guild, initial, workflow)
             now = time.time()
-            daily_ok = bool(workflow.ok) and bool(support.get("ok", True))
-            daily_error = workflow.error or str(support.get("error") or "")
+            daily_ok = (
+                bool(account_daily.ok)
+                and bool(crumble_dungeon.get("ok", True))
+                and bool(workflow.ok)
+                and bool(support.get("ok", True))
+            )
+            daily_error = (
+                account_daily.error
+                or str(crumble_dungeon.get("error") or "")
+                or workflow.error
+                or str(support.get("error") or "")
+            )
             if not daily_ok and not daily_error:
-                daily_error = "support_failed" if not support.get("ok", True) else "workflow_failed"
+                if not account_daily.ok:
+                    daily_error = "account_daily_failed"
+                elif not crumble_dungeon.get("ok", True):
+                    daily_error = "crumble_dungeon_failed"
+                elif not support.get("ok", True):
+                    daily_error = "support_failed"
+                else:
+                    daily_error = "workflow_failed"
             level_after = workflow.guild_progress.level_after
             if level_after is not None and int(level_after) > 0:
                 self.db.update_managed_guild(
@@ -629,8 +693,14 @@ class ResidentGuildRunner:
                 last_attendance_at=now,
                 last_donate_at=now,
                 last_support_at=now if support["attempted"] else membership.last_support_at,
-                last_error=workflow.error,
+                last_error=daily_error,
                 details={
+                    **membership.details,
+                    "cookie_ids": (
+                        crumble_dungeon.get("cookie_ids")
+                        or list(account_daily.cookie_ids)
+                        or list(cached_cookie_ids)
+                    ),
                     "member_state": member_state,
                     "member_state_day": day_key,
                 },
@@ -665,6 +735,8 @@ class ResidentGuildRunner:
                 status="done" if daily_ok else "failed",
                 error=daily_error,
                 details={
+                    "account_daily": account_daily.to_dict(),
+                    "crumble_dungeon": crumble_dungeon,
                     "workflow": workflow.to_dict(),
                     "support": support,
                     "guild_run_id": run_id,
@@ -673,6 +745,8 @@ class ResidentGuildRunner:
             return {
                 "ok": daily_ok,
                 "mid": membership.mid,
+                "account_daily": account_daily.to_dict(),
+                "crumble_dungeon": crumble_dungeon,
                 "workflow": workflow.to_dict(),
                 "support": support,
                 "daily_action": action,

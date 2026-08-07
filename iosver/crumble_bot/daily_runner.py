@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Callable, Optional
 
 from .currency import DIAMOND_CURRENCY_DATA_ID, parse_signup_currency_balance
+from .crumble_dungeon import parse_signup_cookie_ids
 from .grpc_client import GrpcClient
 from .headers import Session, build_metadata
 from .mailbox import (
@@ -447,6 +448,8 @@ class DailyWorkflowResult:
     login_completed: bool = False
     diamond_balance_final: Optional[int] = None
     error: str = ""
+    skipped: bool = False
+    cookie_ids: tuple[int, ...] = field(default_factory=tuple)
     stage_rewards: DailyStageRewardProgress = field(
         default_factory=DailyStageRewardProgress
     )
@@ -454,6 +457,8 @@ class DailyWorkflowResult:
 
     @property
     def ok(self) -> bool:
+        if self.skipped:
+            return True
         return bool(
             self.login_completed
             and self.stage_rewards.ok
@@ -464,6 +469,7 @@ class DailyWorkflowResult:
 
     def to_dict(self) -> dict:
         payload = asdict(self)
+        payload["cookie_ids"] = list(self.cookie_ids)
         payload["stage_rewards"] = self.stage_rewards.to_dict()
         payload["mailbox"] = self.mailbox.to_dict()
         return {"ok": self.ok, **payload}
@@ -492,6 +498,7 @@ class DailyRunner:
         try:
             balance, signup_body = self._sync_account_state()
             result.login_completed = True
+            result.cookie_ids = parse_signup_cookie_ids(signup_body)
             result.mailbox.diamond_balance_before = balance
             stage_counters = parse_signup_stage_reward_counters(
                 signup_body,
