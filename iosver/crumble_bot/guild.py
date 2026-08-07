@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import struct
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Iterable
 
 from . import pbutil as pb
 from .grpc_client import GrpcClient, GrpcResponse
@@ -20,9 +20,11 @@ from .messages import (
     get_guild_invitations_for_user_request,
     get_guild_members_request,
     get_guild_request,
+    get_guild_support_requests_request,
     invite_user_to_guild_request,
     join_guild_request,
     leave_guild_request,
+    provide_guild_supports_request,
     search_guilds_request,
     transfer_guild_master_request,
 )
@@ -35,6 +37,12 @@ APPLY_GUILD_PATH = "/cc.public.game.GuildDiscoveryService/ApplyGuild"
 LEAVE_GUILD_PATH = "/cc.public.game.GuildMemberService/LeaveGuild"
 GET_GUILD_PATH = "/cc.public.game.GuildMemberService/GetGuild"
 GET_GUILD_MEMBERS_PATH = "/cc.public.game.GuildMemberService/GetGuildMembers"
+GET_GUILD_SUPPORT_REQUESTS_PATH = (
+    "/cc.public.game.GuildMemberService/GetGuildSupportRequests"
+)
+PROVIDE_GUILD_SUPPORTS_PATH = (
+    "/cc.public.game.GuildMemberService/ProvideGuildSupports"
+)
 CONDUCT_FREE_GUILD_LAB_RESEARCH_PATH = (
     "/cc.public.game.GuildMemberService/ConductFreeGuildLabResearch"
 )
@@ -115,6 +123,7 @@ class GuildMemberStateSnapshot:
     guild_level: int
     daily_free_research_count: int
     daily_paid_research_count: int
+    daily_support_rewarded_count: int = 0
     role: int | None = None
     guild_id: str = ""
     guild_name: str = ""
@@ -166,6 +175,51 @@ class GuildMemberSummarySnapshot:
     @property
     def role_name(self) -> str:
         return {0: "master", 1: "member"}.get(self.role, f"unknown:{self.role}")
+
+
+@dataclass(frozen=True)
+class GuildSupportRequesterSnapshot:
+    """The member identity returned with a support-center request."""
+
+    mid: str
+    name: str
+    crumble_level: int
+    profile_image_data_id: int = 0
+    profile_frame_data_id: int = 0
+    profile_title_data_id: int = 0
+    channel_id: int = 0
+
+
+@dataclass(frozen=True)
+class GuildSupportRequestSnapshot:
+    """One request currently visible in the guild support center.
+
+    ``support_type`` is ``"lab_research"`` or ``"mercenary"`` for the two
+    10101 process kinds, and ``"unknown"`` when the server adds a new kind.
+    ``research_data_id`` is populated only for lab-research requests.
+    """
+
+    support_request_id: str
+    requester: GuildSupportRequesterSnapshot | None
+    support_type: str
+    research_data_id: int | None
+    started_at_millis: int
+    duration_millis: int
+    reduced_time_millis: int
+    support_type_code: int = 0
+
+    @property
+    def requester_mid(self) -> str:
+        return self.requester.mid if self.requester is not None else ""
+
+    @property
+    def requester_name(self) -> str:
+        return self.requester.name if self.requester is not None else ""
+
+    @property
+    def kind(self) -> str:
+        """Compatibility alias for callers that use the protobuf name."""
+        return self.support_type
 
 
 @dataclass(frozen=True)
@@ -302,6 +356,111 @@ def parse_get_guild_members_response(body: bytes) -> GuildMembersSnapshot:
     )
 
 
+def parse_get_guild_support_requests_response(
+    body: bytes,
+) -> list[GuildSupportRequestSnapshot]:
+    """Parse ``GetGuildSupportRequestsResponse``.
+
+    The response contains one ``GuildSupportRequestForMember`` message per
+    pending request.  The protobuf kind is a nested oneof; it is normalized to
+    a small string and optional research id so callers do not need generated
+    protobuf classes to decide which request ids to support.
+    """
+    requests: list[GuildSupportRequestSnapshot] = []
+    for field_number, wire_type, value in pb.decode_fields(body):
+        if field_number != 1 or wire_type != 2:
+            continue
+        request_fields = pb.decode_fields(bytes(value))
+        request_id = _string_value(request_fields, 1)
+        if not request_id:
+            continue
+
+        requester = _parse_guild_support_requester(
+            _message_value(request_fields, 2)
+        )
+        support_type, support_type_code, research_data_id = (
+            _parse_guild_support_kind(_message_value(request_fields, 3))
+        )
+        requests.append(
+            GuildSupportRequestSnapshot(
+                support_request_id=request_id,
+                requester=requester,
+                support_type=support_type,
+                research_data_id=research_data_id,
+                started_at_millis=_time_millis(
+                    _message_value(request_fields, 4)
+                ),
+                duration_millis=_time_millis(
+                    _message_value(request_fields, 5)
+                ),
+                reduced_time_millis=_time_millis(
+                    _message_value(request_fields, 6)
+                ),
+                support_type_code=support_type_code,
+            )
+        )
+    return requests
+
+
+# Keep a concise parser spelling alongside the generated RPC spelling.
+parse_guild_support_requests_response = parse_get_guild_support_requests_response
+
+
+def parse_provide_guild_supports_response(body: bytes) -> GuildActionResult:
+    """Parse the progression and member state returned after supporting."""
+    return _parse_guild_action_response(
+        body,
+        progression_field=3,
+        member_state_field=4,
+    )
+
+
+def _parse_guild_support_requester(
+    body: bytes | None,
+) -> GuildSupportRequesterSnapshot | None:
+    if body is None:
+        return None
+    fields = pb.decode_fields(body)
+    mid = _string_value(fields, 1)
+    if not mid:
+        return None
+    return GuildSupportRequesterSnapshot(
+        mid=mid,
+        name=_string_value(fields, 2),
+        crumble_level=_int_value(fields, 7),
+        profile_image_data_id=_int_value(fields, 3),
+        profile_frame_data_id=_int_value(fields, 4),
+        profile_title_data_id=_int_value(fields, 5),
+        channel_id=_int_value(fields, 6),
+    )
+
+
+def _parse_guild_support_kind(
+    body: bytes | None,
+) -> tuple[str, int, int | None]:
+    """Return normalized kind, GuildSupportType code, and research id."""
+    if body is None:
+        return "unknown", 0, None
+    kind_fields = pb.decode_fields(body)
+    process_body = _message_value(kind_fields, 1)
+    if process_body is None:
+        return "unknown", 0, None
+    process_key = _message_value(pb.decode_fields(process_body), 1)
+    if process_key is None:
+        return "unknown", 0, None
+    process_key_fields = pb.decode_fields(process_key)
+    lab_research = _message_value(process_key_fields, 1)
+    if lab_research is not None:
+        return (
+            "lab_research",
+            1,
+            _int_value(pb.decode_fields(lab_research), 1),
+        )
+    if _message_value(process_key_fields, 2) is not None:
+        return "mercenary", 2, None
+    return "unknown", 0, None
+
+
 def _parse_guild_banishments(body: bytes | None) -> GuildBanishmentSnapshot:
     fields = pb.decode_fields(body) if body is not None else []
     return GuildBanishmentSnapshot(
@@ -433,6 +592,7 @@ def _parse_guild_action_response(
             guild_level=_int_value(member_fields, 7),
             daily_free_research_count=_int_value(member_fields, 10),
             daily_paid_research_count=_int_value(member_fields, 12),
+            daily_support_rewarded_count=_int_value(member_fields, 14),
             role=_optional_int_value(member_fields, 4),
             guild_id=_string_value(member_fields, 1),
             guild_name=_string_value(member_fields, 2),
@@ -593,6 +753,54 @@ class Guild:
             get_guild_members_request,
             guild_id,
         )
+
+    def get_guild_support_requests(self, guild_id: str) -> GrpcResponse:
+        """Fetch the pending requests shown in the guild support center.
+
+        Parse ``response.message`` with
+        :func:`parse_get_guild_support_requests_response` to obtain request
+        ids, requester names/MIDs, levels, and process details.
+        """
+        return self._guild_id_rpc(
+            GET_GUILD_SUPPORT_REQUESTS_PATH,
+            get_guild_support_requests_request,
+            guild_id,
+        )
+
+    def provide_guild_supports(
+        self,
+        guild_id: str,
+        support_request_ids: Iterable[str],
+    ) -> GrpcResponse:
+        """Support one or more requests from the guild support center.
+
+        ``support_request_ids`` are the ids returned by
+        :meth:`get_guild_support_requests`; the server decides the exact
+        reward and time reduction for each supported request.
+        """
+        guild_id = self._validated_string(guild_id, "guild_id")
+        if isinstance(support_request_ids, (str, bytes)):
+            raise ValueError("support_request_ids must be a sequence of strings")
+        if not isinstance(support_request_ids, Iterable):
+            raise ValueError("support_request_ids must be a sequence of strings")
+        validated_ids = tuple(
+            self._validated_string(request_id, "support_request_id")
+            for request_id in support_request_ids
+        )
+        if not validated_ids:
+            raise ValueError("support_request_ids must not be empty")
+        return self._unary(
+            PROVIDE_GUILD_SUPPORTS_PATH,
+            provide_guild_supports_request(guild_id, validated_ids),
+        )
+
+    def support_guild_supports(
+        self,
+        guild_id: str,
+        support_request_ids: Iterable[str],
+    ) -> GrpcResponse:
+        """Alias matching the generated ``SupportGuildSupportsAsync`` name."""
+        return self.provide_guild_supports(guild_id, support_request_ids)
 
     def conduct_free_guild_lab_research(self, guild_id: str) -> GrpcResponse:
         """Conduct one free guild-lab research action.

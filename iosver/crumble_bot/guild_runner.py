@@ -177,6 +177,7 @@ class GuildWorkflowResult:
     diamond_balance_final: Optional[int] = None
     left_guild: bool = False
     left_at: Optional[float] = None
+    leave_required: bool = True
     stop_reason: str = ""
     paid_stop_status: Optional[int] = None
     paid_stop_message: str = ""
@@ -189,7 +190,7 @@ class GuildWorkflowResult:
         return bool(
             self.joined
             and self.attendance_claimed
-            and self.left_guild
+            and (not self.leave_required or self.left_guild)
             and self.diamond_balance_final is not None
             and not self.error
         )
@@ -220,17 +221,29 @@ class GuildRunner:
         session: Session,
         *,
         free_research_count: int = 3,
-        paid_research_limit: int = 100,
+        paid_research_limit: Optional[int] = 100,
+        effective_research_limit: Optional[int] = None,
         total_count_limit: Optional[int] = None,
         sleep_seconds: float = 0.15,
         on_balance: Optional[Callable[[int], None]] = None,
         initial_guild_level: Optional[int] = None,
         initial_diamond_balance: Optional[int] = None,
+        leave_after: bool = True,
+        attendance_already_claimed: bool = False,
     ) -> None:
         self.client = client
         self.session = session
         self.fallback_free_research_count = max(0, int(free_research_count))
-        self.paid_research_limit = max(0, int(paid_research_limit))
+        self.paid_research_limit = (
+            None
+            if paid_research_limit is None
+            else max(0, int(paid_research_limit))
+        )
+        self.effective_research_limit = (
+            None
+            if effective_research_limit is None
+            else max(0, int(effective_research_limit))
+        )
         self.total_count_limit = (
             None
             if total_count_limit is None
@@ -248,6 +261,8 @@ class GuildRunner:
             if initial_diamond_balance is not None
             else None
         )
+        self.leave_after = bool(leave_after)
+        self.attendance_already_claimed = bool(attendance_already_claimed)
 
     def run(self, guild_id: str) -> GuildWorkflowResult:
         """Directly join a public guild, run the shared member SOP, then leave."""
@@ -281,7 +296,7 @@ class GuildRunner:
         or ``AcceptGuildInvitation`` (private), both of which expose the
         authoritative member state needed for dynamic daily limits.
         """
-        result = GuildWorkflowResult()
+        result = GuildWorkflowResult(leave_required=self.leave_after)
         if self.initial_guild_level is not None:
             result.guild_progress.level_before = self.initial_guild_level
             result.guild_progress.level_after = self.initial_guild_level
@@ -304,12 +319,16 @@ class GuildRunner:
             except Exception as error:
                 log.warning("guild detail unavailable after join: %s", error)
 
-            attendance_response = guild.attend_guild(guild_id)
-            result.guild_progress.observe_action(
-                parse_attend_guild_response(attendance_response.message)
-            )
-            result.attendance_claimed = True
-            log.info("attendance reward claimed")
+            if self.attendance_already_claimed:
+                result.attendance_claimed = True
+                log.info("attendance already handled by caller")
+            else:
+                attendance_response = guild.attend_guild(guild_id)
+                result.guild_progress.observe_action(
+                    parse_attend_guild_response(attendance_response.message)
+                )
+                result.attendance_claimed = True
+                log.info("attendance reward claimed")
 
             result.diamond_balance_before_paid = balance
             log.info("persisted diamond balance before paid research=%s", balance)
@@ -318,13 +337,23 @@ class GuildRunner:
             # can level the guild and unlock another free slot, so the allowance
             # is recalculated from every returned GuildMemberState.
             while True:
-                if self._total_count_reached(result):
-                    result.stop_reason = "total_count_reached"
+                limit_reason = self._effective_limit_stop_reason(result)
+                if limit_reason:
+                    result.stop_reason = limit_reason
                     break
 
                 free_remaining = self._free_research_remaining(result)
                 if free_remaining > 0:
-                    response = guild.conduct_free_guild_lab_research(guild_id)
+                    try:
+                        response = guild.conduct_free_guild_lab_research(guild_id)
+                    except GrpcError as error:
+                        if self._is_daily_research_limit(error):
+                            result.stop_reason = "daily_research_limit"
+                            result.paid_stop_status = error.status
+                            result.paid_stop_message = error.message
+                            result.diamond_balance_final = balance
+                            break
+                        raise
                     action = parse_free_guild_lab_research_response(response.message)
                     result.guild_progress.observe_action(action)
                     result.free_research_count += 1
@@ -344,7 +373,10 @@ class GuildRunner:
                     self._sleep()
                     continue
 
-                if result.paid_research_count >= self.paid_research_limit:
+                if (
+                    self.paid_research_limit is not None
+                    and result.paid_research_count >= self.paid_research_limit
+                ):
                     result.stop_reason = "paid_count_reached"
                     break
 
@@ -371,6 +403,12 @@ class GuildRunner:
                             "paid research exhausted usable diamonds: %s",
                             error.message,
                         )
+                        break
+                    if self._is_daily_research_limit(error):
+                        result.stop_reason = "daily_research_limit"
+                        result.paid_stop_status = error.status
+                        result.paid_stop_message = error.message
+                        result.diamond_balance_final = balance
                         break
                     raise
 
@@ -423,19 +461,21 @@ class GuildRunner:
                 result.guild_progress.observe_detail(result.guild_detail)
             except Exception as error:
                 log.warning(
-                    "final guild detail unavailable before leave: %s", error
+                    "final guild detail unavailable after guild actions: %s",
+                    error,
                 )
 
-            try:
-                guild.leave_guild(guild_id)
-                result.left_guild = True
-                result.left_at = time.time()
-                log.info("left guild")
-            except Exception as error:
-                self._append_error(
-                    result,
-                    f"leave failed: {type(error).__name__}: {error}",
-                )
+            if self.leave_after:
+                try:
+                    guild.leave_guild(guild_id)
+                    result.left_guild = True
+                    result.left_at = time.time()
+                    log.info("left guild")
+                except Exception as error:
+                    self._append_error(
+                        result,
+                        f"leave failed: {type(error).__name__}: {error}",
+                    )
 
         return result
 
@@ -447,11 +487,22 @@ class GuildRunner:
         if self.sleep_seconds > 0:
             time.sleep(self.sleep_seconds)
 
-    def _total_count_reached(self, result: GuildWorkflowResult) -> bool:
-        return bool(
+    def _effective_limit_stop_reason(
+        self,
+        result: GuildWorkflowResult,
+    ) -> str:
+        effective_count = result.effective_research_count
+        if (
             self.total_count_limit is not None
-            and result.effective_research_count >= self.total_count_limit
-        )
+            and effective_count >= self.total_count_limit
+        ):
+            return "total_count_reached"
+        if (
+            self.effective_research_limit is not None
+            and effective_count >= self.effective_research_limit
+        ):
+            return "account_count_reached"
+        return ""
 
     def _free_research_remaining(self, result: GuildWorkflowResult) -> int:
         progress = result.guild_progress
@@ -504,6 +555,27 @@ class GuildRunner:
             and "not enough resources" in message
             and str(DIAMOND_CURRENCY_DATA_ID) in message
         )
+
+    @staticmethod
+    def _is_daily_research_limit(error: GrpcError) -> bool:
+        """Recognize a server-side daily research/donation cap.
+
+        The 10101 server has returned several phrasings for this condition
+        (and does not expose a dedicated status code).  Treat only messages
+        that mention both a research/donation action and a daily/limit term as
+        a normal stop, so authentication and permission failures still fail
+        the workflow.
+        """
+        message = str(error.message or "").lower()
+        action = any(
+            token in message
+            for token in ("research", "donation", "donate", "lab")
+        )
+        limit = any(
+            token in message
+            for token in ("daily", "limit", "maximum", "max")
+        )
+        return (action and limit) or "daily limit" in message
 
     @staticmethod
     def _owned_amount(error: GrpcError) -> Optional[int]:

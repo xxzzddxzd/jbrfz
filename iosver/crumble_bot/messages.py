@@ -218,6 +218,28 @@ def get_guild_members_request(guild_id: str) -> bytes:
     return guild_id_request(guild_id)
 
 
+def get_guild_support_requests_request(guild_id: str) -> bytes:
+    """Build ``GetGuildSupportRequestsRequest`` (guild id field 1)."""
+    return guild_id_request(guild_id)
+
+
+def provide_guild_supports_request(
+    guild_id: str,
+    support_request_ids: Sequence[str],
+) -> bytes:
+    """Build ``ProvideGuildSupportsRequest``.
+
+    The generated 10101 message has ``guild_id`` in field 1 and a repeated
+    ``guild_support_request_ids`` string field in field 2.
+    """
+    return b"".join(
+        (
+            pb.encode_string_field(1, guild_id),
+            *(pb.encode_string_field(2, request_id) for request_id in support_request_ids),
+        )
+    )
+
+
 def conduct_free_guild_lab_research_request(guild_id: str) -> bytes:
     return guild_id_request(guild_id)
 

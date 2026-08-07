@@ -43,6 +43,8 @@ inv 目标 [-c N]   取未使用号登录并邀请
 daily            批量执行每日登录、邮箱领取和邮箱广告
 guild public      公开公会：直接加入后批量签到、研究、捐赠并退出
 guild private     审批公会：引导临时会长接管、邀请账号入会捐赠并退出
+guild init/status/fill/daily/maintain
+                  常驻公会：初始化、同步状态、补位、执行每日公会动作、维护
 guild private return [ID]
                   列出待交还会长任务，或按数据库 ID 交还原会长
 guild joblist     查看 SQLite 中的全部 private 任务清单
@@ -60,7 +62,39 @@ python main.py guild private return
 python main.py guild private return 1
 python main.py guild joblist
 ./main.py list --unused --ready
+
+# 常驻公会（公会容量 30，保留 2 个空位）
+python main.py guild --gname 'ahhhha' init --gmname 'absdbld' --capacity 30
+python main.py guild --gname 'ahhhha' status
+python main.py guild --gname 'ahhhha' fill
+python main.py guild --gname 'ahhhha' daily
+python main.py guild --gname 'ahhhha' maintain
 ```
+
+### 常驻公会管理
+
+常驻模式与旧的 `public/private` 临时进会流程相互独立。`init` 会搜索并缓存
+公会 ID、会长、加入方式和容量，默认把容量减去 2 作为常驻自控账号目标；
+审批制公会会自动选择一个低钻石账号作为代理会长候选，并在手机委任完成前
+返回 `next_action`。容量不能从搜索接口得到时必须在 `init` 提供 `--capacity`。
+
+```bash
+python main.py guild --gname 'ahhhha' init --gmname 'absdbld' --capacity 30
+python main.py guild --gname 'ahhhha' status
+python main.py guild --gname 'ahhhha' fill       # 只补充缺少的常驻账号
+python main.py guild --gname 'ahhhha' daily      # 签到、免费研究、钻石捐赠、支援
+python main.py guild --gname 'ahhhha' maintain   # status → fill → daily
+```
+
+- `--gname` 支持已初始化公会名称的唯一前缀；`--gmname` 只在 `init` 用于校验会长。
+- `status` 会在线同步成员名单和等级；SQLite 中保存成员 MID、名称/等级快照、角色、槽位、
+  最近签到/捐赠/支援时间以及当天动作结果。
+- `fill` 只处理缺少的常驻槽位，不退出已有成员；每天最多招募 50 个账号，并同时检查
+  实际容量，避免外部成员导致超员。审批制公会要求代理账号已由手机委任为会长。
+- `daily` 每个常驻账号每天只执行一次；重复执行会读取 `guild_daily_actions` 并跳过已完成账号。
+  公会等级升级后的免费次数、钻石余额和支援请求都会写回 SQLite。
+- `maintain` 遇到容量不足、招募 50 人上限、代理会长权限或缺少账号时不会等待，直接返回
+  `state` 与 `next_action`，按提示处理后重跑同一命令。
 
 ---
 
@@ -133,25 +167,27 @@ python main.py guild joblist --db /path/to/accounts.db
 |------|------|------|
 | `--gname` | **是** | 公会名称 |
 | `--gmname` | **是** | 会长名称，用于防止同名公会误匹配 |
-| `--count` | **是** | 每个账号最多执行的钻石捐赠次数，只限制付费次数 |
-| `--totalcount` | **是** | 跨账号累计的免费+付费有效研究次数 |
+| `--count` | **是** | 每个账号的免费+钻石有效研究次数上限，暴击按倍率累计 |
+| `--totalcount` | 否 | 跨账号累计的免费+付费有效研究次数；省略时最多处理 50 个账号 |
 | `--db` | 否 | sqlite，默认 `data/accounts.db` |
 
-SOP：登录鉴权 → 直接加入公开公会 → 领取公会签到奖励 → 动态执行当前公会等级剩余的免费研究 → 最多执行 `--count` 次钻石捐赠 → 读取公会变化 → 退出。
+SOP：登录鉴权 → 直接加入公开公会 → 领取公会签到奖励 → 优先执行当前公会等级剩余的免费研究 → 继续钻石捐赠，单账号有效次数达到 `--count` 后退出并切换账号。
 
 - 仅接受搜索结果 `join_method=immediate` 的公开公会；审批制公会会停止并提示使用 `guild private`。
 - 账号必须 `ready=1`、`next_stage>30`、`invalid=0`；`used` 不影响选择。
-- 普通研究按 1 次计入 `--totalcount`；暴击按服务端返回的实际贡献增量计，当前一次暴击按 3 次计。
+- 普通免费研究、普通钻石研究均按 1 次计入 `--count` 和 `--totalcount`；发生暴击时按服务端返回的实际贡献增量同时计入两者，当前一次暴击按 3 次计。
 - 10101 的免费研究上限由公会等级决定：1–3 级 3 次、4–6 级 4 次、7–9 级 5 次、10–11 级 6 次、12–13 级 7 次、14–15 级 8 次。
 - 每次免费或钻石研究后都读取服务端返回的公会等级和今日已用次数；若本次研究使公会升级并新增免费次数，会先把新增的免费次数用完，再继续钻石捐赠。
-- 钻石捐赠没有从 10101 客户端发现固定每日次数上限；27 是价格表最后一档而不是次数上限，第 27 次及以后均按 10000 钻石。实际钻石 RPC 次数仍只由 `--count` 限制。
+- 钻石捐赠没有从 10101 客户端发现固定每日次数上限；27 是价格表最后一档而不是次数上限，第 27 次及以后均按 10000 钻石。单账号实际钻石 RPC 次数取决于免费次数和暴击结果，不再等于 `--count`。
+- 每次研究动作完成后检查该账号有效次数；达到 `--count` 后立即退出公会并切换下一个账号。由于暴击倍率在响应后才知道，单账号最终值可能略高于 `--count`。
 - 每次动作完成后检查全局有效次数，达到 `--totalcount` 后立即停止当前账号的后续研究并退出；由于暴击结果在响应后才知道，最终值最多可能超过目标一个暴击带来的增量差。
+- 省略 `--totalcount` 时不设置跨账号有效次数目标：每个账号仍按 `--count` 执行，最多处理 50 个成功入会账号；若服务端提前拒绝入会则立即结束。
 - 单个账号钻石不足时会提前停止其付费捐赠、退出公会并继续下一个可用账号。
 - 所有账号累计达到 `--totalcount` 或可用账号全部尝试完后结束。
 - `accounts.guild` 保留为成功退出时间的兼容字段；明确的最近加入、退出时间分别保存于 `guild_joined_at`、`guild_left_at`。
 - 首次目标搜索会展示公会摘要并要求确认。
 - 确认结果写入 `guild_targets`；相同公会名和会长名后续直接复用 `guild_id`。
-- 最终 JSON 的 `count` 是每账号付费上限，`requested_totalcount` 是目标，`totalcount` 是实际累计有效次数，`account_count` 是成功完成流程的账号数。
+- 最终 JSON 的 `count` 是每账号有效次数上限，`requested_totalcount` 是目标，`totalcount` 是实际累计有效次数，`account_count` 是成功完成流程的账号数。
 - `totals.free_research_count` 与 `totals.donation_count` 是实际 RPC 动作数；`totals.effective_research_count` 包含暴击倍率；`totals.diamond_spent` 是总钻石消耗。
 - 每个账号的 `guild_progress` 记录公会等级、经验、成员贡献、研究点、免费上限/已用/剩余次数、今日钻石捐赠次数及下一次钻石价格；退出前会再次读取公会详情。
 - 顶层 `guild.level_before/after/change` 和 `experience_before/after/gained` 汇总整个批次的公会变化。
@@ -171,8 +207,8 @@ SOP：登录鉴权 → 直接加入公开公会 → 领取公会签到奖励 →
 | `--gname` | **是** | — | 公会名称 |
 | `--gmname` | **是** | — | 首次确认时的原会长名称 |
 | `--master-mid` | 否 | 自动复用/选择 | 显式指定临时接管会长并负责发送邀请的自控账号 A |
-| `--count` | **是** | — | 每个 B 最多执行的钻石捐赠次数 |
-| `--totalcount` | **是** | — | 所有 B 的免费+付费有效研究总目标 |
+| `--count` | **是** | — | 每个 B 的免费+钻石有效研究次数上限，暴击按倍率累计 |
+| `--totalcount` | 否 | — | 所有 B 的免费+付费有效研究总目标；省略时最多处理 50 个 B |
 | `--confirm` | 否 | false | 新参数与未完成任务不一致时，确认更新原任务的 `count/totalcount` 并继续 |
 | `--db` | 否 | `data/accounts.db` | sqlite |
 
@@ -181,6 +217,8 @@ SOP：登录鉴权 → 直接加入公开公会 → 领取公会签到奖励 →
 - 同一组参数对应一个固定任务；反复执行同一命令会读取原 job 和累计进度，不会从零开始。
 - 未完成任务默认不允许改变 `--count/--totalcount`；确需调整目标时，用新参数重跑并增加 `--confirm`。程序会保留既有累计进度，只更新任务参数后继续。
 - 审批公会每天最多邀请 50 个 B。命令启动时要求 `--totalcount <= --count × 50`；不满足时会在登录、搜索或更新任务前立即退出，并提示当前最大值以及达成目标所需的最小 `--count`。
+- 省略 `--totalcount` 时，private 任务以 50 个成功账号为批次上限；服务端提前返回无法继续招募时，本批次直接进入 `awaiting_master_return`，不等待次日重置。
+- `guild_private_jobs.paid_count_per_account` 是兼容旧 SQLite 保留的字段名；当前保存的是单账号有效次数上限，旧数据库无需迁移即可继续使用。
 - 省略 `--master-mid` 时，程序优先复用该公会已有 job 中的 A；没有 job 时，从满足执行条件的账号中选择钻石余额最低者，并将其 MID 固定写入 `guild_private_jobs.controller_mid`。以后重跑同一命令仍使用该账号。
 - 自动选择会排除原会长、其他进行中 private job 的代理会长和捐赠账号；候选账号须有登录凭据，并满足 `ready=1`、`invalid=0`、`next_stage>30`、当前不在公会且已结束退会冷却。
 - 若该公会存在多个进行中的 private job，省略参数无法唯一确定 A，命令会输出候选 MID 并提示显式传入 `--master-mid`。

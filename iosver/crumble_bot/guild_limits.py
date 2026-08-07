@@ -1,8 +1,16 @@
 """Guild lab limits extracted from the 10101 patch-data tables."""
 from __future__ import annotations
 
-# A private guild can recruit at most 50 donor accounts per server day.
-GUILD_PRIVATE_DAILY_INVITATION_LIMIT = 50
+import re
+
+# A guild can recruit at most 50 donor accounts per server day.
+GUILD_DAILY_RECRUITMENT_ACCOUNT_LIMIT = 50
+GUILD_PRIVATE_DAILY_INVITATION_LIMIT = GUILD_DAILY_RECRUITMENT_ACCOUNT_LIMIT
+
+_DAILY_RECRUITMENT_LIMIT_PATTERN = re.compile(
+    r"daily recruitment limit(?:\s+of)?\s*(\d+)?",
+    re.IGNORECASE,
+)
 
 # ``GuildLevels.bytes`` field 5: DailyFreeResearchCount.
 GUILD_DAILY_FREE_RESEARCH_LIMITS: dict[int, int] = {
@@ -60,6 +68,19 @@ GUILD_PAID_RESEARCH_PRICE_TIER_COUNT = len(GUILD_DAILY_PAID_RESEARCH_COSTS)
 GUILD_MAX_DAILY_FREE_RESEARCH_LIMIT = max(
     GUILD_DAILY_FREE_RESEARCH_LIMITS.values()
 )
+
+
+def parse_guild_daily_recruitment_limit(message: str) -> int | None:
+    """Return a reported guild recruitment cap, or ``None`` if unrelated.
+
+    Zero means the server reported the limit condition without including its
+    numeric value.
+    """
+    matched = _DAILY_RECRUITMENT_LIMIT_PATTERN.search(str(message or ""))
+    if matched is None:
+        return None
+    value = matched.group(1)
+    return int(value) if value else 0
 
 
 def guild_daily_free_research_limit(guild_level: int) -> int | None:

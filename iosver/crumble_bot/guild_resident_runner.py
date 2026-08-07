@@ -1,0 +1,982 @@
+"""Resident-guild management workflows.
+
+Unlike :mod:`guild_runner`, this module never leaves a managed account in the
+normal path.  It reconciles the account pool with a persistent guild roster,
+then executes the already-joined member actions once per server day.
+"""
+from __future__ import annotations
+
+import logging
+import json
+import time
+from dataclasses import asdict
+from datetime import datetime
+from typing import Callable, Optional, Type
+
+from .auth import AccountState
+from .constants import ENDPOINT
+from .db import (
+    DAILY_TIMEZONE,
+    AccountDB,
+    AccountRow,
+    GuildMembershipRow,
+    ManagedGuildRow,
+)
+from .grpc_client import GrpcClient, GrpcError
+from .guild import (
+    Guild,
+    GuildActionResult,
+    GuildMemberStateSnapshot,
+    parse_accept_guild_invitation_response,
+    parse_attend_guild_response,
+    parse_guild_detail_response,
+    parse_guild_invitations_for_user_response,
+    parse_get_guild_members_response,
+    parse_get_guild_support_requests_response,
+    parse_invite_user_to_guild_response,
+    parse_join_guild_response,
+    parse_provide_guild_supports_response,
+    parse_guild_search_response,
+)
+from .guild_limits import parse_guild_daily_recruitment_limit
+from .guild_runner import GuildRunner
+
+log = logging.getLogger(__name__)
+
+ClientFactory = Type[GrpcClient]
+LoginAccount = Callable[[AccountRow], AccountState]
+
+
+def resident_day_key(now: Optional[float] = None) -> str:
+    timestamp = time.time() if now is None else float(now)
+    return datetime.fromtimestamp(timestamp, DAILY_TIMEZONE).date().isoformat()
+
+
+class ResidentGuildRunner:
+    """Maintain one configured guild and its permanent account roster."""
+
+    def __init__(
+        self,
+        db: AccountDB,
+        login_account: LoginAccount,
+        *,
+        client_factory: ClientFactory = GrpcClient,
+        sleep_seconds: float = 0.15,
+    ) -> None:
+        self.db = db
+        self.login_account = login_account
+        self.client_factory = client_factory
+        self.sleep_seconds = max(0.0, float(sleep_seconds))
+
+    def status(self, guild: ManagedGuildRow) -> dict:
+        memberships = self.db.list_guild_memberships(guild.id)
+        managed = [
+            row
+            for row in memberships
+            if row.member_type == "managed" and row.status == "active"
+        ]
+        reserved = [row for row in memberships if row.member_type == "reserved"]
+        today = resident_day_key()
+        actions = []
+        for row in managed:
+            action = self.db.get_daily_guild_action(guild.id, today, row.mid)
+            if action is None:
+                actions.append({"mid": row.mid, "status": "pending"})
+            else:
+                action = dict(action)
+                try:
+                    action["details"] = json.loads(action.pop("details_json") or "{}")
+                except (TypeError, ValueError):
+                    action["details"] = {}
+                actions.append(action)
+        return self._status_payload(guild, memberships, managed, reserved, actions)
+
+    def sync(self, guild: ManagedGuildRow) -> dict:
+        """Refresh member identities and mutable guild summary fields."""
+        actor = self._actor_row(guild)
+        if actor is None:
+            return {
+                "ok": False,
+                "state": "no_member_actor",
+                "stopped_reason": "no_member_actor",
+                "next_action": {
+                    "action": "fill",
+                    "message": "当前没有可登录的常驻成员；先执行 fill。",
+                },
+            }
+
+        try:
+            state = self.login_account(actor)
+            with self.client_factory(state.endpoint or ENDPOINT) as client:
+                api = Guild(client, state.to_session())
+                summaries = parse_guild_search_response(
+                    api.search_guilds(guild.gname).message
+                )
+                summary = next(
+                    (item for item in summaries if item.guild_id == guild.guild_id),
+                    None,
+                )
+                member_response = api.get_guild_members(guild.guild_id)
+                members = parse_get_guild_members_response(member_response.message)
+                detail_response = api.get_guild(guild.guild_id)
+                detail = parse_guild_detail_response(detail_response.message)
+
+            self._persist_logged_in(actor, state)
+            self._reconcile_members(guild, members)
+            changes = {
+                "member_count": len(members.members),
+                "last_sync_at": time.time(),
+                "status": "active",
+                "details": {
+                    **guild.details,
+                    "search_summary": (
+                        asdict(summary)
+                        if summary is not None
+                        else guild.details.get("search_summary", {})
+                    ),
+                    "guild_detail": asdict(detail),
+                    "members": [asdict(member) for member in members.members],
+                },
+            }
+            if summary is not None:
+                changes.update(
+                    {
+                        "gname": summary.name or guild.gname,
+                        "gmname": summary.master_name or guild.gmname,
+                        "join_method": summary.join_method,
+                        "guild_level": summary.guild_level,
+                    }
+                )
+            refreshed = self.db.update_managed_guild(guild.id, **changes)
+            payload = self.status(refreshed)
+            payload.update({"ok": True, "synced": True})
+            return payload
+        except Exception as error:
+            message = f"{type(error).__name__}: {error}"
+            self.db.update_managed_guild(
+                guild.id,
+                status="degraded",
+                details={**guild.details, "last_sync_error": message},
+            )
+            return {
+                **self.status(guild),
+                "ok": False,
+                "synced": False,
+                "state": "sync_failed",
+                "stopped_reason": "sync_failed",
+                "error": message,
+            }
+
+    def fill(self, guild: ManagedGuildRow, *, max_accounts: int = 0) -> dict:
+        """Fill missing managed slots without removing existing members."""
+        memberships = self.db.list_guild_memberships(guild.id)
+        active = [
+            row
+            for row in memberships
+            if row.member_type == "managed" and row.status == "active"
+        ]
+        target_vacancy = max(0, guild.target_managed_count - len(active))
+        if target_vacancy <= 0:
+            return {
+                "ok": True,
+                "state": "at_target",
+                "requested": 0,
+                "joined": 0,
+                "vacancy": 0,
+                "results": [],
+            }
+        if guild.capacity <= 0 or guild.target_managed_count <= 0:
+            return {
+                "ok": False,
+                "state": "capacity_unknown",
+                "stopped_reason": "capacity_unknown",
+                "requested": target_vacancy,
+                "joined": 0,
+                "vacancy": target_vacancy,
+                "next_action": {
+                    "action": "init_with_capacity",
+                    "message": "无法确认公会容量，请在 init 时提供 --capacity。",
+                },
+                "results": [],
+            }
+
+        # ``member_count`` is refreshed by sync.  Cap the local target by the
+        # actual free guild slots as well, otherwise external members could
+        # make a nominal x-2 target overfill the server-side capacity.
+        local_occupied = len(
+            [row for row in memberships if row.status in {
+                "planned", "invited", "accepted", "active", "reserved"
+            }]
+        )
+        occupied = max(int(guild.member_count), local_occupied)
+        capacity_remaining = max(0, int(guild.capacity) - occupied)
+        vacancy = min(target_vacancy, capacity_remaining)
+        if vacancy <= 0:
+            return {
+                "ok": False,
+                "state": "capacity_full",
+                "stopped_reason": "capacity_full",
+                "requested": target_vacancy,
+                "joined": 0,
+                "vacancy": 0,
+                "target_vacancy": target_vacancy,
+                "capacity_remaining": capacity_remaining,
+                "next_action": {
+                    "action": "sync_or_remove_member",
+                    "message": "公会当前没有可用成员位；先同步状态或在手机移除成员。",
+                },
+                "results": [],
+            }
+
+        recruited_today = self._recruitment_count(guild)
+        recruit_remaining = max(0, guild.daily_recruit_limit - recruited_today)
+        if recruit_remaining <= 0:
+            return {
+                "ok": False,
+                "state": "daily_recruitment_limit",
+                "stopped_reason": "daily_recruitment_limit",
+                "requested": vacancy,
+                "joined": 0,
+                "vacancy": vacancy,
+                "daily_recruit_remaining": 0,
+                "next_action": {
+                    "action": "retry_after_day_reset",
+                    "message": "公会今日招募人数已达上限，明日重跑 maintain。",
+                },
+                "results": [],
+            }
+
+        controller = self._controller_row(guild)
+        if guild.join_method != 0 and controller is None:
+            return {
+                "ok": False,
+                "state": "permission_blocked",
+                "stopped_reason": "controller_not_available",
+                "requested": vacancy,
+                "joined": 0,
+                "vacancy": vacancy,
+                "next_action": {
+                    "action": "assign_controller",
+                    "message": "私有公会需要 controller_mid 账号保持会长身份。",
+                },
+                "results": [],
+            }
+        if (
+            guild.join_method != 0
+            and controller is not None
+            and not self._controller_is_master(guild, controller.mid)
+        ):
+            return {
+                "ok": False,
+                "state": "permission_blocked",
+                "stopped_reason": "controller_not_master",
+                "requested": vacancy,
+                "joined": 0,
+                "vacancy": vacancy,
+                "next_action": {
+                    "action": "transfer_master_to_controller",
+                    "message": (
+                        f"请在手机将会长委任给代理账号 {controller.mid}，"
+                        "完成后重跑 fill/maintain。"
+                    ),
+                    "controller_mid": controller.mid,
+                },
+                "results": [],
+            }
+
+        limit = vacancy if not max_accounts else min(vacancy, max(0, int(max_accounts)))
+        limit = min(limit, recruit_remaining)
+        candidates = self.db.list_resident_candidates(guild.id)
+        slots = {
+            row.slot_no
+            for row in memberships
+            if row.member_type == "managed"
+            and row.status in {"planned", "invited", "accepted", "active"}
+            and row.slot_no > 0
+        }
+        results: list[dict] = []
+        joined_so_far = 0
+        for candidate in candidates[:limit]:
+            slot = self._next_slot(slots, guild.target_managed_count)
+            if slot is None:
+                break
+            item = self._join_one(guild, candidate, controller, slot)
+            results.append(item)
+            if item.get("ok"):
+                self.db.mark_used(candidate.mid, True)
+                slots.add(slot)
+                recruited_today += 1
+                joined_so_far += 1
+                self.db.update_managed_guild(
+                    guild.id,
+                    daily_recruit_day=resident_day_key(),
+                    daily_recruit_used=recruited_today,
+                    member_count=max(
+                        int(guild.member_count),
+                        occupied + joined_so_far,
+                    ),
+                )
+            else:
+                # Recruitment is a server-side daily quota.  Stop immediately
+                # when the API reports it instead of burning the remaining
+                # candidates on identical permission failures.
+                reported_limit = parse_guild_daily_recruitment_limit(
+                    item.get("error", "")
+                )
+                if reported_limit is not None:
+                    recruited_today = guild.daily_recruit_limit
+                    self.db.update_managed_guild(
+                        guild.id,
+                        daily_recruit_day=resident_day_key(),
+                        daily_recruit_used=recruited_today,
+                    )
+                    break
+
+        joined = sum(1 for item in results if item.get("ok"))
+        recruitment_limit_hit = any(
+            parse_guild_daily_recruitment_limit(item.get("error", "")) is not None
+            for item in results
+        )
+        state = "daily_recruitment_limit" if recruitment_limit_hit else (
+            "filled" if joined else "fill_failed"
+        )
+        payload = {
+            "ok": joined == len(results) and joined > 0,
+            "state": state,
+            "requested": limit,
+            "joined": joined,
+            "vacancy_before": target_vacancy,
+            "vacancy_after": max(0, vacancy - joined),
+            "capacity_remaining_before": capacity_remaining,
+            "daily_recruit_remaining": max(
+                0, guild.daily_recruit_limit - recruited_today
+            ),
+            "results": results,
+        }
+        if recruitment_limit_hit:
+            payload["stopped_reason"] = "daily_recruitment_limit"
+            payload["next_action"] = {
+                "action": "retry_after_day_reset",
+                "message": "公会今日招募人数已达上限，明日重跑 maintain。",
+            }
+        return payload
+
+    def daily(self, guild: ManagedGuildRow) -> dict:
+        """Run attendance, research/donation, and support for active accounts."""
+        day_key = resident_day_key()
+        memberships = self.db.list_guild_memberships(
+            guild.id,
+            member_type="managed",
+            status="active",
+        )
+        results: list[dict] = []
+        for membership in memberships:
+            existing = self.db.get_daily_guild_action(guild.id, day_key, membership.mid)
+            if existing is not None and existing.get("status") == "done":
+                results.append(
+                    {
+                        "ok": True,
+                        "mid": membership.mid,
+                        "skipped": True,
+                        "reason": "already_completed_today",
+                        "daily_action": existing,
+                    }
+                )
+                continue
+            results.append(self._daily_one(guild, membership, day_key))
+        completed = sum(1 for item in results if item.get("ok"))
+        failed = len(results) - completed
+        self.db.update_managed_guild(
+            guild.id,
+            last_daily_day=day_key,
+            status="active" if failed == 0 else "degraded",
+        )
+        return {
+            "ok": failed == 0,
+            "day": day_key,
+            "count": completed,
+            "attempted": len(results),
+            "failed": failed,
+            "results": results,
+        }
+
+    def maintain(self, guild: ManagedGuildRow) -> dict:
+        """Reconcile, fill vacancies, reconcile again, then run daily actions."""
+        before = self.status(guild)
+        sync_before = self.sync(guild)
+        current = self.db.get_managed_guild(guild.guild_id) or guild
+        fill = self.fill(current)
+        current = self.db.get_managed_guild(guild.guild_id) or current
+        sync_after = self.sync(current)
+        current = self.db.get_managed_guild(guild.guild_id) or current
+        daily = self.daily(current)
+        return {
+            "ok": bool(daily.get("ok")) and bool(fill.get("ok", True)),
+            "mode": "resident",
+            "before": before,
+            "sync_before": sync_before,
+            "fill": fill,
+            "sync_after": sync_after,
+            "daily": daily,
+            "status": self.status(current),
+        }
+
+    def _join_one(
+        self,
+        guild: ManagedGuildRow,
+        row: AccountRow,
+        controller: Optional[AccountRow],
+        slot: int,
+    ) -> dict:
+        mid = row.mid
+        try:
+            state = self.login_account(row)
+            self._persist_logged_in(row, state, note=f"resident:{guild.guild_id}")
+            if guild.join_method == 0:
+                with self.client_factory(state.endpoint or ENDPOINT) as client:
+                    response = Guild(client, state.to_session()).join_guild(
+                        guild.guild_id
+                    )
+                    action = parse_join_guild_response(response.message)
+            else:
+                if controller is None:
+                    raise RuntimeError("controller account is unavailable")
+                controller_state = self.login_account(controller)
+                self._persist_logged_in(
+                    controller, controller_state, note=f"controller:{guild.guild_id}"
+                )
+                with self.client_factory(
+                    controller_state.endpoint or ENDPOINT
+                ) as client:
+                    invite_response = Guild(
+                        client, controller_state.to_session()
+                    ).invite_user_to_guild(guild.guild_id, mid)
+                    invitation_id = parse_invite_user_to_guild_response(
+                        invite_response.message
+                    )
+                with self.client_factory(state.endpoint or ENDPOINT) as client:
+                    api = Guild(client, state.to_session())
+                    invitations = parse_guild_invitations_for_user_response(
+                        api.get_guild_invitations_for_user().message
+                    )
+                    invitation = next(
+                        (
+                            item
+                            for item in invitations
+                            if item.invitation_id == invitation_id
+                            or item.guild.guild_id == guild.guild_id
+                        ),
+                        None,
+                    )
+                    if invitation is None:
+                        raise RuntimeError(
+                            "邀请已发送，但账号尚未看到对应邀请；请重跑 fill"
+                        )
+                    action = parse_accept_guild_invitation_response(
+                        api.accept_guild_invitation(
+                            guild.guild_id, invitation.invitation_id
+                        ).message
+                    )
+            if action.member_state is None:
+                raise RuntimeError("join response missing member_state")
+            joined_at = time.time()
+            self.db.mark_guild_joined(mid, guild.guild_id, joined_at=joined_at)
+            self.db.upsert_guild_membership(
+                guild.id,
+                mid,
+                slot_no=slot,
+                member_type="managed",
+                status="active",
+                role=int(action.member_state.role or 1),
+                joined_at=joined_at,
+                last_seen_at=joined_at,
+                details={"member_state": asdict(action.member_state)},
+            )
+            return {
+                "ok": True,
+                "mid": mid,
+                "slot_no": slot,
+                "joined_at": joined_at,
+                "member_state": asdict(action.member_state),
+            }
+        except Exception as error:
+            message = f"{type(error).__name__}: {error}"
+            self.db.upsert_guild_membership(
+                guild.id,
+                mid,
+                # Failed candidates must not reserve a physical slot; the
+                # next fill attempt should be able to retry that slot.
+                slot_no=0,
+                member_type="managed",
+                status="error",
+                last_error=message,
+            )
+            return {"ok": False, "mid": mid, "slot_no": slot, "error": message}
+
+    def _daily_one(
+        self,
+        guild: ManagedGuildRow,
+        membership: GuildMembershipRow,
+        day_key: str,
+    ) -> dict:
+        row = self.db.get(membership.mid)
+        if row is None:
+            message = "account_not_found"
+            self.db.update_guild_membership(
+                guild.id, membership.mid, status="error", last_error=message
+            )
+            self.db.upsert_daily_guild_action(
+                guild.id, day_key, membership.mid, status="failed", error=message
+            )
+            return {"ok": False, "mid": membership.mid, "error": message}
+
+        try:
+            state = self.login_account(row)
+            self._persist_logged_in(row, state, note=f"resident:{guild.guild_id}")
+            initial = self._initial_action(guild, membership, day_key)
+            attendance_already_claimed = False
+            with self.client_factory(state.endpoint or ENDPOINT) as client:
+                api = Guild(client, state.to_session())
+                try:
+                    attendance = parse_attend_guild_response(
+                        api.attend_guild(guild.guild_id).message
+                    )
+                    initial = attendance
+                    attendance_already_claimed = True
+                except GrpcError as error:
+                    if not self._is_already_attended(error):
+                        raise
+                    attendance_already_claimed = True
+
+                def persist_balance(balance: int) -> None:
+                    state.diamond_balance = max(0, int(balance))
+                    state.resource_key = api.session.resource_key
+                    self._persist_logged_in(row, state)
+
+                workflow = GuildRunner(
+                    client,
+                    api.session,
+                    paid_research_limit=None,
+                    initial_guild_level=guild.guild_level,
+                    initial_diamond_balance=state.diamond_balance,
+                    on_balance=persist_balance,
+                    leave_after=False,
+                    attendance_already_claimed=attendance_already_claimed,
+                    sleep_seconds=self.sleep_seconds,
+                ).run_joined(
+                    guild.guild_id,
+                    initial_action=initial,
+                    joined_at=membership.joined_at or time.time(),
+                )
+                support = self._support_one(
+                    guild, membership.mid, api, day_key
+                )
+
+            state.resource_key = api.session.resource_key
+            if workflow.diamond_balance_final is not None:
+                state.diamond_balance = workflow.diamond_balance_final
+            self._persist_logged_in(row, state)
+            member_state = self._member_state_after(guild, initial, workflow)
+            now = time.time()
+            daily_ok = bool(workflow.ok) and bool(support.get("ok", True))
+            daily_error = workflow.error or str(support.get("error") or "")
+            if not daily_ok and not daily_error:
+                daily_error = "support_failed" if not support.get("ok", True) else "workflow_failed"
+            level_after = workflow.guild_progress.level_after
+            if level_after is not None and int(level_after) > 0:
+                self.db.update_managed_guild(
+                    guild.id,
+                    guild_level=max(int(guild.guild_level), int(level_after)),
+                )
+            self.db.update_guild_membership(
+                guild.id,
+                membership.mid,
+                status="active",
+                last_seen_at=now,
+                last_attendance_at=now,
+                last_donate_at=now,
+                last_support_at=now if support["attempted"] else membership.last_support_at,
+                last_error=workflow.error,
+                details={
+                    "member_state": member_state,
+                    "member_state_day": day_key,
+                },
+            )
+            run_id = self.db.record_guild_run(
+                membership.mid,
+                guild_id=guild.guild_id,
+                joined_at=membership.joined_at or now,
+                left_at=None,
+                free_research_count=workflow.free_research_count,
+                paid_research_count=workflow.paid_research_count,
+                free_effective_count=workflow.free_effective_count,
+                paid_effective_count=workflow.paid_effective_count,
+                free_super_success_count=workflow.free_super_success_count,
+                paid_super_success_count=workflow.paid_super_success_count,
+                diamond_spent=workflow.diamond_spent,
+                stop_reason=workflow.stop_reason,
+                ok=daily_ok,
+                error=daily_error,
+            )
+            action = self.db.upsert_daily_guild_action(
+                guild.id,
+                day_key,
+                membership.mid,
+                attendance_status="success",
+                attendance_at=now,
+                free_research_count=workflow.free_research_count,
+                paid_research_count=workflow.paid_research_count,
+                effective_research_count=workflow.effective_research_count,
+                support_count=support["count"],
+                diamond_spent=workflow.diamond_spent,
+                status="done" if daily_ok else "failed",
+                error=daily_error,
+                details={
+                    "workflow": workflow.to_dict(),
+                    "support": support,
+                    "guild_run_id": run_id,
+                },
+            )
+            return {
+                "ok": daily_ok,
+                "mid": membership.mid,
+                "workflow": workflow.to_dict(),
+                "support": support,
+                "daily_action": action,
+            }
+        except Exception as error:
+            message = f"{type(error).__name__}: {error}"
+            self.db.update_guild_membership(
+                guild.id,
+                membership.mid,
+                status="error",
+                last_error=message,
+            )
+            self.db.upsert_daily_guild_action(
+                guild.id,
+                day_key,
+                membership.mid,
+                status="failed",
+                error=message,
+            )
+            return {"ok": False, "mid": membership.mid, "error": message}
+
+    def _support_one(
+        self,
+        guild: ManagedGuildRow,
+        supporter_mid: str,
+        api: Guild,
+        day_key: str,
+    ) -> dict:
+        try:
+            requests = parse_get_guild_support_requests_response(
+                api.get_guild_support_requests(guild.guild_id).message
+            )
+        except Exception as error:
+            return {
+                "ok": False,
+                "attempted": 0,
+                "count": 0,
+                "requests": [],
+                "error": f"{type(error).__name__}: {error}",
+            }
+        done_ids = self.db.list_guild_support_action_ids(
+            guild.id, day_key, supporter_mid
+        )
+        candidates = [
+            request
+            for request in requests
+            if request.support_request_id not in done_ids
+            and request.requester_mid != supporter_mid
+        ]
+        results: list[dict] = []
+        for request in candidates:
+            try:
+                response = api.provide_guild_supports(
+                    guild.guild_id, [request.support_request_id]
+                )
+                parsed = parse_provide_guild_supports_response(response.message)
+                self.db.upsert_guild_support_action(
+                    guild.id,
+                    day_key,
+                    supporter_mid,
+                    request.support_request_id,
+                    requester_mid=request.requester_mid,
+                    support_type=request.support_type,
+                    status="success",
+                    reduced_time_millis=request.reduced_time_millis,
+                    response={"action": asdict(parsed)},
+                )
+                results.append(
+                    {"ok": True, "request_id": request.support_request_id}
+                )
+            except Exception as error:
+                message = f"{type(error).__name__}: {error}"
+                self.db.upsert_guild_support_action(
+                    guild.id,
+                    day_key,
+                    supporter_mid,
+                    request.support_request_id,
+                    requester_mid=request.requester_mid,
+                    support_type=request.support_type,
+                    status="failed",
+                    error=message,
+                )
+                results.append(
+                    {
+                        "ok": False,
+                        "request_id": request.support_request_id,
+                        "error": message,
+                    }
+                )
+                if self._is_support_limit_error(error):
+                    break
+        count = sum(1 for item in results if item.get("ok"))
+        return {
+            "ok": all(item.get("ok") for item in results),
+            "attempted": len(results),
+            "count": count,
+            "available": len(requests),
+            "requests": results,
+        }
+
+    def _reconcile_members(self, guild: ManagedGuildRow, snapshot) -> None:
+        live_ids = {member.mid for member in snapshot.members}
+        existing = {row.mid: row for row in self.db.list_guild_memberships(guild.id)}
+        now = time.time()
+        for member in snapshot.members:
+            current = existing.get(member.mid)
+            if current is None:
+                self.db.upsert_guild_membership(
+                    guild.id,
+                    member.mid,
+                    member_type="external",
+                    status="active",
+                    role=member.role,
+                    last_seen_at=now,
+                    details={"member": asdict(member)},
+                )
+            else:
+                self.db.update_guild_membership(
+                    guild.id,
+                    member.mid,
+                    status="active",
+                    role=member.role,
+                    last_seen_at=now,
+                    details={**current.details, "member": asdict(member)},
+                )
+        for member in existing.values():
+            if member.member_type == "managed" and member.mid not in live_ids:
+                account = self.db.get(member.mid)
+                if account is not None and account.guild_joined_at > account.guild_left_at:
+                    # A manual kick/leave is still subject to the same
+                    # server cooldown as the transient workflows.
+                    self.db.mark_guild_left(member.mid, left_at=now)
+                self.db.update_guild_membership(
+                    guild.id,
+                    member.mid,
+                    status="missing",
+                    left_at=now,
+                    last_error="member_not_in_live_guild",
+                )
+
+    def _actor_row(self, guild: ManagedGuildRow) -> Optional[AccountRow]:
+        mids = []
+        if guild.controller_mid:
+            mids.append(guild.controller_mid)
+        mids.extend(
+            row.mid
+            for row in self.db.list_guild_memberships(guild.id, status="active")
+            if row.mid not in mids
+        )
+        for mid in mids:
+            row = self.db.get(mid)
+            if row is not None and row.guest_secret:
+                return row
+        return None
+
+    def _controller_row(self, guild: ManagedGuildRow) -> Optional[AccountRow]:
+        if not guild.controller_mid:
+            return None
+        row = self.db.get(guild.controller_mid)
+        return row if row is not None and row.guest_secret else None
+
+    @staticmethod
+    def _controller_is_master(guild: ManagedGuildRow, controller_mid: str) -> bool:
+        summary = guild.details.get("search_summary")
+        if not isinstance(summary, dict):
+            # Rows created by an older database may not have a cached search
+            # summary yet.  Let the API permission response drive the next
+            # action instead of making an unverifiable local assumption.
+            return True
+        master_mid = str(summary.get("master_user_id") or "").strip().upper()
+        return not master_mid or master_mid == str(controller_mid).strip().upper()
+
+    def _persist_logged_in(
+        self,
+        row: AccountRow,
+        state: AccountState,
+        *,
+        note: Optional[str] = None,
+    ) -> None:
+        db_note = row.note if note is None else note
+        self.db.upsert_state(
+            state,
+            used=row.used,
+            ready=row.ready,
+            invalid=row.invalid,
+            note=db_note,
+        )
+
+    def _recruitment_count(self, guild: ManagedGuildRow) -> int:
+        today = resident_day_key()
+        if guild.daily_recruit_day != today:
+            self.db.update_managed_guild(
+                guild.id, daily_recruit_day=today, daily_recruit_used=0
+            )
+            return 0
+        return guild.daily_recruit_used
+
+    @staticmethod
+    def _next_slot(occupied: set[int], limit: int) -> Optional[int]:
+        for slot in range(1, max(0, int(limit)) + 1):
+            if slot not in occupied:
+                return slot
+        return None
+
+    @staticmethod
+    def _status_payload(
+        guild: ManagedGuildRow,
+        memberships: list[GuildMembershipRow],
+        managed: list[GuildMembershipRow],
+        reserved: list[GuildMembershipRow],
+        actions: list[dict],
+    ) -> dict:
+        return {
+            "mode": "resident",
+            "guild": {
+                "id": guild.id,
+                "guild_id": guild.guild_id,
+                "name": guild.gname,
+                "master_name": guild.gmname,
+                "join_method": guild.join_method,
+                "status": guild.status,
+                "level": guild.guild_level,
+                "capacity": guild.capacity,
+                "reserve_slots": guild.reserve_slots,
+                "target_managed_count": guild.target_managed_count,
+                "member_count": guild.member_count,
+                "controller_mid": guild.controller_mid,
+                "original_master_mid": guild.original_master_mid,
+            },
+            "roster": {
+                "managed_active": len(managed),
+                "managed_target": guild.target_managed_count,
+                "vacancy": max(0, guild.target_managed_count - len(managed)),
+                "reserved": len(reserved),
+                "all_local_rows": len(memberships),
+            },
+            "recruitment": {
+                "day": guild.daily_recruit_day,
+                "used": guild.daily_recruit_used,
+                "limit": guild.daily_recruit_limit,
+                "remaining": max(
+                    0, guild.daily_recruit_limit - guild.daily_recruit_used
+                ),
+            },
+            "daily": actions,
+            "members": [
+                {
+                    "mid": row.mid,
+                    "slot_no": row.slot_no,
+                    "member_type": row.member_type,
+                    "status": row.status,
+                    "role": row.role,
+                    "joined_at": row.joined_at,
+                    "last_seen_at": row.last_seen_at,
+                    "last_error": row.last_error,
+                    **{
+                        key: member.get(key)
+                        for key in (
+                            "name",
+                            "crumble_level",
+                            "total_combat_power",
+                            "contribution_point",
+                            "joined_at_millis",
+                            "last_accessed_at_millis",
+                        )
+                        if (member := row.details.get("member"))
+                        and key in member
+                    },
+                    "details": row.details,
+                }
+                for row in memberships
+            ],
+        }
+
+    @staticmethod
+    def _initial_action(
+        guild: ManagedGuildRow,
+        membership: GuildMembershipRow,
+        day_key: str,
+    ) -> GuildActionResult:
+        saved = dict(membership.details.get("member_state") or {})
+        previous_day = str(
+            membership.details.get("member_state_day") or ""
+        )
+        if previous_day != day_key:
+            saved["daily_free_research_count"] = 0
+            saved["daily_paid_research_count"] = 0
+            saved["daily_support_rewarded_count"] = 0
+        state = GuildMemberStateSnapshot(
+            guild_level=int(saved.get("guild_level") or guild.guild_level or 1),
+            daily_free_research_count=int(
+                saved.get("daily_free_research_count") or 0
+            ),
+            daily_paid_research_count=int(
+                saved.get("daily_paid_research_count") or 0
+            ),
+            daily_support_rewarded_count=int(
+                saved.get("daily_support_rewarded_count") or 0
+            ),
+            role=saved.get("role"),
+            guild_id=saved.get("guild_id") or guild.guild_id,
+            guild_name=saved.get("guild_name") or guild.gname,
+        )
+        return GuildActionResult(member_state=state)
+
+    @staticmethod
+    def _member_state_after(
+        guild: ManagedGuildRow,
+        initial: GuildActionResult,
+        workflow,
+    ) -> dict:
+        state = asdict(initial.member_state) if initial.member_state else {}
+        progress = workflow.guild_progress
+        if progress.level_after is not None:
+            state["guild_level"] = progress.level_after
+        if progress.daily_free_research_count_after is not None:
+            state["daily_free_research_count"] = (
+                progress.daily_free_research_count_after
+            )
+        if progress.daily_donation_count_after is not None:
+            state["daily_paid_research_count"] = progress.daily_donation_count_after
+        state.setdefault("guild_id", guild.guild_id)
+        state.setdefault("guild_name", guild.gname)
+        state.setdefault("guild_level", guild.guild_level)
+        return state
+
+    @staticmethod
+    def _is_already_attended(error: GrpcError) -> bool:
+        text = f"{error.message}".lower()
+        return any(
+            token in text
+            for token in ("already attended", "already claimed", "already received")
+        )
+
+    @staticmethod
+    def _is_support_limit_error(error: Exception) -> bool:
+        text = str(error).lower()
+        return "support" in text and any(
+            token in text for token in ("limit", "not enough", "daily")
+        )

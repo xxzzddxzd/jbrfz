@@ -1250,12 +1250,40 @@ class GuildRunnerTests(unittest.TestCase):
         self.assertEqual(result.stop_reason, "total_count_reached")
         self.assertNotIn(CONDUCT_PAID_GUILD_LAB_RESEARCH_PATH, client.calls)
 
-    def test_guild_level_up_unlocks_and_consumes_new_free_research(self) -> None:
+    def test_account_count_uses_free_and_critical_paid_effective_count(
+        self,
+    ) -> None:
+        client = FakeWorkflowClient()
+        runner = GuildRunner(
+            client,
+            AccountState(mid="MID", game_access_token="token").to_session(),
+            paid_research_limit=None,
+            effective_research_limit=6,
+            sleep_seconds=0,
+            initial_diamond_balance=900,
+        )
+
+        result = runner.run("G-ID")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.free_research_count, 3)
+        self.assertEqual(result.free_effective_count, 5)
+        self.assertEqual(result.paid_research_count, 1)
+        self.assertEqual(result.paid_effective_count, 3)
+        self.assertEqual(result.effective_research_count, 8)
+        self.assertEqual(result.stop_reason, "account_count_reached")
+        self.assertEqual(
+            client.calls.count(CONDUCT_PAID_GUILD_LAB_RESEARCH_PATH),
+            1,
+        )
+
+    def test_account_count_includes_normal_paid_and_new_free_research(self) -> None:
         client = DynamicGuildLevelClient()
         runner = GuildRunner(
             client,
             AccountState(mid="MID", game_access_token="token").to_session(),
-            paid_research_limit=1,
+            paid_research_limit=None,
+            effective_research_limit=5,
             sleep_seconds=0,
             initial_diamond_balance=100,
         )
@@ -1264,8 +1292,11 @@ class GuildRunnerTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertEqual(result.free_research_count, 4)
+        self.assertEqual(result.free_effective_count, 4)
         self.assertEqual(result.paid_research_count, 1)
-        self.assertEqual(result.stop_reason, "paid_count_reached")
+        self.assertEqual(result.paid_effective_count, 1)
+        self.assertEqual(result.effective_research_count, 5)
+        self.assertEqual(result.stop_reason, "account_count_reached")
         self.assertEqual(result.guild_progress.level_before, 3)
         self.assertEqual(result.guild_progress.level_after, 4)
         self.assertEqual(
@@ -1309,11 +1340,13 @@ class FakeRunner:
         *,
         on_balance=None,
         paid_research_limit=100,
+        effective_research_limit=None,
         total_count_limit=None,
         **kwargs,
     ) -> None:
         self.on_balance = on_balance
         self.paid_research_limit = paid_research_limit
+        self.effective_research_limit = effective_research_limit
         self.total_count_limit = total_count_limit
 
     def sync_diamond_balance(self) -> int:
@@ -1322,14 +1355,22 @@ class FakeRunner:
         return 600
 
     def run(self, guild_id: str) -> GuildWorkflowResult:
-        effective_limit = (
-            1_000_000
-            if self.total_count_limit is None
-            else self.total_count_limit
-        )
+        limits = [
+            value
+            for value in (
+                self.effective_research_limit,
+                self.total_count_limit,
+            )
+            if value is not None
+        ]
+        effective_limit = min(limits, default=1_000_000)
         free_count = min(3, effective_limit)
         paid_count = min(
-            self.paid_research_limit,
+            (
+                1_000_000
+                if self.paid_research_limit is None
+                else self.paid_research_limit
+            ),
             max(0, effective_limit - free_count),
         )
         effective_count = free_count + paid_count
@@ -1353,8 +1394,14 @@ class FakeRunner:
             left_at=now,
             stop_reason=(
                 "total_count_reached"
-                if effective_count >= effective_limit
-                else "paid_count_reached"
+                if self.total_count_limit is not None
+                and effective_count >= self.total_count_limit
+                else (
+                    "account_count_reached"
+                    if self.effective_research_limit is not None
+                    and effective_count >= self.effective_research_limit
+                    else "paid_count_reached"
+                )
             ),
             guild_progress=GuildProgress(
                 level_before=1,
@@ -1369,6 +1416,16 @@ class FakeRunner:
                 daily_free_research_count_after=free_count,
                 daily_donation_count_before=0,
                 daily_donation_count_after=paid_count,
+            ),
+        )
+
+
+class FakeRecruitmentLimitRunner(FakeRunner):
+    def run(self, guild_id: str) -> GuildWorkflowResult:
+        return GuildWorkflowResult(
+            error=(
+                "GrpcError: grpc-status=9 message='Guild has reached the "
+                "daily recruitment limit of 51.'"
             ),
         )
 
@@ -1583,7 +1640,7 @@ class GuildCommandTests(unittest.TestCase):
         self.assertEqual(args.totalcount, 200)
         self.assertEqual(args.guild_action, "public")
 
-        incomplete = parser.parse_args(
+        without_totalcount = parser.parse_args(
             [
                 "guild",
                 "public",
@@ -1595,8 +1652,21 @@ class GuildCommandTests(unittest.TestCase):
                 "20",
             ]
         )
-        with self.assertRaises(SystemExit):
-            cli.cmd_guild(incomplete)
+        self.assertIsNone(without_totalcount.totalcount)
+
+        private_without_totalcount = parser.parse_args(
+            [
+                "guild",
+                "private",
+                "--gname",
+                "ahhhha",
+                "--gmname",
+                "absdbld",
+                "--count",
+                "20",
+            ]
+        )
+        self.assertIsNone(private_without_totalcount.totalcount)
 
         with redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
@@ -1815,7 +1885,7 @@ class GuildCommandTests(unittest.TestCase):
                     "--master-mid",
                     "CONTROLLER",
                     "--count",
-                    "1",
+                    "6",
                     "--totalcount",
                     "6",
                     "--db",
@@ -1842,6 +1912,12 @@ class GuildCommandTests(unittest.TestCase):
                 "OWNER",
             )
             self.assertEqual(payload["accounts_attempted"], 1)
+            self.assertEqual(payload["count"], 6)
+            self.assertEqual(payload["totalcount"], 8)
+            self.assertEqual(
+                payload["results"][0]["effective_research_count"],
+                8,
+            )
             self.assertNotIn(
                 TRANSFER_GUILD_MASTER_PATH,
                 [path for _, path in PrivateScenarioClient.calls],
@@ -1961,7 +2037,7 @@ class GuildCommandTests(unittest.TestCase):
                     "--master-mid",
                     "CONTROLLER",
                     "--count",
-                    "1",
+                    "8",
                     "--totalcount",
                     "9",
                     "--db",
@@ -2141,6 +2217,168 @@ class GuildCommandTests(unittest.TestCase):
                 account = db.get("DONOR-A")
                 self.assertEqual(account.guild_joined_at, 0)
                 self.assertEqual(account.guild_left_at, 0)
+
+    def test_private_without_totalcount_finishes_when_recruitment_is_blocked(
+        self,
+    ) -> None:
+        PrivateRecruitmentLimitClient.calls = []
+        PrivateRecruitmentLimitClient.master_mid = "CONTROLLER"
+        parser = cli.build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                for mid in ("CONTROLLER", "DONOR"):
+                    db.upsert_state(
+                        AccountState(
+                            mid=mid,
+                            guest_secret="secret",
+                            game_access_token="token",
+                            next_stage=31,
+                            diamond_balance=900,
+                        ),
+                        used=True,
+                        ready=True,
+                        invalid=False,
+                    )
+                db.upsert_guild_target(
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    guild_id="G-ID",
+                    guild_level=1,
+                    member_count=2,
+                    master_user_id="OWNER",
+                    original_master_mid="OWNER",
+                    details={"search_summary": {"join_method": 1}},
+                )
+
+            args = parser.parse_args(
+                [
+                    "guild",
+                    "private",
+                    "--gname",
+                    "ahhhha",
+                    "--gmname",
+                    "absdbld",
+                    "--master-mid",
+                    "CONTROLLER",
+                    "--count",
+                    "10",
+                    "--db",
+                    str(db_path),
+                ]
+            )
+            output = io.StringIO()
+            with (
+                patch.object(cli, "GrpcClient", PrivateRecruitmentLimitClient),
+                patch.object(
+                    cli, "_login_account", side_effect=lambda row: row.to_state()
+                ),
+                redirect_stdout(output),
+            ):
+                code = cli.cmd_guild(args)
+
+            self.assertEqual(code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["state"], "awaiting_master_return")
+            self.assertIsNone(payload["requested_totalcount"])
+            self.assertIsNone(payload["remaining_totalcount"])
+            self.assertFalse(payload["totalcount_reached"])
+            self.assertEqual(payload["account_limit"], 50)
+            self.assertEqual(payload["account_count"], 0)
+            self.assertFalse(payload["account_limit_reached"])
+            self.assertEqual(
+                payload["stopped_reason"],
+                "daily_recruitment_limit_reached",
+            )
+            self.assertEqual(payload["next_action"]["action"], "return_master")
+            with AccountDB(db_path) as db:
+                job = db.get_active_private_job("G-ID", "CONTROLLER")
+                self.assertEqual(job.status, "awaiting_master_return")
+                self.assertEqual(job.total_count_limit, 0)
+
+    def test_private_without_totalcount_finishes_after_fifty_accounts(self) -> None:
+        PrivateScenarioClient.calls = []
+        PrivateScenarioClient.master_mid = "CONTROLLER"
+        parser = cli.build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                db.upsert_state(
+                    AccountState(
+                        mid="CONTROLLER",
+                        guest_secret="secret",
+                        game_access_token="token",
+                        next_stage=31,
+                    ),
+                    used=True,
+                    ready=True,
+                    invalid=False,
+                )
+                db.upsert_guild_target(
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    guild_id="G-ID",
+                    guild_level=1,
+                    member_count=2,
+                    master_user_id="OWNER",
+                    original_master_mid="OWNER",
+                    details={"search_summary": {"join_method": 1}},
+                )
+                job = db.create_private_job(
+                    guild_id="G-ID",
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    original_master_mid="OWNER",
+                    controller_mid="CONTROLLER",
+                    paid_count_per_account=10,
+                    total_count_limit=0,
+                )
+                db.update_private_job(job.id, status="running")
+                for index in range(50):
+                    db.update_private_account(
+                        job.id,
+                        f"DONOR-{index:02d}",
+                        state="complete",
+                    )
+
+            args = parser.parse_args(
+                [
+                    "guild",
+                    "private",
+                    "--gname",
+                    "ahhhha",
+                    "--gmname",
+                    "absdbld",
+                    "--master-mid",
+                    "CONTROLLER",
+                    "--count",
+                    "10",
+                    "--db",
+                    str(db_path),
+                ]
+            )
+            output = io.StringIO()
+            with (
+                patch.object(cli, "GrpcClient", PrivateScenarioClient),
+                patch.object(
+                    cli, "_login_account", side_effect=lambda row: row.to_state()
+                ),
+                redirect_stdout(output),
+            ):
+                code = cli.cmd_guild(args)
+
+            self.assertEqual(code, 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["state"], "awaiting_master_return")
+            self.assertIsNone(payload["progress"]["target"])
+            self.assertEqual(payload["progress"]["account_count"], 50)
+            self.assertEqual(payload["progress"]["account_limit"], 50)
+            self.assertTrue(payload["progress"]["account_limit_reached"])
+            self.assertEqual(payload["next_action"]["action"], "return_master")
+            with AccountDB(db_path) as db:
+                saved = db.get_private_job(job.id)
+                self.assertEqual(saved.status, "awaiting_master_return")
 
     def test_private_return_lists_pending_jobs_by_database_id(self) -> None:
         parser = cli.build_parser()
@@ -2494,6 +2732,84 @@ class GuildCommandTests(unittest.TestCase):
                 self.assertEqual(saved.paid_count_per_account, 40)
                 self.assertEqual(saved.total_count_limit, 2000)
 
+    def test_private_without_totalcount_starts_new_batch_after_completion(
+        self,
+    ) -> None:
+        parser = cli.build_parser()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                db.upsert_state(
+                    AccountState(
+                        mid="CONTROLLER",
+                        guest_secret="secret",
+                        game_access_token="token",
+                        next_stage=31,
+                    ),
+                    used=True,
+                    ready=True,
+                    invalid=False,
+                )
+                db.upsert_guild_target(
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    guild_id="G-ID",
+                    master_user_id="OWNER",
+                    original_master_mid="OWNER",
+                    details={"search_summary": {"join_method": 1}},
+                )
+                previous = db.create_private_job(
+                    guild_id="G-ID",
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    original_master_mid="OWNER",
+                    controller_mid="CONTROLLER",
+                    paid_count_per_account=10,
+                    total_count_limit=0,
+                )
+                db.update_private_job(previous.id, status="complete")
+
+            args = parser.parse_args(
+                [
+                    "guild",
+                    "private",
+                    "--gname",
+                    "ahhhha",
+                    "--gmname",
+                    "absdbld",
+                    "--count",
+                    "10",
+                    "--db",
+                    str(db_path),
+                ]
+            )
+            output = io.StringIO()
+            with (
+                patch.object(
+                    cli.PrivateGuildRunner,
+                    "run",
+                    return_value={
+                        "ok": True,
+                        "complete": False,
+                        "mode": "private",
+                        "state": "awaiting_donors",
+                        "stopped_reason": "awaiting_eligible_accounts",
+                    },
+                ) as run,
+                redirect_stdout(output),
+            ):
+                code = cli.cmd_guild(args)
+
+            self.assertEqual(code, 0)
+            current = run.call_args.args[0]
+            self.assertNotEqual(current.id, previous.id)
+            self.assertEqual(current.total_count_limit, 0)
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["controller"]["mid"], "CONTROLLER")
+            self.assertEqual(payload["controller"]["source"], "latest_job")
+            with AccountDB(db_path) as db:
+                self.assertEqual(len(db.list_private_jobs()), 2)
+
     def test_private_flow_refreshes_stale_public_cache(self) -> None:
         PrivateWaitingClient.calls = []
         parser = cli.build_parser()
@@ -2769,8 +3085,8 @@ class GuildCommandTests(unittest.TestCase):
                 guild_action="public",
                 gname="ahhhha",
                 gmname="absdbld",
-                count=2,
-                totalcount=9,
+                count=4,
+                totalcount=8,
                 db=str(db_path),
             )
             output = io.StringIO()
@@ -2789,9 +3105,9 @@ class GuildCommandTests(unittest.TestCase):
 
             self.assertEqual(code, 0)
             summary = json.loads(output.getvalue())
-            self.assertEqual(summary["count"], 2)
-            self.assertEqual(summary["requested_totalcount"], 9)
-            self.assertEqual(summary["totalcount"], 9)
+            self.assertEqual(summary["count"], 4)
+            self.assertEqual(summary["requested_totalcount"], 8)
+            self.assertEqual(summary["totalcount"], 8)
             self.assertTrue(summary["totalcount_reached"])
             self.assertEqual(summary["account_count"], 2)
             self.assertEqual(summary["accounts_attempted"], 2)
@@ -2800,17 +3116,25 @@ class GuildCommandTests(unittest.TestCase):
             self.assertEqual(summary["guild"]["level_after"], 2)
             self.assertEqual(summary["guild"]["level_change"], 1)
             self.assertEqual(summary["totals"]["free_research_count"], 6)
-            self.assertEqual(summary["totals"]["donation_count"], 3)
-            self.assertEqual(summary["totals"]["effective_research_count"], 9)
+            self.assertEqual(summary["totals"]["donation_count"], 2)
+            self.assertEqual(summary["totals"]["effective_research_count"], 8)
             self.assertNotIn("mailbox_checked_count", summary["totals"])
             self.assertNotIn("mailbox", summary["results"][0])
-            self.assertEqual(summary["totals"]["diamond_spent"], 300)
-            self.assertEqual(summary["totals"]["guild_experience_gained"], 9)
-            self.assertEqual(summary["totals"]["research_point_gained"], 9)
-            self.assertEqual(summary["results"][0]["donation_count"], 2)
+            self.assertEqual(summary["totals"]["diamond_spent"], 200)
+            self.assertEqual(summary["totals"]["guild_experience_gained"], 8)
+            self.assertEqual(summary["totals"]["research_point_gained"], 8)
+            self.assertEqual(summary["results"][0]["donation_count"], 1)
+            self.assertEqual(
+                summary["results"][0]["effective_research_count"],
+                4,
+            )
+            self.assertEqual(
+                summary["results"][0]["stop_reason"],
+                "account_count_reached",
+            )
             self.assertEqual(
                 summary["results"][0]["guild_progress"]["experience_gained"],
-                5,
+                4,
             )
             with AccountDB(db_path) as db:
                 account_a = db.get("A")
@@ -2819,13 +3143,128 @@ class GuildCommandTests(unittest.TestCase):
                 self.assertGreater(account_b.guild, 0)
                 self.assertGreater(account_a.guild_joined_at, 0)
                 self.assertGreater(account_a.guild_left_at, 0)
-                self.assertEqual(account_a.guild_paid_research_total, 2)
-                self.assertEqual(account_a.guild_effective_research_total, 5)
+                self.assertEqual(account_a.guild_paid_research_total, 1)
+                self.assertEqual(account_a.guild_effective_research_total, 4)
                 self.assertEqual(account_b.guild_paid_research_total, 1)
                 self.assertEqual(account_b.guild_effective_research_total, 4)
                 self.assertEqual(len(db.list_guild_runs("A")), 1)
                 self.assertEqual(len(db.list_guild_runs("B")), 1)
                 self.assertEqual(db.guild_pool_status()["cooling"], 3)
+
+    def test_public_without_totalcount_stops_after_fifty_joined_accounts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                for index in range(51):
+                    db.upsert_state(
+                        AccountState(
+                            mid=f"ACCOUNT-{index:02d}",
+                            guest_secret="secret",
+                            game_access_token="token",
+                            next_stage=31,
+                        ),
+                        used=True,
+                        ready=True,
+                        invalid=False,
+                    )
+                db.upsert_guild_target(
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    guild_id="G-ID",
+                    guild_level=1,
+                    member_count=1,
+                )
+
+            args = argparse.Namespace(
+                guild_action="public",
+                gname="ahhhha",
+                gmname="absdbld",
+                count=1,
+                totalcount=None,
+                db=str(db_path),
+            )
+            output = io.StringIO()
+            with (
+                patch.object(cli, "GrpcClient", DummyClient),
+                patch.object(cli, "GuildRunner", FakeRunner),
+                patch.object(
+                    cli, "_login_account", side_effect=lambda row: row.to_state()
+                ),
+                patch.object(
+                    cli, "_confirm_guild", side_effect=AssertionError("must use cache")
+                ),
+                redirect_stdout(output),
+            ):
+                code = cli.cmd_guild(args)
+
+            self.assertEqual(code, 0)
+            summary = json.loads(output.getvalue())
+            self.assertIsNone(summary["requested_totalcount"])
+            self.assertFalse(summary["totalcount_reached"])
+            self.assertEqual(summary["account_limit"], 50)
+            self.assertEqual(summary["joined_account_count"], 50)
+            self.assertTrue(summary["account_limit_reached"])
+            self.assertEqual(summary["accounts_attempted"], 50)
+            self.assertEqual(summary["account_count"], 50)
+            self.assertEqual(summary["totalcount"], 50)
+            self.assertEqual(summary["stopped_reason"], "account_limit_reached")
+
+    def test_public_without_totalcount_stops_when_guild_rejects_join(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                for mid in ("A", "B"):
+                    db.upsert_state(
+                        AccountState(
+                            mid=mid,
+                            guest_secret="secret",
+                            game_access_token="token",
+                            next_stage=31,
+                        ),
+                        used=True,
+                        ready=True,
+                        invalid=False,
+                    )
+                db.upsert_guild_target(
+                    gname="ahhhha",
+                    gmname="absdbld",
+                    guild_id="G-ID",
+                    guild_level=1,
+                    member_count=1,
+                )
+
+            args = argparse.Namespace(
+                guild_action="public",
+                gname="ahhhha",
+                gmname="absdbld",
+                count=10,
+                totalcount=None,
+                db=str(db_path),
+            )
+            output = io.StringIO()
+            with (
+                patch.object(cli, "GrpcClient", DummyClient),
+                patch.object(cli, "GuildRunner", FakeRecruitmentLimitRunner),
+                patch.object(
+                    cli, "_login_account", side_effect=lambda row: row.to_state()
+                ),
+                redirect_stdout(output),
+            ):
+                code = cli.cmd_guild(args)
+
+            self.assertEqual(code, 0)
+            summary = json.loads(output.getvalue())
+            self.assertTrue(summary["ok"])
+            self.assertEqual(summary["accounts_attempted"], 1)
+            self.assertEqual(summary["accounts_failed"], 0)
+            self.assertEqual(summary["joined_account_count"], 0)
+            self.assertEqual(
+                summary["stopped_reason"],
+                "daily_recruitment_limit_reached",
+            )
+            self.assertEqual(summary["daily_recruitment_limit"], 51)
 
     def test_public_flow_refreshes_stale_private_cache(self) -> None:
         FakeSearchGuild.calls = 0

@@ -124,6 +124,102 @@ CREATE TABLE IF NOT EXISTS guild_private_accounts (
 );
 CREATE INDEX IF NOT EXISTS idx_guild_private_accounts_state
 ON guild_private_accounts(job_id, state, mid);
+
+-- Persistent guild-management mode.  The older guild_targets/guild_runs/
+-- guild_private_* tables remain the compatibility layer for transient SOPs.
+CREATE TABLE IF NOT EXISTS guilds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL UNIQUE,
+    gname TEXT NOT NULL,
+    gmname TEXT NOT NULL DEFAULT '',
+    original_master_mid TEXT NOT NULL DEFAULT '',
+    controller_mid TEXT NOT NULL DEFAULT '',
+    join_method INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'initialized',
+    guild_level INTEGER NOT NULL DEFAULT 0,
+    capacity INTEGER NOT NULL DEFAULT 0,
+    reserve_slots INTEGER NOT NULL DEFAULT 2,
+    target_managed_count INTEGER NOT NULL DEFAULT 0,
+    member_count INTEGER NOT NULL DEFAULT 0,
+    daily_recruit_limit INTEGER NOT NULL DEFAULT 50,
+    daily_recruit_day TEXT NOT NULL DEFAULT '',
+    daily_recruit_used INTEGER NOT NULL DEFAULT 0,
+    last_sync_at REAL NOT NULL DEFAULT 0,
+    last_daily_day TEXT NOT NULL DEFAULT '',
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_guilds_gname ON guilds(gname, gmname, id);
+
+CREATE TABLE IF NOT EXISTS guild_memberships (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_pk INTEGER NOT NULL,
+    mid TEXT NOT NULL,
+    slot_no INTEGER NOT NULL DEFAULT 0,
+    member_type TEXT NOT NULL DEFAULT 'managed',
+    status TEXT NOT NULL DEFAULT 'planned',
+    role INTEGER NOT NULL DEFAULT 1,
+    joined_at REAL NOT NULL DEFAULT 0,
+    left_at REAL NOT NULL DEFAULT 0,
+    last_seen_at REAL NOT NULL DEFAULT 0,
+    last_attendance_at REAL NOT NULL DEFAULT 0,
+    last_donate_at REAL NOT NULL DEFAULT 0,
+    last_support_at REAL NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(guild_pk, mid)
+);
+CREATE INDEX IF NOT EXISTS idx_guild_memberships_state
+ON guild_memberships(guild_pk, member_type, status, slot_no);
+CREATE INDEX IF NOT EXISTS idx_guild_memberships_mid
+ON guild_memberships(mid, status, guild_pk);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_guild_memberships_slot
+ON guild_memberships(guild_pk, slot_no)
+WHERE slot_no > 0;
+
+CREATE TABLE IF NOT EXISTS guild_daily_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_pk INTEGER NOT NULL,
+    day_key TEXT NOT NULL,
+    mid TEXT NOT NULL,
+    attendance_status TEXT NOT NULL DEFAULT 'pending',
+    attendance_at REAL NOT NULL DEFAULT 0,
+    free_research_count INTEGER NOT NULL DEFAULT 0,
+    paid_research_count INTEGER NOT NULL DEFAULT 0,
+    effective_research_count INTEGER NOT NULL DEFAULT 0,
+    support_count INTEGER NOT NULL DEFAULT 0,
+    diamond_spent INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    error TEXT NOT NULL DEFAULT '',
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(guild_pk, day_key, mid)
+);
+CREATE INDEX IF NOT EXISTS idx_guild_daily_actions_state
+ON guild_daily_actions(guild_pk, day_key, status, mid);
+
+CREATE TABLE IF NOT EXISTS guild_support_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_pk INTEGER NOT NULL,
+    day_key TEXT NOT NULL,
+    supporter_mid TEXT NOT NULL,
+    support_request_id TEXT NOT NULL,
+    requester_mid TEXT NOT NULL DEFAULT '',
+    support_type TEXT NOT NULL DEFAULT '',
+    reduced_time_millis INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    error TEXT NOT NULL DEFAULT '',
+    response_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(guild_pk, day_key, supporter_mid, support_request_id)
+);
+CREATE INDEX IF NOT EXISTS idx_guild_support_actions_state
+ON guild_support_actions(guild_pk, day_key, supporter_mid, status);
 """
 
 
@@ -206,6 +302,66 @@ class GuildPrivateJobRow:
     master_acquired_at: float
     completed_at: float
     error: str
+    created_at: float
+    updated_at: float
+
+    @property
+    def effective_count_per_account(self) -> int:
+        """Effective per-account limit stored in the legacy paid-count column."""
+        return self.paid_count_per_account
+
+    @property
+    def has_total_count_limit(self) -> bool:
+        """Whether this job has an explicit cross-account effective target."""
+        return self.total_count_limit > 0
+
+    @property
+    def requested_totalcount(self) -> int | None:
+        """Expose the zero SQLite sentinel as an omitted JSON target."""
+        return self.total_count_limit if self.has_total_count_limit else None
+
+
+@dataclass(frozen=True)
+class ManagedGuildRow:
+    id: int
+    guild_id: str
+    gname: str
+    gmname: str
+    original_master_mid: str
+    controller_mid: str
+    join_method: int
+    status: str
+    guild_level: int
+    capacity: int
+    reserve_slots: int
+    target_managed_count: int
+    member_count: int
+    daily_recruit_limit: int
+    daily_recruit_day: str
+    daily_recruit_used: int
+    last_sync_at: float
+    last_daily_day: str
+    details: Dict[str, Any]
+    created_at: float
+    updated_at: float
+
+@dataclass(frozen=True)
+class GuildMembershipRow:
+    id: int
+    guild_pk: int
+    mid: str
+    slot_no: int
+    member_type: str
+    status: str
+    role: int
+    joined_at: float
+    left_at: float
+    last_seen_at: float
+    last_attendance_at: float
+    last_donate_at: float
+    last_support_at: float
+    last_error: str
+    details: Dict[str, Any]
     created_at: float
     updated_at: float
 
@@ -292,6 +448,12 @@ class AccountDB:
             WHERE guild_left_at<=0 AND guild>0
             """
         )
+        # ``SCHEMA`` is additive and idempotent.  Keep a lightweight version
+        # marker so future resident-guild migrations can be ordered without
+        # breaking databases created by older releases.
+        user_version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+        if user_version < 2:
+            self._conn.execute("PRAGMA user_version=2")
 
     def close(self) -> None:
         self._conn.close()
@@ -784,6 +946,559 @@ class AccountDB:
             raise RuntimeError("failed to persist guild target")
         return row
 
+    # ------------------------------------------------------------------
+    # Resident guild management
+    # ------------------------------------------------------------------
+
+    def get_managed_guild(self, guild_id: str) -> Optional[ManagedGuildRow]:
+        row = self._conn.execute(
+            "SELECT * FROM guilds WHERE guild_id=?",
+            (str(guild_id),),
+        ).fetchone()
+        return self._managed_guild_row(row) if row else None
+
+    def list_managed_guilds(
+        self,
+        *,
+        gname: Optional[str] = None,
+        gmname: Optional[str] = None,
+    ) -> List[ManagedGuildRow]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if gname:
+            clauses.append("gname=?")
+            params.append(str(gname))
+        if gmname:
+            clauses.append("gmname=?")
+            params.append(str(gmname))
+        sql = "SELECT * FROM guilds"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id"
+        return [
+            self._managed_guild_row(row)
+            for row in self._conn.execute(sql, tuple(params))
+        ]
+
+    def find_managed_guilds(
+        self,
+        gname: str,
+        *,
+        gmname: Optional[str] = None,
+        prefix: bool = True,
+    ) -> List[ManagedGuildRow]:
+        """Find resident guild configs by exact name or a unique prefix."""
+        value = str(gname).strip()
+        if not value:
+            return []
+        candidates = self.list_managed_guilds(gmname=gmname)
+        exact = [row for row in candidates if row.gname == value]
+        if exact or not prefix:
+            return exact
+        return [row for row in candidates if row.gname.startswith(value)]
+
+    def upsert_managed_guild(
+        self,
+        *,
+        guild_id: str,
+        gname: str,
+        gmname: str = "",
+        original_master_mid: str = "",
+        controller_mid: str = "",
+        join_method: int = 0,
+        status: str = "initialized",
+        guild_level: int = 0,
+        capacity: int = 0,
+        reserve_slots: int = 2,
+        target_managed_count: Optional[int] = None,
+        member_count: int = 0,
+        daily_recruit_limit: int = 50,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> ManagedGuildRow:
+        now = time.time()
+        capacity_value = max(0, int(capacity))
+        reserve_value = max(0, int(reserve_slots))
+        target_value = (
+            max(0, capacity_value - reserve_value)
+            if target_managed_count is None
+            else max(0, int(target_managed_count))
+        )
+        self._conn.execute(
+            """
+            INSERT INTO guilds (
+                guild_id, gname, gmname, original_master_mid, controller_mid,
+                join_method, status, guild_level, capacity, reserve_slots,
+                target_managed_count, member_count, daily_recruit_limit,
+                details_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                gname=excluded.gname,
+                gmname=excluded.gmname,
+                original_master_mid=CASE
+                    WHEN excluded.original_master_mid<>''
+                    THEN excluded.original_master_mid
+                    ELSE guilds.original_master_mid
+                END,
+                controller_mid=CASE
+                    WHEN excluded.controller_mid<>''
+                    THEN excluded.controller_mid
+                    ELSE guilds.controller_mid
+                END,
+                join_method=excluded.join_method,
+                status=excluded.status,
+                guild_level=excluded.guild_level,
+                capacity=excluded.capacity,
+                reserve_slots=excluded.reserve_slots,
+                target_managed_count=excluded.target_managed_count,
+                member_count=excluded.member_count,
+                daily_recruit_limit=excluded.daily_recruit_limit,
+                details_json=excluded.details_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                str(guild_id),
+                str(gname).strip(),
+                str(gmname).strip(),
+                str(original_master_mid).strip().upper(),
+                str(controller_mid).strip().upper(),
+                int(join_method),
+                str(status),
+                max(0, int(guild_level)),
+                capacity_value,
+                reserve_value,
+                target_value,
+                max(0, int(member_count)),
+                max(0, int(daily_recruit_limit)),
+                json.dumps(details or {}, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+        self._conn.commit()
+        row = self.get_managed_guild(guild_id)
+        if row is None:
+            raise RuntimeError("failed to persist managed guild")
+        return row
+
+    def update_managed_guild(self, guild_pk: int, **changes: Any) -> ManagedGuildRow:
+        allowed = {
+            "gname",
+            "gmname",
+            "original_master_mid",
+            "controller_mid",
+            "join_method",
+            "status",
+            "guild_level",
+            "capacity",
+            "reserve_slots",
+            "target_managed_count",
+            "member_count",
+            "daily_recruit_limit",
+            "daily_recruit_day",
+            "daily_recruit_used",
+            "last_sync_at",
+            "last_daily_day",
+            "details_json",
+            "details",
+        }
+        fields = {key: value for key, value in changes.items() if key in allowed}
+        if "details" in fields:
+            fields["details_json"] = json.dumps(
+                fields.pop("details") or {}, ensure_ascii=False
+            )
+        if not fields:
+            row = self._conn.execute(
+                "SELECT * FROM guilds WHERE id=?", (int(guild_pk),)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"managed guild not found: {guild_pk}")
+            return self._managed_guild_row(row)
+        fields["updated_at"] = time.time()
+        assignments = ", ".join(f"{key}=?" for key in fields)
+        self._conn.execute(
+            f"UPDATE guilds SET {assignments} WHERE id=?",
+            tuple(fields.values()) + (int(guild_pk),),
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            "SELECT * FROM guilds WHERE id=?", (int(guild_pk),)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"managed guild not found: {guild_pk}")
+        return self._managed_guild_row(row)
+
+    def list_guild_memberships(
+        self,
+        guild_pk: int,
+        *,
+        member_type: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[GuildMembershipRow]:
+        clauses = ["guild_pk=?"]
+        params: list[Any] = [int(guild_pk)]
+        if member_type:
+            clauses.append("member_type=?")
+            params.append(str(member_type))
+        if status:
+            clauses.append("status=?")
+            params.append(str(status))
+        rows = self._conn.execute(
+            "SELECT * FROM guild_memberships WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY slot_no, mid",
+            tuple(params),
+        )
+        return [self._membership_row(row) for row in rows]
+
+    def get_guild_membership(
+        self,
+        guild_pk: int,
+        mid: str,
+    ) -> Optional[GuildMembershipRow]:
+        row = self._conn.execute(
+            "SELECT * FROM guild_memberships WHERE guild_pk=? AND mid=?",
+            (int(guild_pk), str(mid).upper()),
+        ).fetchone()
+        return self._membership_row(row) if row else None
+
+    def upsert_guild_membership(
+        self,
+        guild_pk: int,
+        mid: str,
+        *,
+        slot_no: int = 0,
+        member_type: str = "managed",
+        status: str = "planned",
+        role: int = 1,
+        joined_at: float = 0,
+        left_at: float = 0,
+        last_seen_at: float = 0,
+        last_attendance_at: float = 0,
+        last_donate_at: float = 0,
+        last_support_at: float = 0,
+        last_error: str = "",
+        details: Optional[Dict[str, Any]] = None,
+    ) -> GuildMembershipRow:
+        now = time.time()
+        mid_value = str(mid).strip().upper()
+        self._conn.execute(
+            """
+            INSERT INTO guild_memberships (
+                guild_pk, mid, slot_no, member_type, status, role,
+                joined_at, left_at, last_seen_at, last_attendance_at,
+                last_donate_at, last_support_at, last_error, details_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_pk, mid) DO UPDATE SET
+                slot_no=excluded.slot_no,
+                member_type=excluded.member_type,
+                status=excluded.status,
+                role=excluded.role,
+                joined_at=CASE WHEN excluded.joined_at>0
+                    THEN excluded.joined_at ELSE guild_memberships.joined_at END,
+                left_at=CASE WHEN excluded.left_at>0
+                    THEN excluded.left_at ELSE guild_memberships.left_at END,
+                last_seen_at=CASE WHEN excluded.last_seen_at>0
+                    THEN excluded.last_seen_at ELSE guild_memberships.last_seen_at END,
+                last_attendance_at=CASE WHEN excluded.last_attendance_at>0
+                    THEN excluded.last_attendance_at
+                    ELSE guild_memberships.last_attendance_at END,
+                last_donate_at=CASE WHEN excluded.last_donate_at>0
+                    THEN excluded.last_donate_at ELSE guild_memberships.last_donate_at END,
+                last_support_at=CASE WHEN excluded.last_support_at>0
+                    THEN excluded.last_support_at
+                    ELSE guild_memberships.last_support_at END,
+                last_error=excluded.last_error,
+                details_json=excluded.details_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                int(guild_pk),
+                mid_value,
+                max(0, int(slot_no)),
+                str(member_type),
+                str(status),
+                int(role),
+                float(joined_at or 0),
+                float(left_at or 0),
+                float(last_seen_at or 0),
+                float(last_attendance_at or 0),
+                float(last_donate_at or 0),
+                float(last_support_at or 0),
+                str(last_error or "")[:1000],
+                json.dumps(details or {}, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+        self._conn.commit()
+        row = self.get_guild_membership(guild_pk, mid_value)
+        if row is None:
+            raise RuntimeError("failed to persist guild membership")
+        return row
+
+    def update_guild_membership(
+        self,
+        guild_pk: int,
+        mid: str,
+        **changes: Any,
+    ) -> GuildMembershipRow:
+        allowed = {
+            "slot_no",
+            "member_type",
+            "status",
+            "role",
+            "joined_at",
+            "left_at",
+            "last_seen_at",
+            "last_attendance_at",
+            "last_donate_at",
+            "last_support_at",
+            "last_error",
+            "details_json",
+            "details",
+        }
+        fields = {key: value for key, value in changes.items() if key in allowed}
+        if "details" in fields:
+            fields["details_json"] = json.dumps(
+                fields.pop("details") or {}, ensure_ascii=False
+            )
+        if not fields:
+            row = self.get_guild_membership(guild_pk, mid)
+            if row is None:
+                raise KeyError(f"guild membership not found: {guild_pk}/{mid}")
+            return row
+        fields["updated_at"] = time.time()
+        assignments = ", ".join(f"{key}=?" for key in fields)
+        self._conn.execute(
+            f"UPDATE guild_memberships SET {assignments} "
+            "WHERE guild_pk=? AND mid=?",
+            tuple(fields.values()) + (int(guild_pk), str(mid).upper()),
+        )
+        self._conn.commit()
+        row = self.get_guild_membership(guild_pk, mid)
+        if row is None:
+            raise KeyError(f"guild membership not found: {guild_pk}/{mid}")
+        return row
+
+    def list_resident_candidates(
+        self,
+        guild_pk: int,
+        *,
+        now: Optional[float] = None,
+        cooldown_seconds: int = GUILD_COOLDOWN_SECONDS,
+    ) -> List[AccountRow]:
+        current = time.time() if now is None else float(now)
+        cutoff = current - max(0, int(cooldown_seconds))
+        rows = self._conn.execute(
+            """
+            SELECT a.* FROM accounts AS a
+            WHERE a.ready=1 AND a.invalid=0 AND a.next_stage>30
+              AND (a.guild<=0 OR a.guild<=?)
+              AND a.guild_joined_at<=a.guild_left_at
+              AND NOT EXISTS (
+                  SELECT 1 FROM guild_memberships AS m
+                  WHERE m.mid=a.mid
+                    AND m.status IN ('planned', 'invited', 'accepted', 'active', 'reserved')
+              )
+            ORDER BY a.created_at, a.mid
+            """,
+            (cutoff,),
+        )
+        return [self._row(row) for row in rows]
+
+    def get_daily_guild_action(
+        self,
+        guild_pk: int,
+        day_key: str,
+        mid: str,
+    ) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            """
+            SELECT * FROM guild_daily_actions
+            WHERE guild_pk=? AND day_key=? AND mid=?
+            """,
+            (int(guild_pk), str(day_key), str(mid).upper()),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_daily_guild_action(
+        self,
+        guild_pk: int,
+        day_key: str,
+        mid: str,
+        **changes: Any,
+    ) -> Dict[str, Any]:
+        allowed = {
+            "attendance_status",
+            "attendance_at",
+            "free_research_count",
+            "paid_research_count",
+            "effective_research_count",
+            "support_count",
+            "diamond_spent",
+            "status",
+            "error",
+            "details_json",
+            "details",
+        }
+        fields = {key: value for key, value in changes.items() if key in allowed}
+        if "details" in fields:
+            fields["details_json"] = json.dumps(
+                fields.pop("details") or {}, ensure_ascii=False
+            )
+        now = time.time()
+        existing = self.get_daily_guild_action(guild_pk, day_key, mid)
+        if existing is None:
+            base = {
+                "attendance_status": "pending",
+                "attendance_at": 0,
+                "free_research_count": 0,
+                "paid_research_count": 0,
+                "effective_research_count": 0,
+                "support_count": 0,
+                "diamond_spent": 0,
+                "status": "pending",
+                "error": "",
+                "details_json": "{}",
+            }
+            base.update(fields)
+            self._conn.execute(
+                """
+                INSERT INTO guild_daily_actions (
+                    guild_pk, day_key, mid, attendance_status, attendance_at,
+                    free_research_count, paid_research_count,
+                    effective_research_count, support_count, diamond_spent,
+                    status, error, details_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(guild_pk),
+                    str(day_key),
+                    str(mid).upper(),
+                    base["attendance_status"],
+                    base["attendance_at"],
+                    base["free_research_count"],
+                    base["paid_research_count"],
+                    base["effective_research_count"],
+                    base["support_count"],
+                    base["diamond_spent"],
+                    base["status"],
+                    base["error"],
+                    base["details_json"],
+                    now,
+                    now,
+                ),
+            )
+        elif fields:
+            fields["updated_at"] = now
+            assignments = ", ".join(f"{key}=?" for key in fields)
+            self._conn.execute(
+                f"UPDATE guild_daily_actions SET {assignments} "
+                "WHERE guild_pk=? AND day_key=? AND mid=?",
+                tuple(fields.values())
+                + (int(guild_pk), str(day_key), str(mid).upper()),
+            )
+        self._conn.commit()
+        result = self.get_daily_guild_action(guild_pk, day_key, mid)
+        if result is None:
+            raise RuntimeError("failed to persist daily guild action")
+        return result
+
+    def list_guild_support_action_ids(
+        self,
+        guild_pk: int,
+        day_key: str,
+        supporter_mid: str,
+    ) -> set[str]:
+        rows = self._conn.execute(
+            """
+            SELECT support_request_id FROM guild_support_actions
+            WHERE guild_pk=? AND day_key=? AND supporter_mid=?
+              AND status='success'
+            """,
+            (int(guild_pk), str(day_key), str(supporter_mid).upper()),
+        )
+        return {str(row[0]) for row in rows}
+
+    def upsert_guild_support_action(
+        self,
+        guild_pk: int,
+        day_key: str,
+        supporter_mid: str,
+        support_request_id: str,
+        **changes: Any,
+    ) -> Dict[str, Any]:
+        allowed = {
+            "requester_mid",
+            "support_type",
+            "reduced_time_millis",
+            "status",
+            "error",
+            "response_json",
+            "response",
+        }
+        fields = {key: value for key, value in changes.items() if key in allowed}
+        if "response" in fields:
+            fields["response_json"] = json.dumps(
+                fields.pop("response") or {}, ensure_ascii=False
+            )
+        now = time.time()
+        base = {
+            "requester_mid": "",
+            "support_type": "",
+            "reduced_time_millis": 0,
+            "status": "pending",
+            "error": "",
+            "response_json": "{}",
+        }
+        base.update(fields)
+        self._conn.execute(
+            """
+            INSERT INTO guild_support_actions (
+                guild_pk, day_key, supporter_mid, support_request_id,
+                requester_mid, support_type, reduced_time_millis, status,
+                error, response_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_pk, day_key, supporter_mid, support_request_id)
+            DO UPDATE SET requester_mid=excluded.requester_mid,
+                support_type=excluded.support_type,
+                reduced_time_millis=excluded.reduced_time_millis,
+                status=excluded.status,
+                error=excluded.error,
+                response_json=excluded.response_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                int(guild_pk),
+                str(day_key),
+                str(supporter_mid).upper(),
+                str(support_request_id),
+                str(base["requester_mid"] or "").upper(),
+                str(base["support_type"] or ""),
+                max(0, int(base["reduced_time_millis"] or 0)),
+                str(base["status"]),
+                str(base["error"] or "")[:1000],
+                base["response_json"]
+                if isinstance(base["response_json"], str)
+                else json.dumps(base["response_json"] or {}, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+        self._conn.commit()
+        row = self._conn.execute(
+            """
+            SELECT * FROM guild_support_actions
+            WHERE guild_pk=? AND day_key=? AND supporter_mid=?
+              AND support_request_id=?
+            """,
+            (int(guild_pk), str(day_key), str(supporter_mid).upper(), str(support_request_id)),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("failed to persist guild support action")
+        return dict(row)
+
     def get_private_job(self, job_id: int) -> Optional[GuildPrivateJobRow]:
         row = self._conn.execute(
             "SELECT * FROM guild_private_jobs WHERE id=?",
@@ -1169,6 +1884,62 @@ class AccountDB:
             ),
             details=details if isinstance(details, dict) else {},
             confirmed_at=float(row["confirmed_at"] or 0),
+            updated_at=float(row["updated_at"] or 0),
+        )
+
+    @staticmethod
+    def _managed_guild_row(row: sqlite3.Row) -> ManagedGuildRow:
+        try:
+            details = json.loads(row["details_json"] or "{}")
+        except Exception:
+            details = {}
+        return ManagedGuildRow(
+            id=int(row["id"]),
+            guild_id=row["guild_id"] or "",
+            gname=row["gname"] or "",
+            gmname=row["gmname"] or "",
+            original_master_mid=row["original_master_mid"] or "",
+            controller_mid=row["controller_mid"] or "",
+            join_method=int(row["join_method"] or 0),
+            status=row["status"] or "",
+            guild_level=int(row["guild_level"] or 0),
+            capacity=int(row["capacity"] or 0),
+            reserve_slots=int(row["reserve_slots"] or 0),
+            target_managed_count=int(row["target_managed_count"] or 0),
+            member_count=int(row["member_count"] or 0),
+            daily_recruit_limit=int(row["daily_recruit_limit"] or 0),
+            daily_recruit_day=row["daily_recruit_day"] or "",
+            daily_recruit_used=int(row["daily_recruit_used"] or 0),
+            last_sync_at=float(row["last_sync_at"] or 0),
+            last_daily_day=row["last_daily_day"] or "",
+            details=details if isinstance(details, dict) else {},
+            created_at=float(row["created_at"] or 0),
+            updated_at=float(row["updated_at"] or 0),
+        )
+
+    @staticmethod
+    def _membership_row(row: sqlite3.Row) -> GuildMembershipRow:
+        try:
+            details = json.loads(row["details_json"] or "{}")
+        except Exception:
+            details = {}
+        return GuildMembershipRow(
+            id=int(row["id"]),
+            guild_pk=int(row["guild_pk"]),
+            mid=row["mid"] or "",
+            slot_no=int(row["slot_no"] or 0),
+            member_type=row["member_type"] or "managed",
+            status=row["status"] or "",
+            role=int(row["role"] or 0),
+            joined_at=float(row["joined_at"] or 0),
+            left_at=float(row["left_at"] or 0),
+            last_seen_at=float(row["last_seen_at"] or 0),
+            last_attendance_at=float(row["last_attendance_at"] or 0),
+            last_donate_at=float(row["last_donate_at"] or 0),
+            last_support_at=float(row["last_support_at"] or 0),
+            last_error=row["last_error"] or "",
+            details=details if isinstance(details, dict) else {},
+            created_at=float(row["created_at"] or 0),
             updated_at=float(row["updated_at"] or 0),
         )
 

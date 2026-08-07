@@ -10,16 +10,27 @@ from pathlib import Path
 from .auth import AccountState, guest_login, new_device_ids
 from .constants import ENDPOINT, FALLBACK_RESOURCE_KEY, TO_STAGE
 from .daily_runner import DailyRunner, DailyWorkflowResult
-from .db import DEFAULT_DB, AccountDB, AccountRow, GuildTargetRow
+from .db import (
+    DEFAULT_DB,
+    AccountDB,
+    AccountRow,
+    GuildTargetRow,
+    ManagedGuildRow,
+)
 from .grpc_client import GrpcClient, GrpcError
 from .guild import (
     Guild,
     GuildSearchSummary,
     parse_guild_search_response,
 )
-from .guild_limits import GUILD_PRIVATE_DAILY_INVITATION_LIMIT
+from .guild_limits import (
+    GUILD_DAILY_RECRUITMENT_ACCOUNT_LIMIT,
+    GUILD_PRIVATE_DAILY_INVITATION_LIMIT,
+    parse_guild_daily_recruitment_limit,
+)
 from .guild_runner import GuildRunner, GuildWorkflowResult
 from .guild_private_runner import PrivateGuildRunner
+from .guild_resident_runner import ResidentGuildRunner
 from .invite import register_friend_inviter
 from .inviter import parse_inviter
 from .stage_runner import StageConfig, StageRunner
@@ -414,6 +425,287 @@ def _persist_logged_in_actor(
         invalid=row.invalid,
         note=row.note,
     )
+
+
+def _resident_target(db: AccountDB, args: argparse.Namespace) -> ManagedGuildRow:
+    gname = str(getattr(args, "gname", "") or "").strip()
+    gmname = str(getattr(args, "gmname", "") or "").strip()
+    if not gname:
+        raise SystemExit("常驻公会命令必须提供 --gname")
+    matches = db.find_managed_guilds(gname, gmname=gmname or None)
+    if not matches:
+        raise SystemExit(
+            f"公会 {gname!r} 尚未初始化，请先执行 "
+            "guild --gname <name> init --gmname <master>"
+        )
+    if len(matches) > 1:
+        payload = {
+            "ok": False,
+            "state": "ambiguous_guild_name",
+            "gname": gname,
+            "candidates": [
+                {
+                    "id": item.id,
+                    "guild_id": item.guild_id,
+                    "gname": item.gname,
+                    "gmname": item.gmname,
+                }
+                for item in matches
+            ],
+            "next_action": "补充 --gmname 或使用更长的 --gname 前缀",
+        }
+        raise SystemExit(json.dumps(payload, ensure_ascii=False, indent=2))
+    return matches[0]
+
+
+def _resident_discovery_row(
+    db: AccountDB,
+    target: ManagedGuildRow | None,
+) -> AccountRow | None:
+    if target is not None:
+        if target.controller_mid:
+            row = db.get(target.controller_mid)
+            if row is not None and row.guest_secret:
+                return row
+        for membership in db.list_guild_memberships(target.id, status="active"):
+            row = db.get(membership.mid)
+            if row is not None and row.guest_secret:
+                return row
+        candidates = db.list_resident_candidates(target.id)
+        if candidates:
+            return candidates[0]
+    candidates = db.list_guild_eligible()
+    return next((row for row in candidates if row.guest_secret), None)
+
+
+def _resident_search_summary(
+    row: AccountRow,
+    *,
+    gname: str,
+    gmname: str,
+) -> tuple[AccountState, GuildSearchSummary]:
+    state = _login_account(row)
+    session = state.to_session()
+    with GrpcClient(state.endpoint or ENDPOINT) as client:
+        summaries = parse_guild_search_response(
+            Guild(client, session).search_guilds(gname).message
+        )
+    matches = [
+        item
+        for item in summaries
+        if item.name == gname or item.name.startswith(gname)
+    ]
+    if gmname:
+        matches = [item for item in matches if item.master_name == gmname]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"公会搜索结果不唯一或不存在: gname={gname!r}, gmname={gmname!r}, "
+            f"matches={len(matches)}"
+        )
+    # The login/session layer may refresh the resource key while building the
+    # authenticated headers.  Carry that value back to the persisted account
+    # state so resident commands do not fall back to an obsolete DB value.
+    state.resource_key = session.resource_key
+    return state, matches[0]
+
+
+def _resident_controller_candidate(
+    db: AccountDB,
+    *,
+    excluded: set[str] | None = None,
+) -> AccountRow | None:
+    """Choose a low-diamond account that can remain as a private controller."""
+    excluded_mids = {str(mid).strip().upper() for mid in (excluded or set())}
+    rows = [
+        row
+        for row in db.list_guild_eligible()
+        if row.mid not in excluded_mids and row.guest_secret
+    ]
+    if not rows:
+        return None
+    return min(rows, key=lambda row: (row.diamond_balance, row.created_at, row.mid))
+
+
+def _cmd_guild_resident_init(args: argparse.Namespace) -> int:
+    gname = str(getattr(args, "gname", "") or "").strip()
+    gmname = str(getattr(args, "gmname", "") or "").strip()
+    if not gname:
+        raise SystemExit("guild init 必须提供 --gname")
+    if not gmname:
+        raise SystemExit("guild init 必须提供 --gmname")
+    capacity_arg = getattr(args, "capacity", None)
+    if capacity_arg is not None and int(capacity_arg) < 3:
+        raise SystemExit("--capacity 必须 >= 3，至少保留 2 个位置")
+
+    with AccountDB(args.db) as db:
+        existing_matches = db.find_managed_guilds(gname, gmname=gmname)
+        existing = existing_matches[0] if len(existing_matches) == 1 else None
+        discovery = _resident_discovery_row(db, existing)
+        if discovery is None:
+            payload = {
+                "ok": False,
+                "mode": "resident",
+                "state": "no_discovery_account",
+                "stopped_reason": "no_discovery_account",
+                "next_action": {
+                    "action": "prepare_account",
+                    "message": "需要一个 ready=1、invalid=0、next_stage>30 且有登录凭据的账号。",
+                },
+            }
+            print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+            return 1
+        try:
+            state, summary = _resident_search_summary(
+                discovery,
+                gname=gname,
+                gmname=gmname,
+            )
+        except Exception as error:
+            payload = {
+                "ok": False,
+                "mode": "resident",
+                "state": "guild_search_failed",
+                "stopped_reason": "guild_search_failed",
+                "error": f"{type(error).__name__}: {error}",
+            }
+            print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+            return 1
+
+        _persist_logged_in_actor(db, discovery, state, state.to_session())
+        capacity = int(
+            capacity_arg
+            if capacity_arg is not None
+            else (existing.capacity if existing is not None else 0)
+        )
+        details = {
+            **(existing.details if existing is not None else {}),
+            "search_summary": _guild_confirmation_payload(summary),
+            "capacity_source": "argument" if capacity_arg is not None else (
+                "cached" if existing is not None and existing.capacity else "unknown"
+            ),
+        }
+        controller_mid = str(
+            getattr(args, "controller_mid", "")
+            or getattr(args, "master_mid", "")
+            or (existing.controller_mid if existing is not None else "")
+            or ""
+        ).strip().upper()
+        controller_source = "argument" if controller_mid else ""
+        if not controller_mid and summary.join_method != 0:
+            controller = _resident_controller_candidate(
+                db,
+                excluded={summary.master_user_id, discovery.mid},
+            )
+            if controller is not None:
+                controller_mid = controller.mid
+                controller_source = "auto"
+        details["controller_source"] = controller_source or "existing"
+        target = db.upsert_managed_guild(
+            guild_id=summary.guild_id,
+            gname=summary.name or gname,
+            gmname=summary.master_name or gmname,
+            original_master_mid=(
+                existing.original_master_mid
+                if existing is not None and existing.original_master_mid
+                else summary.master_user_id
+            ),
+            controller_mid=controller_mid,
+            join_method=summary.join_method,
+            status="initialized",
+            guild_level=summary.guild_level,
+            capacity=capacity,
+            reserve_slots=2,
+            member_count=summary.member_count,
+            details=details,
+        )
+        if controller_mid:
+            controller_is_master = bool(
+                summary.master_user_id
+                and controller_mid == summary.master_user_id.strip().upper()
+            )
+            db.upsert_guild_membership(
+                target.id,
+                controller_mid,
+                member_type="reserved",
+                status="active" if controller_is_master else "planned",
+                role=0 if controller_is_master else 1,
+                details={"source": "controller"},
+            )
+        payload = ResidentGuildRunner(db, _login_account).status(target)
+        init_ok = bool(capacity)
+        payload.update(
+            {
+                "ok": init_ok,
+                "state": "initialized" if capacity else "capacity_unknown",
+                "stopped_reason": "" if capacity else "capacity_unknown",
+                "init": {
+                    "discovery_mid": discovery.mid,
+                    "guild_id": summary.guild_id,
+                    "capacity": capacity or None,
+                    "target_managed_count": target.target_managed_count,
+                },
+            }
+        )
+        if not capacity:
+            payload["next_action"] = {
+                "action": "rerun_init_with_capacity",
+                "message": "GetGuild 未直接返回容量，请补充 --capacity x 后重跑 init。",
+            }
+        elif summary.join_method != 0 and not controller_mid:
+            payload["next_action"] = {
+                "action": "prepare_controller_account",
+                "message": "私有公会需要可登录的常驻代理会长，请补充账号或传入 --controller-mid。",
+            }
+        elif summary.join_method != 0 and controller_mid != summary.master_user_id:
+            payload["next_action"] = {
+                "action": "transfer_master_to_controller",
+                "message": (
+                    f"请在手机将会长委任给代理账号 {controller_mid}，"
+                    "完成后重跑 guild --gname <name> fill/maintain。"
+                ),
+                "controller_mid": controller_mid,
+            }
+        print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+    return 0 if init_ok else 1
+
+
+def _cmd_guild_resident_status(args: argparse.Namespace) -> int:
+    with AccountDB(args.db) as db:
+        target = _resident_target(db, args)
+        runner = ResidentGuildRunner(db, _login_account)
+        payload = runner.sync(target)
+        if not payload.get("ok"):
+            payload = {**runner.status(db.get_managed_guild(target.guild_id) or target), **payload}
+        print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+    return 0
+
+
+def _cmd_guild_resident_fill(args: argparse.Namespace) -> int:
+    with AccountDB(args.db) as db:
+        target = _resident_target(db, args)
+        payload = ResidentGuildRunner(db, _login_account).fill(target)
+        current = db.get_managed_guild(target.guild_id) or target
+        payload["status"] = ResidentGuildRunner(db, _login_account).status(current)
+        print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+    return 0 if payload.get("ok") else 1
+
+
+def _cmd_guild_resident_daily(args: argparse.Namespace) -> int:
+    with AccountDB(args.db) as db:
+        target = _resident_target(db, args)
+        payload = ResidentGuildRunner(db, _login_account).daily(target)
+        current = db.get_managed_guild(target.guild_id) or target
+        payload["status"] = ResidentGuildRunner(db, _login_account).status(current)
+        print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+    return 0 if payload.get("ok") else 1
+
+
+def _cmd_guild_resident_maintain(args: argparse.Namespace) -> int:
+    with AccountDB(args.db) as db:
+        target = _resident_target(db, args)
+        payload = ResidentGuildRunner(db, _login_account).maintain(target)
+        print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+    return 0 if payload.get("ok") else 1
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -892,9 +1184,30 @@ def cmd_daily(args: argparse.Namespace) -> int:
 
 
 def cmd_guild(args: argparse.Namespace) -> int:
-    """Dispatch the public or private guild SOP."""
+    """Dispatch transient public/private SOPs or resident guild management."""
     action = str(getattr(args, "guild_action", "") or "")
     private_action = str(getattr(args, "private_action", "") or "")
+    if not action and str(getattr(args, "gname", "") or "").strip():
+        action = "status"
+    resident_actions = {"init", "status", "fill", "daily", "maintain"}
+    if action in resident_actions:
+        if private_action or getattr(args, "private_job_id", None) is not None:
+            raise SystemExit("常驻公会命令不接受 private return 参数")
+        if getattr(args, "count", None) is not None:
+            raise SystemExit("常驻公会命令不接受 --count")
+        if getattr(args, "totalcount", None) is not None:
+            raise SystemExit("常驻公会命令不接受 --totalcount")
+        if bool(getattr(args, "confirm", False)):
+            raise SystemExit("常驻公会命令不接受 --confirm")
+        if action == "init":
+            return _cmd_guild_resident_init(args)
+        if action == "status":
+            return _cmd_guild_resident_status(args)
+        if action == "fill":
+            return _cmd_guild_resident_fill(args)
+        if action == "daily":
+            return _cmd_guild_resident_daily(args)
+        return _cmd_guild_resident_maintain(args)
     if action == "joblist":
         if private_action or getattr(args, "private_job_id", None) is not None:
             raise SystemExit("guild joblist 不接受 private return 参数")
@@ -986,9 +1299,14 @@ def _private_cli_job_payload(job) -> dict:
         "original_master_name": job.gmname,
         "original_master_mid": job.original_master_mid,
         "controller_mid": job.controller_mid,
-        "count": job.paid_count_per_account,
-        "requested_totalcount": job.total_count_limit,
+        "count": job.effective_count_per_account,
+        "requested_totalcount": job.requested_totalcount,
         "totalcount": job.effective_count,
+        "account_limit": (
+            None
+            if job.has_total_count_limit
+            else GUILD_DAILY_RECRUITMENT_ACCOUNT_LIMIT
+        ),
     }
 
 
@@ -1010,12 +1328,20 @@ def _guild_joblist_item_payload(db: AccountDB, job) -> dict:
     for account in accounts:
         state = str(account["state"])
         account_states[state] = account_states.get(state, 0) + 1
-    remaining = max(0, job.total_count_limit - job.effective_count)
+    completed_account_count = account_states.get("complete", 0)
+    remaining = (
+        max(0, job.total_count_limit - job.effective_count)
+        if job.has_total_count_limit
+        else None
+    )
     return {
         **_private_cli_job_payload(job),
         "application_id": job.application_id,
         "remaining_totalcount": remaining,
-        "totalcount_reached": job.effective_count >= job.total_count_limit,
+        "totalcount_reached": bool(
+            job.has_total_count_limit
+            and job.effective_count >= job.total_count_limit
+        ),
         "master_acquired_at": job.master_acquired_at,
         "master_acquired_at_local": _local_timestamp(job.master_acquired_at),
         "completed_at": job.completed_at,
@@ -1025,6 +1351,12 @@ def _guild_joblist_item_payload(db: AccountDB, job) -> dict:
         "updated_at": job.updated_at,
         "updated_at_local": _local_timestamp(job.updated_at),
         "account_count": len(accounts),
+        "completed_account_count": completed_account_count,
+        "account_limit_reached": bool(
+            not job.has_total_count_limit
+            and completed_account_count
+            >= GUILD_DAILY_RECRUITMENT_ACCOUNT_LIMIT
+        ),
         "account_states": account_states,
         "return_pending": job.status == "awaiting_master_return",
         "return_command": f"python main.py guild private return {job.id}",
@@ -1124,20 +1456,19 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
     parameter_update: dict | None = None
     if getattr(args, "count", None) is None:
         raise SystemExit("guild private 必须提供 --count")
-    if getattr(args, "totalcount", None) is None:
-        raise SystemExit("guild private 必须提供 --totalcount")
     count = int(args.count)
-    totalcount = int(args.totalcount)
+    totalcount_value = getattr(args, "totalcount", None)
+    totalcount = int(totalcount_value) if totalcount_value is not None else 0
     if not gname:
         raise SystemExit("--gname 不能为空")
     if not gmname:
         raise SystemExit("--gmname 不能为空")
     if count < 1:
         raise SystemExit("--count 必须 >= 1")
-    if totalcount < 1:
+    if totalcount_value is not None and totalcount < 1:
         raise SystemExit("--totalcount 必须 >= 1")
     daily_capacity = count * GUILD_PRIVATE_DAILY_INVITATION_LIMIT
-    if daily_capacity < totalcount:
+    if totalcount and daily_capacity < totalcount:
         minimum_count = (
             totalcount + GUILD_PRIVATE_DAILY_INVITATION_LIMIT - 1
         ) // GUILD_PRIVATE_DAILY_INVITATION_LIMIT
@@ -1176,7 +1507,7 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                 if (
                     latest is not None
                     and latest.status == "complete"
-                    and latest.paid_count_per_account == count
+                    and latest.effective_count_per_account == count
                     and latest.total_count_limit == totalcount
                 ):
                     controller_mid = latest.controller_mid
@@ -1407,7 +1738,7 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                 return 1
         job = db.get_active_private_job(target.guild_id, controller_mid)
         if job is not None and (
-            job.paid_count_per_account != count
+            job.effective_count_per_account != count
             or job.total_count_limit != totalcount
         ):
             if not confirm_update:
@@ -1416,8 +1747,8 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                     "确认要更新原任务目标时请增加 --confirm"
                 )
             previous = {
-                "count": job.paid_count_per_account,
-                "totalcount": job.total_count_limit,
+                "count": job.effective_count_per_account,
+                "totalcount": job.requested_totalcount,
             }
             job = db.update_private_job(
                 job.id,
@@ -1428,18 +1759,23 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                 "confirmed": True,
                 "previous": previous,
                 "current": {
-                    "count": job.paid_count_per_account,
-                    "totalcount": job.total_count_limit,
+                    "count": job.effective_count_per_account,
+                    "totalcount": job.requested_totalcount,
                 },
             }
         if job is None:
             latest = db.get_latest_private_job(target.guild_id, controller_mid)
             same_target = bool(
                 latest is not None
-                and latest.paid_count_per_account == count
+                and latest.effective_count_per_account == count
                 and latest.total_count_limit == totalcount
             )
-            if latest is not None and latest.status == "complete" and same_target:
+            if (
+                latest is not None
+                and latest.status == "complete"
+                and same_target
+                and totalcount > 0
+            ):
                 if latest.effective_count >= latest.total_count_limit:
                     payload = {
                         "ok": True,
@@ -1529,24 +1865,28 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
     gmname = str(args.gmname or "").strip()
     if getattr(args, "count", None) is None:
         raise SystemExit("guild public 必须提供 --count")
-    if getattr(args, "totalcount", None) is None:
-        raise SystemExit("guild public 必须提供 --totalcount")
-    paid_count_per_account = int(args.count)
-    requested_total_count = int(args.totalcount)
+    effective_count_per_account = int(args.count)
+    totalcount_value = getattr(args, "totalcount", None)
+    requested_total_count = (
+        int(totalcount_value) if totalcount_value is not None else None
+    )
     if not gname:
         raise SystemExit("--gname 不能为空")
     if not gmname:
         raise SystemExit("--gmname 不能为空")
-    if paid_count_per_account < 1:
+    if effective_count_per_account < 1:
         raise SystemExit("--count 必须 >= 1")
-    if requested_total_count < 1:
+    if requested_total_count is not None and requested_total_count < 1:
         raise SystemExit("--totalcount 必须 >= 1")
 
     results: list[dict] = []
     completed = 0
     failures = 0
     attempted = 0
+    joined_accounts = 0
     effective_total = 0
+    recruitment_limit: int | None = None
+    join_unavailable = False
     target_source = "cache"
     prepared_states: dict[str, AccountState] = {}
     workflows: list[GuildWorkflowResult] = []
@@ -1558,7 +1898,7 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
             summary = {
                 "ok": True,
                 "mode": "public",
-                "count": paid_count_per_account,
+                "count": effective_count_per_account,
                 "requested_totalcount": requested_total_count,
                 "totalcount": 0,
                 "totalcount_reached": False,
@@ -1597,7 +1937,7 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
             except Exception as error:
                 summary = {
                     "ok": False,
-                    "count": paid_count_per_account,
+                    "count": effective_count_per_account,
                     "requested_totalcount": requested_total_count,
                     "totalcount": 0,
                     "totalcount_reached": False,
@@ -1621,7 +1961,7 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
             if len(matches) != 1:
                 summary = {
                     "ok": False,
-                    "count": paid_count_per_account,
+                    "count": effective_count_per_account,
                     "requested_totalcount": requested_total_count,
                     "totalcount": 0,
                     "totalcount_reached": False,
@@ -1643,7 +1983,7 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
                 summary = {
                     "ok": False,
                     "mode": "public",
-                    "count": paid_count_per_account,
+                    "count": effective_count_per_account,
                     "requested_totalcount": requested_total_count,
                     "totalcount": 0,
                     "totalcount_reached": False,
@@ -1662,7 +2002,7 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
             if not _confirm_guild(confirmation):
                 summary = {
                     "ok": True,
-                    "count": paid_count_per_account,
+                    "count": effective_count_per_account,
                     "requested_totalcount": requested_total_count,
                     "totalcount": 0,
                     "totalcount_reached": False,
@@ -1713,7 +2053,7 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
                     summary = {
                         "ok": False,
                         "mode": "public",
-                        "count": paid_count_per_account,
+                        "count": effective_count_per_account,
                         "requested_totalcount": requested_total_count,
                         "totalcount": 0,
                         "totalcount_reached": False,
@@ -1736,7 +2076,7 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
                 summary = {
                     "ok": False,
                     "mode": "public",
-                    "count": paid_count_per_account,
+                    "count": effective_count_per_account,
                     "requested_totalcount": requested_total_count,
                     "totalcount": 0,
                     "totalcount_reached": False,
@@ -1760,7 +2100,16 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
             )
 
         for index, row in enumerate(eligible_rows, start=1):
-            if effective_total >= requested_total_count:
+            if (
+                requested_total_count is not None
+                and effective_total >= requested_total_count
+            ):
+                break
+            if (
+                requested_total_count is None
+                and joined_accounts
+                >= GUILD_DAILY_RECRUITMENT_ACCOUNT_LIMIT
+            ):
                 break
             attempted += 1
             log.info(
@@ -1803,9 +2152,14 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
                     runner = GuildRunner(
                         client,
                         session,
-                        paid_research_limit=paid_count_per_account,
+                        paid_research_limit=None,
+                        effective_research_limit=(
+                            effective_count_per_account
+                        ),
                         total_count_limit=(
                             requested_total_count - effective_total
+                            if requested_total_count is not None
+                            else None
                         ),
                         on_balance=persist_balance,
                         initial_guild_level=target.guild_level,
@@ -1814,6 +2168,19 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
                     workflow = runner.run(target.guild_id)
                     workflows.append(workflow)
                     effective_total += workflow.effective_research_count
+
+                if workflow.joined:
+                    joined_accounts += 1
+                if requested_total_count is None and not workflow.joined:
+                    join_unavailable = True
+                    recruitment_limit = parse_guild_daily_recruitment_limit(
+                        workflow.error
+                    )
+                    workflow.stop_reason = (
+                        "daily_recruitment_limit_reached"
+                        if recruitment_limit is not None
+                        else "guild_join_failed"
+                    )
 
                 state.resource_key = session.resource_key
                 if workflow.diamond_balance_final is not None:
@@ -1894,6 +2261,15 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
                         effective_total,
                         requested_total_count,
                     )
+                elif join_unavailable:
+                    if recruitment_limit is None:
+                        failures += 1
+                    log.warning(
+                        "[%s] guild join unavailable mid=%s error=%s",
+                        index,
+                        row.mid,
+                        workflow.error,
+                    )
                 else:
                     failures += 1
                     log.error(
@@ -1902,6 +2278,8 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
                         row.mid,
                         workflow.error or workflow.paid_stop_message,
                     )
+                if join_unavailable:
+                    break
             except Exception as error:
                 failures += 1
                 item = {
@@ -1918,18 +2296,40 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
                 )
 
         pool_after = _guild_pool_payload(db.guild_pool_status())
-        stopped_reason = (
-            "totalcount_reached"
-            if effective_total >= requested_total_count
-            else "all_eligible_accounts_attempted"
+        totalcount_reached = bool(
+            requested_total_count is not None
+            and effective_total >= requested_total_count
         )
+        account_limit_reached = bool(
+            requested_total_count is None
+            and joined_accounts >= GUILD_DAILY_RECRUITMENT_ACCOUNT_LIMIT
+        )
+        if totalcount_reached:
+            stopped_reason = "totalcount_reached"
+        elif account_limit_reached:
+            stopped_reason = "account_limit_reached"
+        elif join_unavailable:
+            stopped_reason = (
+                "daily_recruitment_limit_reached"
+                if recruitment_limit is not None
+                else "guild_join_failed"
+            )
+        else:
+            stopped_reason = "all_eligible_accounts_attempted"
         summary = {
             "ok": failures == 0,
             "mode": "public",
-            "count": paid_count_per_account,
+            "count": effective_count_per_account,
             "requested_totalcount": requested_total_count,
             "totalcount": effective_total,
-            "totalcount_reached": effective_total >= requested_total_count,
+            "totalcount_reached": totalcount_reached,
+            "account_limit": (
+                None
+                if requested_total_count is not None
+                else GUILD_DAILY_RECRUITMENT_ACCOUNT_LIMIT
+            ),
+            "joined_account_count": joined_accounts,
+            "account_limit_reached": account_limit_reached,
             "account_count": completed,
             "accounts_attempted": attempted,
             "accounts_failed": failures,
@@ -1946,6 +2346,8 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
             "pool_after": pool_after,
             "results": results,
         }
+        if recruitment_limit is not None:
+            summary["daily_recruitment_limit"] = recruitment_limit or None
         print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
 
     return 0 if failures == 0 else 1
@@ -1980,8 +2382,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("guild", help="公开、审批公会 SOP 或查看公会数据")
     sp.add_argument(
         "guild_action",
-        choices=("public", "private", "joblist"),
-        help="公会流程类型，或 joblist 查看 SQLite 任务清单",
+        choices=(
+            "public",
+            "private",
+            "joblist",
+            "init",
+            "status",
+            "fill",
+            "daily",
+            "maintain",
+        ),
+        help=(
+            "公会流程或常驻管理动作：init/status/fill/daily/maintain；"
+            "joblist 查看旧 private 任务"
+        ),
     )
     sp.add_argument(
         "private_action",
@@ -2000,19 +2414,34 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "--count",
         type=int,
-        help="public/private：每个账号最多执行的钻石捐赠次数",
+        help=(
+            "public/private：每个账号的免费+钻石有效研究次数上限；"
+            "暴击按倍率计数"
+        ),
     )
     sp.add_argument(
         "--totalcount",
         type=int,
-        help="public/private：跨账号免费+钻石研究有效总次数；暴击按倍率计数",
+        help=(
+            "public/private：可选；跨账号免费+钻石研究有效总次数。"
+            "省略时最多处理 50 个账号，或在公会无法继续入会时停止"
+        ),
     )
     sp.add_argument(
         "--master-mid",
         help=(
             "private：可选；显式指定临时会长账号 MID。省略时优先复用已有任务，"
-            "否则自动选择钻石最少的可用账号"
+            "否则自动选择钻石最少的可用账号；resident init 可作为 controller"
         ),
+    )
+    sp.add_argument(
+        "--controller-mid",
+        help="resident init：指定常驻私有公会的控制/会长账号 MID",
+    )
+    sp.add_argument(
+        "--capacity",
+        type=int,
+        help="resident init：公会最大容量；GetGuild 未返回容量时必须提供",
     )
     sp.add_argument(
         "--confirm",

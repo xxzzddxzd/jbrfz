@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import time
 from dataclasses import asdict
 from typing import Callable, Optional
@@ -24,6 +23,10 @@ from .guild import (
     parse_guild_search_response,
     parse_invite_user_to_guild_response,
 )
+from .guild_limits import (
+    GUILD_DAILY_RECRUITMENT_ACCOUNT_LIMIT,
+    parse_guild_daily_recruitment_limit,
+)
 from .guild_runner import GuildRunner, GuildWorkflowResult
 from .headers import Session
 from .social import Social, parse_get_user_social_info_response
@@ -32,25 +35,6 @@ log = logging.getLogger(__name__)
 
 LoginAccount = Callable[[AccountRow], AccountState]
 ClientFactory = Callable[[str], GrpcClient]
-
-_DAILY_RECRUITMENT_LIMIT_PATTERN = re.compile(
-    r"daily recruitment limit(?:\s+of)?\s*(\d+)?",
-    re.IGNORECASE,
-)
-
-
-def _parse_daily_recruitment_limit(message: str) -> Optional[int]:
-    """Return the guild-wide daily recruitment limit, or ``None`` if unrelated.
-
-    A return value of zero means the server reported the limit condition without
-    including the numeric limit in its message.
-    """
-    matched = _DAILY_RECRUITMENT_LIMIT_PATTERN.search(str(message or ""))
-    if matched is None:
-        return None
-    value = matched.group(1)
-    return int(value) if value else 0
-
 
 class PrivateGuildRunner:
     """Coordinate one temporary guild-master account and sequential donors."""
@@ -91,8 +75,17 @@ class PrivateGuildRunner:
                         complete=True,
                     )
 
-                target_reached = job.effective_count >= job.total_count_limit
-                if target_reached:
+                target_reached = self._total_target_reached(job)
+                account_limit_reached = self._account_limit_reached(job)
+                batch_finished = bool(
+                    target_reached
+                    or account_limit_reached
+                    or (
+                        not job.has_total_count_limit
+                        and job.status == "awaiting_master_return"
+                    )
+                )
+                if batch_finished:
                     if job.status != "awaiting_master_return":
                         job = self.db.update_private_job(
                             job.id,
@@ -380,6 +373,25 @@ class PrivateGuildRunner:
             )
             return ""
 
+    def _total_target_reached(self, job: GuildPrivateJobRow) -> bool:
+        return bool(
+            job.has_total_count_limit
+            and job.effective_count >= job.total_count_limit
+        )
+
+    def _completed_account_count(self, job_id: int) -> int:
+        return sum(
+            item["state"] == "complete"
+            for item in self.db.list_private_accounts(job_id)
+        )
+
+    def _account_limit_reached(self, job: GuildPrivateJobRow) -> bool:
+        return bool(
+            not job.has_total_count_limit
+            and self._completed_account_count(job.id)
+            >= GUILD_DAILY_RECRUITMENT_ACCOUNT_LIMIT
+        )
+
     def _run_donors(self, job: GuildPrivateJobRow, controller: Guild) -> dict:
         results: list[dict] = []
         workflows: list[GuildWorkflowResult] = []
@@ -388,6 +400,8 @@ class PrivateGuildRunner:
         recruitment_limit: Optional[int] = None
         recruitment_limit_error = ""
         recruitment_limit_mid = ""
+        join_unavailable_error = ""
+        join_unavailable_mid = ""
         effective_before = int(job.effective_count)
         effective_total = int(job.effective_count)
 
@@ -399,7 +413,9 @@ class PrivateGuildRunner:
         for item in records:
             if (
                 item["state"] == "failed"
-                and _parse_daily_recruitment_limit(str(item.get("error") or ""))
+                and parse_guild_daily_recruitment_limit(
+                    str(item.get("error") or "")
+                )
                 is not None
             ):
                 item = self.db.update_private_account(
@@ -410,6 +426,10 @@ class PrivateGuildRunner:
                 )
             restored_records.append(item)
         records = restored_records
+        completed_before = sum(
+            item["state"] == "complete" for item in records
+        )
+        completed_accounts = completed_before
         pending = [
             item
             for item in records
@@ -432,7 +452,16 @@ class PrivateGuildRunner:
             seen.add(row.mid)
 
         for row, record in rows:
-            if effective_total >= job.total_count_limit:
+            if (
+                job.has_total_count_limit
+                and effective_total >= job.total_count_limit
+            ):
+                break
+            if (
+                not job.has_total_count_limit
+                and completed_accounts
+                >= GUILD_DAILY_RECRUITMENT_ACCOUNT_LIMIT
+            ):
                 break
             attempted += 1
             if record is None:
@@ -443,7 +472,11 @@ class PrivateGuildRunner:
                     controller,
                     row,
                     record,
-                    remaining_total=job.total_count_limit - effective_total,
+                    remaining_total=(
+                        job.total_count_limit - effective_total
+                        if job.has_total_count_limit
+                        else None
+                    ),
                 )
                 workflows.append(workflow)
                 effective_total += workflow.effective_research_count
@@ -453,12 +486,14 @@ class PrivateGuildRunner:
                     error="",
                 )
                 results.append(item)
-                if not workflow.ok:
+                if workflow.ok:
+                    completed_accounts += 1
+                else:
                     failures += 1
             except Exception as error:
                 message = f"{type(error).__name__}: {error}"
                 detected_limit = (
-                    _parse_daily_recruitment_limit(error.message)
+                    parse_guild_daily_recruitment_limit(error.message)
                     if isinstance(error, GrpcError) and error.status == 9
                     else None
                 )
@@ -490,6 +525,31 @@ class PrivateGuildRunner:
                     )
                     break
 
+                if not job.has_total_count_limit and isinstance(error, GrpcError):
+                    failures += 1
+                    join_unavailable_error = message
+                    join_unavailable_mid = row.mid
+                    self.db.update_private_account(
+                        job.id,
+                        row.mid,
+                        state="failed",
+                        error=message,
+                    )
+                    results.append(
+                        {
+                            "mid": row.mid,
+                            "ok": False,
+                            "stopped_reason": "guild_join_failed",
+                            "error": message,
+                        }
+                    )
+                    log.warning(
+                        "private guild cannot accept donor %s: %s",
+                        row.mid,
+                        message,
+                    )
+                    break
+
                 failures += 1
                 self.db.update_private_account(
                     job.id,
@@ -500,9 +560,37 @@ class PrivateGuildRunner:
                 results.append({"mid": row.mid, "ok": False, "error": message})
                 log.error("private guild donor %s failed: %s", row.mid, message)
 
-        target_reached = effective_total >= job.total_count_limit
+        target_reached = bool(
+            job.has_total_count_limit
+            and effective_total >= job.total_count_limit
+        )
+        account_limit_reached = bool(
+            not job.has_total_count_limit
+            and completed_accounts >= GUILD_DAILY_RECRUITMENT_ACCOUNT_LIMIT
+        )
+        recruitment_stops_batch = bool(
+            not job.has_total_count_limit and recruitment_limit is not None
+        )
+        join_failure_stops_batch = bool(
+            not job.has_total_count_limit and join_unavailable_error
+        )
+        batch_finished = bool(
+            target_reached
+            or account_limit_reached
+            or recruitment_stops_batch
+            or join_failure_stops_batch
+        )
         if target_reached:
             stopped_reason = "totalcount_reached"
+            next_state = "awaiting_master_return"
+        elif account_limit_reached:
+            stopped_reason = "account_limit_reached"
+            next_state = "awaiting_master_return"
+        elif recruitment_stops_batch:
+            stopped_reason = "daily_recruitment_limit_reached"
+            next_state = "awaiting_master_return"
+        elif join_failure_stops_batch:
+            stopped_reason = "guild_join_failed"
             next_state = "awaiting_master_return"
         elif recruitment_limit is not None:
             stopped_reason = "daily_recruitment_limit_reached"
@@ -522,7 +610,13 @@ class PrivateGuildRunner:
                 recruitment_limit_error
                 if recruitment_limit_error
                 else (
-                    "" if failures == 0 else f"{failures} donor account(s) failed"
+                    join_unavailable_error
+                    if join_unavailable_error
+                    else (
+                        ""
+                        if failures == 0
+                        else f"{failures} donor account(s) failed"
+                    )
                 )
             ),
         )
@@ -538,15 +632,24 @@ class PrivateGuildRunner:
             "complete": False,
             "mode": "private",
             "state": next_state,
-            "count": job.paid_count_per_account,
-            "requested_totalcount": job.total_count_limit,
+            "count": job.effective_count_per_account,
+            "requested_totalcount": job.requested_totalcount,
             "totalcount": effective_total,
             "totalcount_added": effective_total - effective_before,
-            "remaining_totalcount": max(
-                0,
-                job.total_count_limit - effective_total,
+            "remaining_totalcount": (
+                max(0, job.total_count_limit - effective_total)
+                if job.has_total_count_limit
+                else None
             ),
             "totalcount_reached": target_reached,
+            "account_limit": (
+                None
+                if job.has_total_count_limit
+                else GUILD_DAILY_RECRUITMENT_ACCOUNT_LIMIT
+            ),
+            "account_count": completed_accounts,
+            "account_count_added": completed_accounts - completed_before,
+            "account_limit_reached": account_limit_reached,
             "accounts_attempted": attempted,
             "accounts_failed": failures,
             "stopped_reason": stopped_reason,
@@ -562,7 +665,10 @@ class PrivateGuildRunner:
         if recruitment_limit is not None:
             payload["daily_recruitment_limit"] = recruitment_limit or None
             payload["retryable_mid"] = recruitment_limit_mid
-        if target_reached:
+        if join_unavailable_error:
+            payload["join_unavailable_mid"] = join_unavailable_mid
+            payload["join_unavailable_error"] = join_unavailable_error
+        if batch_finished:
             payload["manual_master_return"] = {
                 "required": True,
                 "from_mid": job.controller_mid,
@@ -572,7 +678,11 @@ class PrivateGuildRunner:
             payload["next_action"] = {
                 "action": "return_master",
                 "command": f"python main.py guild private return {job.id}",
-                "message": "目标已达到，请将会长交还给原会长。",
+                "message": (
+                    "公会已无法继续招募，请将会长交还给原会长。"
+                    if recruitment_stops_batch or join_failure_stops_batch
+                    else "本批次目标已达到，请将会长交还给原会长。"
+                ),
             }
         elif recruitment_limit is not None:
             limit_text = (
@@ -614,7 +724,7 @@ class PrivateGuildRunner:
         row: AccountRow,
         record: dict,
         *,
-        remaining_total: int,
+        remaining_total: Optional[int],
     ) -> tuple[GuildWorkflowResult, dict]:
         state_name = str(record["state"])
         invitation_id = str(record.get("invitation_id") or "")
@@ -691,7 +801,10 @@ class PrivateGuildRunner:
                 runner = GuildRunner(
                     donor_client,
                     donor_session,
-                    paid_research_limit=job.paid_count_per_account,
+                    paid_research_limit=None,
+                    effective_research_limit=(
+                        job.effective_count_per_account
+                    ),
                     total_count_limit=remaining_total,
                     on_balance=persist_balance,
                     initial_guild_level=(
@@ -818,6 +931,12 @@ class PrivateGuildRunner:
             if controller_name
             else f"MID {job.controller_mid}"
         )
+        account_count = self._completed_account_count(job.id)
+        account_limit = (
+            None
+            if job.has_total_count_limit
+            else GUILD_DAILY_RECRUITMENT_ACCOUNT_LIMIT
+        )
         payload = {
             "ok": ok,
             "complete": complete or job.status == "complete",
@@ -827,12 +946,19 @@ class PrivateGuildRunner:
             "job": self._job_payload(job),
             "progress": {
                 "current": job.effective_count,
-                "target": job.total_count_limit,
-                "remaining": max(
-                    0,
-                    job.total_count_limit - job.effective_count,
+                "target": job.requested_totalcount,
+                "remaining": (
+                    max(0, job.total_count_limit - job.effective_count)
+                    if job.has_total_count_limit
+                    else None
                 ),
-                "reached": job.effective_count >= job.total_count_limit,
+                "reached": self._total_target_reached(job),
+                "account_count": account_count,
+                "account_limit": account_limit,
+                "account_limit_reached": bool(
+                    account_limit is not None
+                    and account_count >= account_limit
+                ),
             },
             "manual_action": None,
             "next_action": None,
@@ -887,7 +1013,7 @@ class PrivateGuildRunner:
             payload["next_action"] = {
                 "action": "return_master",
                 "command": f"python main.py guild private return {job.id}",
-                "message": "目标已达到，请执行 return 命令交还会长。",
+                "message": "本批次已结束，请执行 return 命令交还会长。",
             }
         elif reason == "controller_not_found":
             payload["next_action"] = {
@@ -897,7 +1023,7 @@ class PrivateGuildRunner:
         elif reason == "complete":
             payload["next_action"] = {
                 "action": "none",
-                "message": "目标已达到且会长已交还，无需继续操作。",
+                "message": "本批次已结束且会长已交还，无需继续操作。",
             }
         if current_master is not None:
             payload["current_master"] = {
@@ -950,9 +1076,14 @@ class PrivateGuildRunner:
             "original_master_mid": job.original_master_mid,
             "controller_mid": job.controller_mid,
             "application_id": job.application_id,
-            "count": job.paid_count_per_account,
-            "requested_totalcount": job.total_count_limit,
+            "count": job.effective_count_per_account,
+            "requested_totalcount": job.requested_totalcount,
             "totalcount": job.effective_count,
+            "account_limit": (
+                None
+                if job.has_total_count_limit
+                else GUILD_DAILY_RECRUITMENT_ACCOUNT_LIMIT
+            ),
         }
 
     @staticmethod
