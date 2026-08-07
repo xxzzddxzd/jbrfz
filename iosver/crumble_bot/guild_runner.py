@@ -22,10 +22,7 @@ from .guild import (
     parse_join_guild_response,
     parse_paid_guild_lab_research_response,
 )
-from .guild_limits import (
-    guild_daily_free_research_limit,
-    guild_paid_research_cost,
-)
+from .guild_limits import guild_daily_free_research_limit, guild_paid_research_cost
 from .headers import Session
 
 log = logging.getLogger(__name__)
@@ -222,6 +219,7 @@ class GuildRunner:
         *,
         free_research_count: int = 3,
         paid_research_limit: Optional[int] = 100,
+        paid_research_cost_limit: Optional[int] = None,
         effective_research_limit: Optional[int] = None,
         total_count_limit: Optional[int] = None,
         sleep_seconds: float = 0.15,
@@ -238,6 +236,11 @@ class GuildRunner:
             None
             if paid_research_limit is None
             else max(0, int(paid_research_limit))
+        )
+        self.paid_research_cost_limit = (
+            None
+            if paid_research_cost_limit is None
+            else max(0, int(paid_research_cost_limit))
         )
         self.effective_research_limit = (
             None
@@ -378,6 +381,23 @@ class GuildRunner:
                     and result.paid_research_count >= self.paid_research_limit
                 ):
                     result.stop_reason = "paid_count_reached"
+                    break
+
+                next_paid_count = (
+                    int(result.guild_progress.daily_donation_count_after or 0) + 1
+                )
+                next_paid_cost = guild_paid_research_cost(next_paid_count)
+                if (
+                    self.paid_research_cost_limit is not None
+                    and next_paid_cost is not None
+                    and next_paid_cost > self.paid_research_cost_limit
+                ):
+                    result.stop_reason = "paid_cost_limit"
+                    result.paid_stop_message = (
+                        f"next paid research cost {next_paid_cost} exceeds "
+                        f"limit {self.paid_research_cost_limit}"
+                    )
+                    log.info("%s", result.paid_stop_message)
                     break
 
                 index = result.paid_research_count + 1

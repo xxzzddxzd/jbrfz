@@ -1228,6 +1228,33 @@ class GuildRunnerTests(unittest.TestCase):
             1,
         )
 
+    def test_paid_cost_limit_stops_before_expensive_tier(self) -> None:
+        client = FakeWorkflowClient()
+        runner = GuildRunner(
+            client,
+            AccountState(mid="MID", game_access_token="token").to_session(),
+            paid_research_limit=None,
+            paid_research_cost_limit=300,
+            sleep_seconds=0,
+            initial_diamond_balance=1000,
+            attendance_already_claimed=True,
+            leave_after=False,
+        )
+        initial = parse_accept_guild_invitation_response(
+            pb.encode_message_field(
+                2,
+                guild_member_state(level=1, free_count=3, paid_count=17),
+            )
+        )
+
+        result = runner.run_joined("G-ID", initial_action=initial)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.paid_research_count, 0)
+        self.assertEqual(result.stop_reason, "paid_cost_limit")
+        self.assertIn("400", result.paid_stop_message)
+        self.assertNotIn(CONDUCT_PAID_GUILD_LAB_RESEARCH_PATH, client.calls)
+
     def test_total_count_stops_during_free_research_and_counts_critical(self) -> None:
         client = FakeWorkflowClient()
         runner = GuildRunner(

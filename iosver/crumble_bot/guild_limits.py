@@ -68,6 +68,9 @@ GUILD_PAID_RESEARCH_PRICE_TIER_COUNT = len(GUILD_DAILY_PAID_RESEARCH_COSTS)
 GUILD_MAX_DAILY_FREE_RESEARCH_LIMIT = max(
     GUILD_DAILY_FREE_RESEARCH_LIMITS.values()
 )
+# Resident-guild daily automation must not spend the next tier once a single
+# donation would cost more than this safety limit.
+GUILD_DAILY_PAID_RESEARCH_MAX_COST = 300
 
 
 def parse_guild_daily_recruitment_limit(message: str) -> int | None:

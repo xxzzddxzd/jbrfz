@@ -37,7 +37,10 @@ from .guild import (
     parse_provide_guild_supports_response,
     parse_guild_search_response,
 )
-from .guild_limits import parse_guild_daily_recruitment_limit
+from .guild_limits import (
+    GUILD_DAILY_PAID_RESEARCH_MAX_COST,
+    parse_guild_daily_recruitment_limit,
+)
 from .guild_runner import GuildRunner
 from .social import Social, parse_get_user_social_info_response
 
@@ -586,6 +589,7 @@ class ResidentGuildRunner:
                     client,
                     api.session,
                     paid_research_limit=None,
+                    paid_research_cost_limit=GUILD_DAILY_PAID_RESEARCH_MAX_COST,
                     initial_guild_level=guild.guild_level,
                     initial_diamond_balance=state.diamond_balance,
                     on_balance=persist_balance,
