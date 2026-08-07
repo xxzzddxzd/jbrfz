@@ -251,6 +251,34 @@ def _guild_human_output(payload: object) -> str:
         )
         if fill.get("daily_recruit_remaining") is not None:
             lines.append(f"今日招募剩余：{fill['daily_recruit_remaining']}")
+        member_names = {}
+        members = status.get("members")
+        if isinstance(members, list):
+            member_names = {
+                str(item.get("mid") or "").upper(): str(item.get("name") or "")
+                for item in members
+                if isinstance(item, dict) and item.get("mid")
+            }
+        results = fill.get("results")
+        if isinstance(results, list) and results:
+            lines.append("本次账号：")
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                mid = str(item.get("mid") or "-").strip()
+                name = str(
+                    item.get("name")
+                    or member_names.get(mid.upper())
+                    or ""
+                ).strip()
+                label = f"{name}（{mid}）" if name else mid
+                if item.get("joined"):
+                    state_label = "已入会"
+                elif item.get("applied"):
+                    state_label = "待审批"
+                else:
+                    state_label = "失败"
+                lines.append(f"  - {label}：{state_label}")
 
     daily = payload.get("daily")
     if (
