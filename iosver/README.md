@@ -25,7 +25,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 支援；账号日常成功后会同步写入 `daily` 时间戳。
 
 如果只需要支援公会成员，可执行 `guild --gname <name> support`；它只读取支援中心，
-并按当天的 `guild_support_actions` 记录去重，不会触发其他日常动作。
+查询一次后复用请求列表让常驻账号直接支援；达到支援上限即停止，并按当天的
+`guild_support_actions` 记录去重，不会触发其他日常动作。
 
 `guild private` 是可重复执行的状态机：相同参数会继续原任务并输出当前进度、卡点和 `next_action`；未达到目标时不会提前交还会长。`--master-mid` 可省略，程序会复用已有任务的代理会长，或自动选择钻石最少的可用账号并将其固定记录到任务中。
 

@@ -11,6 +11,7 @@ from crumble_bot.grpc_client import GrpcResponse
 from crumble_bot.guild import (
     APPLY_GUILD_PATH,
     GET_GUILD_APPLICATIONS_FOR_USER_PATH,
+    GET_GUILD_SUPPORT_REQUESTS_PATH,
     JOIN_GUILD_PATH,
 )
 from crumble_bot.guild_resident_runner import ResidentGuildRunner
@@ -220,7 +221,7 @@ class ResidentGuildTests(unittest.TestCase):
 
     def test_support_is_standalone_and_does_not_create_daily_action(self) -> None:
         with AccountDB(self.db_path) as db:
-            self._add_accounts(db, count=1)
+            self._add_accounts(db, count=2)
             guild = db.upsert_managed_guild(
                 guild_id="G1",
                 gname="ahhhha",
@@ -235,8 +236,26 @@ class ResidentGuildTests(unittest.TestCase):
                 status="active",
                 details={"name": "bot-0"},
             )
+            db.upsert_guild_membership(
+                guild.id,
+                "BOT1",
+                slot_no=2,
+                member_type="managed",
+                status="active",
+                details={"name": "bot-1"},
+            )
 
-            class _NoopClient:
+            request = b"".join(
+                (
+                    pb.encode_string_field(1, "REQ1"),
+                    pb.encode_message_field(
+                        2, pb.encode_string_field(1, "OWNER")
+                    ),
+                )
+            )
+            rpc_paths = []
+
+            class _SupportClient:
                 def __init__(self, _endpoint: str) -> None:
                     pass
 
@@ -246,20 +265,30 @@ class ResidentGuildTests(unittest.TestCase):
                 def __exit__(self, *args) -> None:
                     return None
 
+                def unary(self, path: str, _message: bytes, *, metadata=None):
+                    rpc_paths.append(path)
+                    if path == GET_GUILD_SUPPORT_REQUESTS_PATH:
+                        return GrpcResponse(
+                            pb.encode_message_field(1, request), {}, {}
+                        )
+                    raise AssertionError(path)
+
             runner = ResidentGuildRunner(
                 db,
                 self._login,
-                client_factory=_NoopClient,
+                client_factory=_SupportClient,
             )
             calls = []
 
-            def fake_support(guild_row, supporter_mid, api, day_key):
-                calls.append((guild_row.guild_id, supporter_mid, day_key))
+            def fake_support(guild_row, supporter_mid, api, day_key, requests=None):
+                calls.append(
+                    (guild_row.guild_id, supporter_mid, day_key, requests)
+                )
                 return {
                     "ok": True,
-                    "attempted": 2,
-                    "count": 2,
-                    "available": 2,
+                    "attempted": 1,
+                    "count": 1,
+                    "available": len(requests or []),
                     "requests": [],
                 }
 
@@ -269,8 +298,13 @@ class ResidentGuildTests(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertEqual(result["count"], 2)
             self.assertEqual(result["attempted"], 2)
-            self.assertEqual(result["accounts_attempted"], 1)
+            self.assertEqual(result["accounts_attempted"], 2)
+            self.assertEqual(rpc_paths, [GET_GUILD_SUPPORT_REQUESTS_PATH])
             self.assertEqual(calls[0][0:2], ("G1", "BOT0"))
+            self.assertEqual(calls[1][0:2], ("G1", "BOT1"))
+            self.assertEqual(
+                [item.support_request_id for item in calls[0][3]], ["REQ1"]
+            )
             self.assertIsNone(
                 db.get_daily_guild_action(guild.id, result["day"], "BOT0")
             )

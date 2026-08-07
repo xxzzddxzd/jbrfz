@@ -438,6 +438,14 @@ class ResidentGuildRunner:
         support_count = 0
         support_attempted = 0
         failed = 0
+        cached_requests: Optional[list] = None
+        query_attempted = False
+        query_info: dict = {
+            "ok": False,
+            "attempted": False,
+            "request_count": 0,
+        }
+        stopped_reason = ""
         for membership in memberships:
             row = self.db.get(membership.mid)
             item = {
@@ -446,6 +454,7 @@ class ResidentGuildRunner:
                 "name": str(membership.details.get("name") or ""),
                 "support": None,
             }
+            member_stop_reason = ""
             if row is None:
                 message = "account_not_found"
                 item["error"] = message
@@ -467,9 +476,37 @@ class ResidentGuildRunner:
                 session = state.to_session()
                 with self.client_factory(state.endpoint or ENDPOINT) as client:
                     api = Guild(client, session)
-                    support_result = self._support_one(
-                        guild, membership.mid, api, day_key
-                    )
+                    if cached_requests is None:
+                        # The request list is shared by all supporters in this
+                        # invocation.  Querying it once avoids one extra RPC
+                        # per account; only the ProvideGuildSupports call is
+                        # repeated for each supporter.
+                        query_attempted = True
+                        cached_requests = parse_get_guild_support_requests_response(
+                            api.get_guild_support_requests(guild.guild_id).message
+                        )
+                        query_info = {
+                            "ok": True,
+                            "attempted": True,
+                            "queried_by_mid": membership.mid,
+                            "request_count": len(cached_requests),
+                        }
+                    if cached_requests:
+                        support_result = self._support_one(
+                            guild,
+                            membership.mid,
+                            api,
+                            day_key,
+                            requests=cached_requests,
+                        )
+                    else:
+                        support_result = {
+                            "ok": True,
+                            "attempted": 0,
+                            "count": 0,
+                            "available": 0,
+                            "requests": [],
+                        }
                     state.resource_key = api.session.resource_key
                 self._persist_logged_in(row, state)
 
@@ -504,6 +541,10 @@ class ResidentGuildRunner:
                 if not item["ok"]:
                     item["error"] = support_error or "support_failed"
                     failed += 1
+                if support_result.get("stopped_reason") == "support_limit":
+                    member_stop_reason = "support_limit"
+                elif not cached_requests:
+                    member_stop_reason = "no_pending_requests"
             except Exception as error:
                 message = f"{type(error).__name__}: {error}"
                 item["error"] = message
@@ -514,7 +555,19 @@ class ResidentGuildRunner:
                     last_error=message,
                 )
                 failed += 1
+                if query_attempted and cached_requests is None:
+                    query_info = {
+                        "ok": False,
+                        "attempted": True,
+                        "queried_by_mid": membership.mid,
+                        "request_count": 0,
+                        "error": message,
+                    }
+                    member_stop_reason = "query_failed"
             results.append(item)
+            if member_stop_reason:
+                stopped_reason = member_stop_reason
+                break
 
         self.db.update_managed_guild(
             guild.id,
@@ -524,11 +577,17 @@ class ResidentGuildRunner:
             "ok": failed == 0,
             "mode": "resident_support",
             "day": day_key,
-            "state": "completed" if failed == 0 else "partial_failure",
+            "state": (
+                stopped_reason
+                if stopped_reason
+                else ("completed" if failed == 0 else "partial_failure")
+            ),
             "count": support_count,
             "attempted": support_attempted,
             "accounts_attempted": len(results),
             "failed": failed,
+            "query": query_info,
+            **({"stopped_reason": stopped_reason} if stopped_reason else {}),
             "results": results,
         }
 
@@ -927,19 +986,21 @@ class ResidentGuildRunner:
         supporter_mid: str,
         api: Guild,
         day_key: str,
+        requests: Optional[list] = None,
     ) -> dict:
-        try:
-            requests = parse_get_guild_support_requests_response(
-                api.get_guild_support_requests(guild.guild_id).message
-            )
-        except Exception as error:
-            return {
-                "ok": False,
-                "attempted": 0,
-                "count": 0,
-                "requests": [],
-                "error": f"{type(error).__name__}: {error}",
-            }
+        if requests is None:
+            try:
+                requests = parse_get_guild_support_requests_response(
+                    api.get_guild_support_requests(guild.guild_id).message
+                )
+            except Exception as error:
+                return {
+                    "ok": False,
+                    "attempted": 0,
+                    "count": 0,
+                    "requests": [],
+                    "error": f"{type(error).__name__}: {error}",
+                }
         done_ids = self.db.list_guild_support_action_ids(
             guild.id, day_key, supporter_mid
         )
@@ -950,6 +1011,7 @@ class ResidentGuildRunner:
             and request.requester_mid != supporter_mid
         ]
         results: list[dict] = []
+        stopped_reason = ""
         for request in candidates:
             try:
                 response = api.provide_guild_supports(
@@ -990,6 +1052,7 @@ class ResidentGuildRunner:
                     }
                 )
                 if self._is_support_limit_error(error):
+                    stopped_reason = "support_limit"
                     break
         count = sum(1 for item in results if item.get("ok"))
         return {
@@ -998,6 +1061,7 @@ class ResidentGuildRunner:
             "count": count,
             "available": len(requests),
             "requests": results,
+            **({"stopped_reason": stopped_reason} if stopped_reason else {}),
         }
 
     def _reconcile_members(self, guild: ManagedGuildRow, snapshot) -> None:
@@ -1325,5 +1389,6 @@ class ResidentGuildRunner:
     def _is_support_limit_error(error: Exception) -> bool:
         text = str(error).lower()
         return "support" in text and any(
-            token in text for token in ("limit", "not enough", "daily")
+            token in text
+            for token in ("limit", "not enough", "daily", "maximum", "max")
         )
