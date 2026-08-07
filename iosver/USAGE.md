@@ -233,12 +233,13 @@ SOP：登录鉴权 → 直接加入公开公会 → 领取公会签到奖励 →
 - 省略 `--totalcount` 时，private 任务以 50 个成功账号为批次上限；服务端提前返回无法继续招募时，本批次直接进入 `awaiting_master_return`，不等待次日重置。
 - `guild_private_jobs.paid_count_per_account` 是兼容旧 SQLite 保留的字段名；当前保存的是单账号有效次数上限，旧数据库无需迁移即可继续使用。
 - 省略 `--master-mid` 时，程序优先复用该公会已有 job 中的 A；没有 job 时，从满足执行条件的账号中选择钻石余额最低者，并将其 MID 固定写入 `guild_private_jobs.controller_mid`。以后重跑同一命令仍使用该账号。
+- 复用 A 前会再次检查账号是否仍在目标公会或已结束 24 小时入会冷却；若上一个批次刚创建但 A 仍在冷却，程序会自动换用其他可用代理，否则直接返回冷却时间，不再发送必然失败的入会请求。
 - 自动选择会排除原会长、其他进行中 private job 的代理会长和捐赠账号；候选账号须有登录凭据，并满足 `ready=1`、`invalid=0`、`next_stage>30`、当前不在公会且已结束退会冷却。
 - 若该公会存在多个进行中的 private job，省略参数无法唯一确定 A，命令会输出候选 MID 并提示显式传入 `--master-mid`。
 - 公会切换公开/审批模式后，若缓存的 `join_method` 与当前命令冲突，程序会按已确认的 `guild_id` 在线重新搜索并更新缓存，不需要手工修改 SQLite，也不会再次要求确认公会。
 - 每次 JSON 都包含 `state`、当前/目标/剩余进度和 `next_action`，用于说明当前卡点及下一步操作。
 - 未达到 `--totalcount` 且暂时没有可用 B 时，状态保持为 `awaiting_donors`；补充符合条件的账号或等待 24 小时冷却结束后，重跑同一命令继续。
-- 只有达到目标后才进入 `awaiting_master_return`；任务已完成时重跑同一命令只返回 `target_already_complete`，不会创建新一轮。
+- 只有达到目标后才进入 `awaiting_master_return`；同一自然日内任务已完成时重跑只返回 `target_already_complete`，下个自然日会创建新的每日批次。
 - 每次只邀请并处理一个 B，退出后才处理下一个，避免占满公会或遗留批量邀请。
 - 同一个 B 在一个 private job 内只使用一次，避免冷却结束后被同一任务重复计算。
 - `--count`、`--totalcount`、暴击计数、动态免费次数和钻石统计与 public 完全一致。

@@ -620,7 +620,7 @@ class AccountDB:
             SELECT * FROM accounts
             WHERE ready=1 AND invalid=0 AND next_stage>30
               AND guild_joined_at<=guild_left_at
-              AND (guild<=0 OR guild<=?)
+              AND MAX(guild, guild_left_at)<=?
             ORDER BY
               CASE WHEN guild<=0 THEN 0 ELSE 1 END,
               guild ASC,
@@ -705,7 +705,7 @@ class AccountDB:
             SELECT COUNT(*) FROM accounts
             WHERE ready=1 AND invalid=0 AND next_stage>30
               AND guild_joined_at<=guild_left_at
-              AND (guild<=0 OR guild<=?)
+              AND MAX(guild, guild_left_at)<=?
             """,
             (cutoff,),
         ).fetchone()[0]
@@ -713,15 +713,17 @@ class AccountDB:
             """
             SELECT COUNT(*) FROM accounts
             WHERE ready=1 AND invalid=0 AND next_stage>30
-              AND guild_joined_at<=guild_left_at AND guild>?
+              AND guild_joined_at<=guild_left_at
+              AND MAX(guild, guild_left_at)>?
             """,
             (cutoff,),
         ).fetchone()[0]
         next_row = self._conn.execute(
             """
-            SELECT MIN(guild + ?) FROM accounts
+            SELECT MIN(MAX(guild, guild_left_at) + ?) FROM accounts
             WHERE ready=1 AND invalid=0 AND next_stage>30
-              AND guild_joined_at<=guild_left_at AND guild>?
+              AND guild_joined_at<=guild_left_at
+              AND MAX(guild, guild_left_at)>?
             """,
             (max(0, int(cooldown_seconds)), cutoff),
         ).fetchone()
@@ -1294,7 +1296,7 @@ class AccountDB:
             """
             SELECT a.* FROM accounts AS a
             WHERE a.ready=1 AND a.invalid=0 AND a.next_stage>30
-              AND (a.guild<=0 OR a.guild<=?)
+              AND MAX(a.guild, a.guild_left_at)<=?
               AND a.guild_joined_at<=a.guild_left_at
               AND NOT EXISTS (
                   SELECT 1 FROM guild_memberships AS m
@@ -1630,6 +1632,7 @@ class AccountDB:
         allowed = {
             "application_id",
             "status",
+            "controller_mid",
             "paid_count_per_account",
             "total_count_limit",
             "effective_count",

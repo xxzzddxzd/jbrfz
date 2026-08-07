@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 from dataclasses import asdict
 from datetime import datetime
+import time
 from pathlib import Path
 
 from .auth import AccountState, guest_login, new_device_ids
@@ -13,6 +15,7 @@ from .daily_runner import DailyRunner, DailyWorkflowResult
 from .db import (
     DEFAULT_DB,
     DAILY_TIMEZONE,
+    GUILD_COOLDOWN_SECONDS,
     AccountDB,
     AccountRow,
     GuildTargetRow,
@@ -392,6 +395,116 @@ def _select_private_controller(
             row.created_at,
             row.mid,
         ),
+    )
+
+
+def _private_controller_availability(
+    row: AccountRow | None,
+    guild_id: str,
+    *,
+    now: float | None = None,
+) -> dict:
+    """Check whether a controller can enter or already belongs to a guild.
+
+    Automatic controller selection already uses ``list_guild_eligible``.  A
+    controller reused from an older private job used to bypass that query,
+    which could select an account still inside the 24-hour rejoin cooldown.
+    Keep the check explicit for both automatic reuse and ``--master-mid``.
+    """
+    if row is None:
+        return {"ok": False, "reason": "controller_not_found"}
+    if not row.guest_secret:
+        return {"ok": False, "reason": "missing_guest_secret"}
+    if not row.ready or row.invalid or row.next_stage <= 30:
+        return {
+            "ok": False,
+            "reason": "controller_not_eligible",
+            "ready": bool(row.ready),
+            "invalid": bool(row.invalid),
+            "next_stage": row.next_stage,
+        }
+
+    current = time.time() if now is None else float(now)
+    if row.guild_joined_at > row.guild_left_at:
+        if row.guild_last_id == guild_id:
+            return {"ok": True, "reason": "already_in_target_guild"}
+        return {
+            "ok": False,
+            "reason": "currently_in_other_guild",
+            "guild_id": row.guild_last_id,
+        }
+
+    last_left_at = max(float(row.guild or 0), float(row.guild_left_at or 0))
+    cooldown_until = last_left_at + GUILD_COOLDOWN_SECONDS if last_left_at else 0
+    if cooldown_until > current:
+        return {
+            "ok": False,
+            "reason": "controller_cooldown",
+            "cooldown_until": cooldown_until,
+            "cooldown_until_local": _local_timestamp(cooldown_until),
+        }
+    return {"ok": True, "reason": "cooldown_complete"}
+
+
+def _private_controller_unavailable_payload(
+    mid: str,
+    availability: dict,
+) -> dict:
+    reason = str(availability.get("reason") or "controller_unavailable")
+    message = {
+        "controller_cooldown": (
+            "代理会长仍在入会冷却中，请换一个已结束冷却的账号，或等待到 "
+            f"{availability.get('cooldown_until_local', '-')} 后重试。"
+        ),
+        "currently_in_other_guild": "代理账号当前在其他公会中，无法作为本批次会长。",
+        "missing_guest_secret": "代理账号缺少登录凭据。",
+        "controller_not_eligible": "代理账号未满足 ready/invalid/next_stage 条件。",
+        "controller_not_found": "SQLite 中找不到代理账号。",
+    }.get(reason, "代理账号当前不可用。")
+    return {
+        "ok": False,
+        "complete": False,
+        "mode": "private",
+        "state": reason,
+        "stopped_reason": reason,
+        "controller": {
+            "mid": mid,
+            **{
+                key: value
+                for key, value in availability.items()
+                if key not in {"ok", "reason"}
+            },
+        },
+        "next_action": {
+            "action": "choose_another_controller",
+            "message": message,
+            "command": "增加 --master-mid 指定可用代理账号，或等待冷却结束后重跑。",
+        },
+    }
+
+
+def _record_private_controller_cooldown(
+    db: AccountDB,
+    mid: str,
+    message: str,
+) -> None:
+    """Persist a server-reported rejoin deadline for future selection."""
+    matched = re.search(
+        r"rejoin cooldown ends at\s+([0-9]{4}-[0-9]{2}-[0-9]{2}T[^' ]+)",
+        str(message or ""),
+        flags=re.IGNORECASE,
+    )
+    if not matched:
+        return
+    try:
+        deadline = datetime.fromisoformat(
+            matched.group(1).rstrip(".,;")
+        ).timestamp()
+    except ValueError:
+        return
+    db.mark_guild_left(
+        mid,
+        left_at=deadline - GUILD_COOLDOWN_SECONDS,
     )
 
 
@@ -1784,6 +1897,73 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
         )
         if not original_master_mid:
             raise SystemExit("目标公会缺少原会长 MID，无法建立 private 任务")
+
+        active_controller_job = db.get_active_private_job(
+            target.guild_id,
+            controller_mid,
+        )
+        if active_controller_job is not None and active_controller_job.error:
+            # A job created by an older binary may already contain the server
+            # deadline even though that binary did not persist it to accounts.
+            _record_private_controller_cooldown(
+                db,
+                controller_mid,
+                active_controller_job.error,
+            )
+            controller_row = db.get(controller_mid) or controller_row
+        controller_availability = _private_controller_availability(
+            controller_row,
+            target.guild_id,
+        )
+        if not controller_availability.get("ok"):
+            can_replace_controller = bool(
+                not controller_value
+                and controller_source in {"latest_job", "active_job"}
+                and (
+                    controller_source == "latest_job"
+                    or (
+                        active_controller_job is not None
+                        and active_controller_job.status == "created"
+                        and not db.list_private_accounts(active_controller_job.id)
+                    )
+                )
+            )
+            if can_replace_controller:
+                selected = _select_private_controller(
+                    db,
+                    exclude_mids={original_master_mid, controller_mid},
+                )
+                if selected is not None:
+                    if active_controller_job is not None:
+                        db.update_private_job(
+                            active_controller_job.id,
+                            controller_mid=selected.mid,
+                            application_id="",
+                            status="created",
+                            master_acquired_at=0,
+                            error="",
+                        )
+                    log.info(
+                        "private controller %s unavailable (%s); using %s",
+                        controller_mid,
+                        controller_availability.get("reason"),
+                        selected.mid,
+                    )
+                    controller_mid = selected.mid
+                    controller_row = selected
+                    controller_source = "auto_replaced"
+                    controller_availability = _private_controller_availability(
+                        controller_row,
+                        target.guild_id,
+                    )
+            if not controller_availability.get("ok"):
+                payload = _private_controller_unavailable_payload(
+                    controller_mid,
+                    controller_availability,
+                )
+                print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+                return 1
+
         if controller_mid == original_master_mid:
             if controller_source == "auto":
                 selected = _select_private_controller(
@@ -1928,6 +2108,7 @@ def _cmd_guild_private(args: argparse.Namespace) -> int:
                 payload["pool"] = _guild_pool_payload(payload["pool"])
         except Exception as error:
             message = f"{type(error).__name__}: {error}"
+            _record_private_controller_cooldown(db, controller_mid, message)
             db.update_private_job(job.id, error=message)
             payload = {
                 "ok": False,
