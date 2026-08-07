@@ -104,6 +104,24 @@ class ResidentGuildTests(unittest.TestCase):
                 invalid=False,
             )
 
+    def test_legacy_daily_action_is_replayed_after_daily_sop_upgrade(self) -> None:
+        self.assertFalse(
+            ResidentGuildRunner._daily_action_has_account_workflows(
+                {"status": "done", "details_json": '{"workflow": {}, "support": {}}'}
+            )
+        )
+        self.assertTrue(
+            ResidentGuildRunner._daily_action_has_account_workflows(
+                {
+                    "status": "done",
+                    "details_json": (
+                        '{"account_daily": {}, "crumble_dungeon": {}, '
+                        '"workflow": {}, "support": {}}'
+                    ),
+                }
+            )
+        )
+
     def test_schema_and_target_default_keep_two_slots(self) -> None:
         with AccountDB(self.db_path) as db:
             self._add_accounts(db)

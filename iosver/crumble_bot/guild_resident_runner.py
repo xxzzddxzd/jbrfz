@@ -369,7 +369,11 @@ class ResidentGuildRunner:
         results: list[dict] = []
         for membership in memberships:
             existing = self.db.get_daily_guild_action(guild.id, day_key, membership.mid)
-            if existing is not None and existing.get("status") == "done":
+            if (
+                existing is not None
+                and existing.get("status") == "done"
+                and self._daily_action_has_account_workflows(existing)
+            ):
                 results.append(
                     {
                         "ok": True,
@@ -396,6 +400,24 @@ class ResidentGuildRunner:
             "failed": failed,
             "results": results,
         }
+
+    @staticmethod
+    def _daily_action_has_account_workflows(action: dict) -> bool:
+        """Return whether a completed action includes the current daily SOP.
+
+        Before resident ``guild daily`` also ran the account daily rewards and
+        crumble dungeon, completed rows only contained ``workflow`` and
+        ``support``.  Treat those legacy rows as pending once so upgrading a
+        database does not silently skip the newly added actions.
+        """
+        try:
+            details = json.loads(action.get("details_json") or "{}")
+        except (TypeError, ValueError):
+            return False
+        return isinstance(details, dict) and {
+            "account_daily",
+            "crumble_dungeon",
+        }.issubset(details)
 
     def maintain(self, guild: ManagedGuildRow) -> dict:
         """Reconcile, fill vacancies, reconcile again, then run daily actions."""
