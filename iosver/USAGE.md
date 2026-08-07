@@ -97,7 +97,7 @@ python main.py guild --gname 'ahhhha' maintain   # status → fill → daily
   50 个入会申请，并同时检查实际容量，避免外部成员导致超员。公开公会直接加入；
   审批制公会由各候选账号自己提交申请，命令返回 `next_action=approve_applications`，
   由用户在手机同意后重跑 `fill`/`maintain`。申请状态不会冒充已入会成员。
-- `daily` 每个常驻账号每天只执行一次；重复执行会读取 `guild_daily_actions` 并跳过已完成账号。
+- `daily` 每次先同步手机上最新的公会成员状态，再对每个常驻账号每天只执行一次；重复执行会读取 `guild_daily_actions` 并跳过已完成账号。
   公会等级升级后的免费次数、钻石余额和支援请求都会写回 SQLite；付费捐赠在下一次
   单次成本超过 300 钻石前停止。
 - `support` 只执行支援中心，支援列表只查询一次，后续账号直接提交支援；达到支援上限

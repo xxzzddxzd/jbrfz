@@ -328,6 +328,11 @@ def _guild_human_output(payload: object) -> str:
             f"尝试 {support.get('attempted', 0)}，失败 {support.get('failed', 0)}"
         )
 
+    sync = payload.get("sync")
+    if isinstance(sync, dict) and not sync.get("ok", True):
+        sync_error = str(sync.get("error") or sync.get("stopped_reason") or "同步失败")
+        lines.append(f"同步：失败（{sync_error}）")
+
     if payload.get("mode") in {"guild_joblist", "private_return_list"}:
         jobs = payload.get("jobs")
         if isinstance(jobs, list):
@@ -1196,9 +1201,17 @@ def _cmd_guild_resident_fill(args: argparse.Namespace) -> int:
 def _cmd_guild_resident_daily(args: argparse.Namespace) -> int:
     with AccountDB(args.db) as db:
         target = _resident_target(db, args)
-        payload = ResidentGuildRunner(db, _login_account).daily(target)
+        runner = ResidentGuildRunner(db, _login_account)
+        # The phone may have approved applications since the last fill.  Sync
+        # first so those rows become active in SQLite before daily selects its
+        # member roster; otherwise daily would keep showing stale ``applied``
+        # rows and skip the newly accepted accounts.
+        sync = runner.sync(target)
         current = db.get_managed_guild(target.guild_id) or target
-        payload["status"] = ResidentGuildRunner(db, _login_account).status(current)
+        payload = runner.daily(current)
+        payload["sync"] = sync
+        current = db.get_managed_guild(target.guild_id) or current
+        payload["status"] = runner.status(current)
         _print_guild_payload(payload, args)
     return 0 if payload.get("ok") else 1
 
