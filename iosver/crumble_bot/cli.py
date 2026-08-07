@@ -698,8 +698,11 @@ def _cmd_guild_resident_status(args: argparse.Namespace) -> int:
         target = _resident_target(db, args)
         runner = ResidentGuildRunner(db, _login_account)
         payload = runner.sync(target)
+        current = db.get_managed_guild(target.guild_id) or target
+        name_refresh = runner.enrich_member_names(current)
         if not payload.get("ok"):
-            payload = {**runner.status(db.get_managed_guild(target.guild_id) or target), **payload}
+            payload = {**runner.status(current), **payload}
+        payload["name_refresh"] = name_refresh
         print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
     return 0
 
@@ -717,12 +720,15 @@ def _cmd_guild_resident_fill(args: argparse.Namespace) -> int:
         fill = runner.fill(current)
         current = db.get_managed_guild(target.guild_id) or current
         after = runner.sync(current)
+        current = db.get_managed_guild(target.guild_id) or current
+        name_refresh = runner.enrich_member_names(current)
         payload = {
             "ok": bool(fill.get("ok")),
             "mode": "resident",
             "before": before,
             "fill": fill,
             "after": after,
+            "name_refresh": name_refresh,
         }
         current = db.get_managed_guild(target.guild_id) or target
         payload["status"] = runner.status(current)
@@ -743,7 +749,11 @@ def _cmd_guild_resident_daily(args: argparse.Namespace) -> int:
 def _cmd_guild_resident_maintain(args: argparse.Namespace) -> int:
     with AccountDB(args.db) as db:
         target = _resident_target(db, args)
-        payload = ResidentGuildRunner(db, _login_account).maintain(target)
+        runner = ResidentGuildRunner(db, _login_account)
+        payload = runner.maintain(target)
+        current = db.get_managed_guild(target.guild_id) or target
+        payload["name_refresh"] = runner.enrich_member_names(current)
+        payload["status"] = runner.status(current)
         print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
     return 0 if payload.get("ok") else 1
 

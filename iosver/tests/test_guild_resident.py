@@ -14,6 +14,7 @@ from crumble_bot.guild import (
     JOIN_GUILD_PATH,
 )
 from crumble_bot.guild_resident_runner import ResidentGuildRunner
+from crumble_bot.social import GET_USER_SOCIAL_INFO_PATH
 
 
 def _join_response() -> bytes:
@@ -54,6 +55,22 @@ class _PrivateApplyClient:
         return None
 
     def unary(self, path: str, _message: bytes, *, metadata=None) -> GrpcResponse:
+        if path == GET_USER_SOCIAL_INFO_PATH:
+            entries = []
+            for index in range(4):
+                entries.append(
+                    pb.encode_message_field(
+                        1,
+                        b"".join(
+                            (
+                                pb.encode_string_field(1, f"BOT{index}"),
+                                pb.encode_int32_field(2, 31),
+                                pb.encode_string_field(3, f"bot-{index}"),
+                            )
+                        ),
+                    )
+                )
+            return GrpcResponse(b"".join(entries), {}, {})
         if path == GET_GUILD_APPLICATIONS_FOR_USER_PATH:
             return GrpcResponse(b"", {}, {})
         if path == APPLY_GUILD_PATH:
@@ -152,14 +169,19 @@ class ResidentGuildTests(unittest.TestCase):
                 status="active",
                 role=1,
             )
-            result = ResidentGuildRunner(
+            runner = ResidentGuildRunner(
                 db,
                 self._login,
                 client_factory=_PrivateApplyClient,
-            ).fill(guild)
+            )
+            result = runner.fill(guild)
             self.assertTrue(result["ok"])
             self.assertEqual(result["joined"], 0)
             self.assertEqual(result["applied"], 3)
+            self.assertEqual(
+                [item["name"] for item in result["results"]],
+                ["bot-1", "bot-2", "bot-3"],
+            )
             self.assertEqual(
                 result["next_action"]["action"],
                 "approve_applications",
@@ -167,6 +189,15 @@ class ResidentGuildTests(unittest.TestCase):
             self.assertEqual(
                 len(db.list_guild_memberships(guild.id, status="applied")),
                 3,
+            )
+            refresh = runner.enrich_member_names(guild)
+            self.assertEqual(refresh["updated"], 1)
+            self.assertEqual(
+                [
+                    item.details["name"]
+                    for item in db.list_guild_memberships(guild.id, status="applied")
+                ],
+                ["bot-1", "bot-2", "bot-3"],
             )
 
 

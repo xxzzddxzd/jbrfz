@@ -39,6 +39,7 @@ from .guild import (
 )
 from .guild_limits import parse_guild_daily_recruitment_limit
 from .guild_runner import GuildRunner
+from .social import Social, parse_get_user_social_info_response
 
 log = logging.getLogger(__name__)
 
@@ -420,12 +421,16 @@ class ResidentGuildRunner:
         slot: int,
     ) -> dict:
         mid = row.mid
+        candidate_name = ""
         try:
             state = self.login_account(row)
             self._persist_logged_in(row, state, note=f"resident:{guild.guild_id}")
             if guild.join_method == 0:
                 with self.client_factory(state.endpoint or ENDPOINT) as client:
                     api = Guild(client, state.to_session())
+                    candidate_name = self._lookup_user_name(
+                        client, api.session, mid
+                    )
                     response = api.join_guild(guild.guild_id)
                     action = parse_join_guild_response(response.message)
                     state.resource_key = api.session.resource_key
@@ -443,13 +448,17 @@ class ResidentGuildRunner:
                     role=int(action.member_state.role or 1),
                     joined_at=joined_at,
                     last_seen_at=joined_at,
-                    details={"member_state": asdict(action.member_state)},
+                    details={
+                        "member_state": asdict(action.member_state),
+                        **({"name": candidate_name} if candidate_name else {}),
+                    },
                 )
                 return {
                     "ok": True,
                     "joined": True,
                     "applied": False,
                     "mid": mid,
+                    **({"name": candidate_name} if candidate_name else {}),
                     "slot_no": slot,
                     "joined_at": joined_at,
                     "member_state": asdict(action.member_state),
@@ -457,6 +466,9 @@ class ResidentGuildRunner:
             else:
                 with self.client_factory(state.endpoint or ENDPOINT) as client:
                     api = Guild(client, state.to_session())
+                    candidate_name = self._lookup_user_name(
+                        client, api.session, mid
+                    )
                     applications = parse_guild_applications_for_user_response(
                         api.get_guild_applications_for_user().message
                     )
@@ -493,6 +505,7 @@ class ResidentGuildRunner:
                     details={
                         "application_id": application_id,
                         "applied_at": applied_at,
+                        **({"name": candidate_name} if candidate_name else {}),
                     },
                 )
                 return {
@@ -501,6 +514,7 @@ class ResidentGuildRunner:
                     "applied": True,
                     "awaiting_approval": True,
                     "mid": mid,
+                    **({"name": candidate_name} if candidate_name else {}),
                     "slot_no": slot,
                     "application_id": application_id,
                     "applied_at": applied_at,
@@ -516,8 +530,17 @@ class ResidentGuildRunner:
                 member_type="managed",
                 status="error",
                 last_error=message,
+                details=(
+                    {"name": candidate_name} if candidate_name else {}
+                ),
             )
-            return {"ok": False, "mid": mid, "slot_no": slot, "error": message}
+            return {
+                "ok": False,
+                "mid": mid,
+                **({"name": candidate_name} if candidate_name else {}),
+                "slot_no": slot,
+                "error": message,
+            }
 
     def _daily_one(
         self,
@@ -830,6 +853,91 @@ class ResidentGuildRunner:
             note=db_note,
         )
 
+    @staticmethod
+    def _lookup_user_name(client: GrpcClient, session, user_id: str) -> str:
+        """Resolve the candidate's display name for CLI/SQLite output."""
+        target = str(user_id or "").strip().upper()
+        if not target:
+            return ""
+        try:
+            response = Social(client, session).get_user_social_info((target,))
+            infos = parse_get_user_social_info_response(response.message)
+            matched = next(
+                (item for item in infos if item.user_id.strip().upper() == target),
+                None,
+            )
+            return matched.name if matched is not None else ""
+        except Exception as error:
+            log.warning("unable to resolve resident member name for %s: %s", target, error)
+            return ""
+
+    def enrich_member_names(self, guild: ManagedGuildRow) -> dict:
+        """Backfill names for locally tracked members/applications in one RPC."""
+        memberships = [
+            item
+            for item in self.db.list_guild_memberships(guild.id)
+            if item.status != "retired"
+        ]
+        missing = [
+            item
+            for item in memberships
+            if not str(item.details.get("name") or "").strip()
+        ]
+        if not missing:
+            return {"ok": True, "updated": 0, "missing": 0}
+
+        actor = None
+        for membership in memberships:
+            row = self.db.get(membership.mid)
+            if row is not None and row.guest_secret:
+                actor = row
+                break
+        if actor is None:
+            return {
+                "ok": False,
+                "updated": 0,
+                "missing": len(missing),
+                "error": "no_account_for_name_lookup",
+            }
+
+        try:
+            state = self.login_account(actor)
+            session = state.to_session()
+            with self.client_factory(state.endpoint or ENDPOINT) as client:
+                response = Social(client, session).get_user_social_info(
+                    tuple(item.mid for item in missing)
+                )
+            state.resource_key = session.resource_key
+            self._persist_logged_in(actor, state)
+            names = {
+                item.user_id.strip().upper(): item.name
+                for item in parse_get_user_social_info_response(response.message)
+                if item.name
+            }
+            updated = 0
+            for membership in missing:
+                name = names.get(membership.mid)
+                if not name:
+                    continue
+                self.db.update_guild_membership(
+                    guild.id,
+                    membership.mid,
+                    details={**membership.details, "name": name},
+                )
+                updated += 1
+            return {
+                "ok": True,
+                "updated": updated,
+                "missing": len(missing) - updated,
+            }
+        except Exception as error:
+            return {
+                "ok": False,
+                "updated": 0,
+                "missing": len(missing),
+                "error": f"{type(error).__name__}: {error}",
+            }
+
     def _recruitment_count(self, guild: ManagedGuildRow) -> int:
         today = resident_day_key()
         if guild.daily_recruit_day != today:
@@ -897,6 +1005,11 @@ class ResidentGuildRunner:
                     "joined_at": row.joined_at,
                     "last_seen_at": row.last_seen_at,
                     "last_error": row.last_error,
+                    **(
+                        {"name": row.details.get("name")}
+                        if row.details.get("name")
+                        else {}
+                    ),
                     **{
                         key: member.get(key)
                         for key in (
