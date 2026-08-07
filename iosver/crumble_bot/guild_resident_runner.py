@@ -27,13 +27,12 @@ from .guild import (
     Guild,
     GuildActionResult,
     GuildMemberStateSnapshot,
-    parse_accept_guild_invitation_response,
+    parse_apply_guild_response,
     parse_attend_guild_response,
     parse_guild_detail_response,
-    parse_guild_invitations_for_user_response,
+    parse_guild_applications_for_user_response,
     parse_get_guild_members_response,
     parse_get_guild_support_requests_response,
-    parse_invite_user_to_guild_response,
     parse_join_guild_response,
     parse_provide_guild_supports_response,
     parse_guild_search_response,
@@ -75,7 +74,11 @@ class ResidentGuildRunner:
             for row in memberships
             if row.member_type == "managed" and row.status == "active"
         ]
-        reserved = [row for row in memberships if row.member_type == "reserved"]
+        reserved = [
+            row
+            for row in memberships
+            if row.member_type == "reserved" and row.status != "retired"
+        ]
         today = resident_day_key()
         actions = []
         for row in managed:
@@ -175,7 +178,16 @@ class ResidentGuildRunner:
             for row in memberships
             if row.member_type == "managed" and row.status == "active"
         ]
-        target_vacancy = max(0, guild.target_managed_count - len(active))
+        pending = [
+            row
+            for row in memberships
+            if row.member_type == "managed"
+            and row.status in {"planned", "applied", "invited", "accepted"}
+        ]
+        target_vacancy = max(
+            0,
+            guild.target_managed_count - len(active) - len(pending),
+        )
         if target_vacancy <= 0:
             return {
                 "ok": True,
@@ -205,7 +217,7 @@ class ResidentGuildRunner:
         # make a nominal x-2 target overfill the server-side capacity.
         local_occupied = len(
             [row for row in memberships if row.status in {
-                "planned", "invited", "accepted", "active", "reserved"
+                "planned", "applied", "invited", "accepted", "active", "reserved"
             }]
         )
         occupied = max(int(guild.member_count), local_occupied)
@@ -246,44 +258,6 @@ class ResidentGuildRunner:
                 "results": [],
             }
 
-        controller = self._controller_row(guild)
-        if guild.join_method != 0 and controller is None:
-            return {
-                "ok": False,
-                "state": "permission_blocked",
-                "stopped_reason": "controller_not_available",
-                "requested": vacancy,
-                "joined": 0,
-                "vacancy": vacancy,
-                "next_action": {
-                    "action": "assign_controller",
-                    "message": "私有公会需要 controller_mid 账号保持会长身份。",
-                },
-                "results": [],
-            }
-        if (
-            guild.join_method != 0
-            and controller is not None
-            and not self._controller_is_master(guild, controller.mid)
-        ):
-            return {
-                "ok": False,
-                "state": "permission_blocked",
-                "stopped_reason": "controller_not_master",
-                "requested": vacancy,
-                "joined": 0,
-                "vacancy": vacancy,
-                "next_action": {
-                    "action": "transfer_master_to_controller",
-                    "message": (
-                        f"请在手机将会长委任给代理账号 {controller.mid}，"
-                        "完成后重跑 fill/maintain。"
-                    ),
-                    "controller_mid": controller.mid,
-                },
-                "results": [],
-            }
-
         limit = vacancy if not max_accounts else min(vacancy, max(0, int(max_accounts)))
         limit = min(limit, recruit_remaining)
         candidates = self.db.list_resident_candidates(guild.id)
@@ -291,7 +265,9 @@ class ResidentGuildRunner:
             row.slot_no
             for row in memberships
             if row.member_type == "managed"
-            and row.status in {"planned", "invited", "accepted", "active"}
+            and row.status in {
+                "planned", "applied", "invited", "accepted", "active"
+            }
             and row.slot_no > 0
         }
         results: list[dict] = []
@@ -300,13 +276,14 @@ class ResidentGuildRunner:
             slot = self._next_slot(slots, guild.target_managed_count)
             if slot is None:
                 break
-            item = self._join_one(guild, candidate, controller, slot)
+            item = self._join_one(guild, candidate, None, slot)
             results.append(item)
             if item.get("ok"):
                 self.db.mark_used(candidate.mid, True)
                 slots.add(slot)
                 recruited_today += 1
-                joined_so_far += 1
+                if item.get("joined"):
+                    joined_so_far += 1
                 self.db.update_managed_guild(
                     guild.id,
                     daily_recruit_day=resident_day_key(),
@@ -332,27 +309,41 @@ class ResidentGuildRunner:
                     )
                     break
 
-        joined = sum(1 for item in results if item.get("ok"))
+        joined = sum(1 for item in results if item.get("joined"))
+        applied = sum(1 for item in results if item.get("applied"))
+        filled = joined + applied
         recruitment_limit_hit = any(
             parse_guild_daily_recruitment_limit(item.get("error", "")) is not None
             for item in results
         )
         state = "daily_recruitment_limit" if recruitment_limit_hit else (
-            "filled" if joined else "fill_failed"
+            "awaiting_approval" if applied and not joined else (
+                "filled" if joined else "fill_failed"
+            )
         )
         payload = {
-            "ok": joined == len(results) and joined > 0,
+            "ok": filled == len(results) and filled > 0,
             "state": state,
             "requested": limit,
             "joined": joined,
+            "applied": applied,
+            "filled": filled,
             "vacancy_before": target_vacancy,
-            "vacancy_after": max(0, vacancy - joined),
+            "vacancy_after": max(0, vacancy - filled),
             "capacity_remaining_before": capacity_remaining,
             "daily_recruit_remaining": max(
                 0, guild.daily_recruit_limit - recruited_today
             ),
             "results": results,
         }
+        if applied:
+            payload["next_action"] = {
+                "action": "approve_applications",
+                "message": (
+                    "已为常驻账号提交入会申请；请在手机逐个同意申请，"
+                    "完成后重跑 guild --gname <name> maintain。"
+                ),
+            }
         if recruitment_limit_hit:
             payload["stopped_reason"] = "daily_recruitment_limit"
             payload["next_action"] = {
@@ -434,71 +425,86 @@ class ResidentGuildRunner:
             self._persist_logged_in(row, state, note=f"resident:{guild.guild_id}")
             if guild.join_method == 0:
                 with self.client_factory(state.endpoint or ENDPOINT) as client:
-                    response = Guild(client, state.to_session()).join_guild(
-                        guild.guild_id
-                    )
+                    api = Guild(client, state.to_session())
+                    response = api.join_guild(guild.guild_id)
                     action = parse_join_guild_response(response.message)
-            else:
-                if controller is None:
-                    raise RuntimeError("controller account is unavailable")
-                controller_state = self.login_account(controller)
-                self._persist_logged_in(
-                    controller, controller_state, note=f"controller:{guild.guild_id}"
+                    state.resource_key = api.session.resource_key
+                    self._persist_logged_in(row, state)
+                if action.member_state is None:
+                    raise RuntimeError("join response missing member_state")
+                joined_at = time.time()
+                self.db.mark_guild_joined(mid, guild.guild_id, joined_at=joined_at)
+                self.db.upsert_guild_membership(
+                    guild.id,
+                    mid,
+                    slot_no=slot,
+                    member_type="managed",
+                    status="active",
+                    role=int(action.member_state.role or 1),
+                    joined_at=joined_at,
+                    last_seen_at=joined_at,
+                    details={"member_state": asdict(action.member_state)},
                 )
-                with self.client_factory(
-                    controller_state.endpoint or ENDPOINT
-                ) as client:
-                    invite_response = Guild(
-                        client, controller_state.to_session()
-                    ).invite_user_to_guild(guild.guild_id, mid)
-                    invitation_id = parse_invite_user_to_guild_response(
-                        invite_response.message
-                    )
+                return {
+                    "ok": True,
+                    "joined": True,
+                    "applied": False,
+                    "mid": mid,
+                    "slot_no": slot,
+                    "joined_at": joined_at,
+                    "member_state": asdict(action.member_state),
+                }
+            else:
                 with self.client_factory(state.endpoint or ENDPOINT) as client:
                     api = Guild(client, state.to_session())
-                    invitations = parse_guild_invitations_for_user_response(
-                        api.get_guild_invitations_for_user().message
+                    applications = parse_guild_applications_for_user_response(
+                        api.get_guild_applications_for_user().message
                     )
-                    invitation = next(
+                    application = next(
                         (
                             item
-                            for item in invitations
-                            if item.invitation_id == invitation_id
-                            or item.guild.guild_id == guild.guild_id
+                            for item in applications
+                            if item.guild.guild_id == guild.guild_id
                         ),
                         None,
                     )
-                    if invitation is None:
-                        raise RuntimeError(
-                            "邀请已发送，但账号尚未看到对应邀请；请重跑 fill"
+                    application_id = (
+                        application.application_id
+                        if application is not None
+                        else parse_apply_guild_response(
+                            api.apply_guild(guild.guild_id).message
                         )
-                    action = parse_accept_guild_invitation_response(
-                        api.accept_guild_invitation(
-                            guild.guild_id, invitation.invitation_id
-                        ).message
                     )
-            if action.member_state is None:
-                raise RuntimeError("join response missing member_state")
-            joined_at = time.time()
-            self.db.mark_guild_joined(mid, guild.guild_id, joined_at=joined_at)
-            self.db.upsert_guild_membership(
-                guild.id,
-                mid,
-                slot_no=slot,
-                member_type="managed",
-                status="active",
-                role=int(action.member_state.role or 1),
-                joined_at=joined_at,
-                last_seen_at=joined_at,
-                details={"member_state": asdict(action.member_state)},
-            )
-            return {
-                "ok": True,
-                "mid": mid,
-                "slot_no": slot,
-                "joined_at": joined_at,
-                "member_state": asdict(action.member_state),
-            }
+                    state.resource_key = api.session.resource_key
+                    self._persist_logged_in(row, state)
+                if not application_id:
+                    raise RuntimeError(
+                        "ApplyGuild response did not contain application_id"
+                    )
+                applied_at = time.time()
+                self.db.upsert_guild_membership(
+                    guild.id,
+                    mid,
+                    slot_no=slot,
+                    member_type="managed",
+                    status="applied",
+                    role=1,
+                    last_seen_at=applied_at,
+                    details={
+                        "application_id": application_id,
+                        "applied_at": applied_at,
+                    },
+                )
+                return {
+                    "ok": True,
+                    "joined": False,
+                    "applied": True,
+                    "awaiting_approval": True,
+                    "mid": mid,
+                    "slot_no": slot,
+                    "application_id": application_id,
+                    "applied_at": applied_at,
+                }
         except Exception as error:
             message = f"{type(error).__name__}: {error}"
             self.db.upsert_guild_membership(
@@ -757,16 +763,28 @@ class ResidentGuildRunner:
                     details={"member": asdict(member)},
                 )
             else:
+                joined_at = current.joined_at or now
+                if current.member_type == "managed":
+                    account = self.db.get(member.mid)
+                    if account is not None and account.guild_joined_at <= account.guild_left_at:
+                        self.db.mark_guild_joined(
+                            member.mid, guild.guild_id, joined_at=joined_at
+                        )
                 self.db.update_guild_membership(
                     guild.id,
                     member.mid,
                     status="active",
                     role=member.role,
+                    joined_at=joined_at,
                     last_seen_at=now,
                     details={**current.details, "member": asdict(member)},
                 )
         for member in existing.values():
-            if member.member_type == "managed" and member.mid not in live_ids:
+            if (
+                member.member_type == "managed"
+                and member.status not in {"applied", "invited", "accepted"}
+                and member.mid not in live_ids
+            ):
                 account = self.db.get(member.mid)
                 if account is not None and account.guild_joined_at > account.guild_left_at:
                     # A manual kick/leave is still subject to the same
@@ -786,7 +804,8 @@ class ResidentGuildRunner:
             mids.append(guild.controller_mid)
         mids.extend(
             row.mid
-            for row in self.db.list_guild_memberships(guild.id, status="active")
+            for row in self.db.list_guild_memberships(guild.id)
+            if row.status in {"active", "applied"}
             if row.mid not in mids
         )
         for mid in mids:
@@ -794,23 +813,6 @@ class ResidentGuildRunner:
             if row is not None and row.guest_secret:
                 return row
         return None
-
-    def _controller_row(self, guild: ManagedGuildRow) -> Optional[AccountRow]:
-        if not guild.controller_mid:
-            return None
-        row = self.db.get(guild.controller_mid)
-        return row if row is not None and row.guest_secret else None
-
-    @staticmethod
-    def _controller_is_master(guild: ManagedGuildRow, controller_mid: str) -> bool:
-        summary = guild.details.get("search_summary")
-        if not isinstance(summary, dict):
-            # Rows created by an older database may not have a cached search
-            # summary yet.  Let the API permission response drive the next
-            # action instead of making an unverifiable local assumption.
-            return True
-        master_mid = str(summary.get("master_user_id") or "").strip().upper()
-        return not master_mid or master_mid == str(controller_mid).strip().upper()
 
     def _persist_logged_in(
         self,
@@ -911,6 +913,7 @@ class ResidentGuildRunner:
                     "details": row.details,
                 }
                 for row in memberships
+                if row.status != "retired"
             ],
         }
 

@@ -1298,8 +1298,10 @@ class AccountDB:
               AND a.guild_joined_at<=a.guild_left_at
               AND NOT EXISTS (
                   SELECT 1 FROM guild_memberships AS m
-                  WHERE m.mid=a.mid
-                    AND m.status IN ('planned', 'invited', 'accepted', 'active', 'reserved')
+                    WHERE m.mid=a.mid
+                    AND m.status IN (
+                        'planned', 'applied', 'invited', 'accepted', 'active', 'reserved'
+                    )
               )
             ORDER BY a.created_at, a.mid
             """,

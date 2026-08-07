@@ -33,6 +33,7 @@ from .guild_private_runner import PrivateGuildRunner
 from .guild_resident_runner import ResidentGuildRunner
 from .invite import register_friend_inviter
 from .inviter import parse_inviter
+from .social import Social, parse_get_user_social_info_response
 from .stage_runner import StageConfig, StageRunner
 
 log = logging.getLogger(__name__)
@@ -509,21 +510,25 @@ def _resident_search_summary(
     return state, matches[0]
 
 
-def _resident_controller_candidate(
-    db: AccountDB,
-    *,
-    excluded: set[str] | None = None,
-) -> AccountRow | None:
-    """Choose a low-diamond account that can remain as a private controller."""
-    excluded_mids = {str(mid).strip().upper() for mid in (excluded or set())}
-    rows = [
-        row
-        for row in db.list_guild_eligible()
-        if row.mid not in excluded_mids and row.guest_secret
-    ]
-    if not rows:
-        return None
-    return min(rows, key=lambda row: (row.diamond_balance, row.created_at, row.mid))
+def _resident_lookup_user_name(state: AccountState, user_id: str) -> str:
+    """Resolve a controller's display name using the authenticated actor."""
+    target = str(user_id or "").strip().upper()
+    if not target:
+        return ""
+    try:
+        session = state.to_session()
+        with GrpcClient(state.endpoint or ENDPOINT) as client:
+            response = Social(client, session).get_user_social_info((target,))
+        state.resource_key = session.resource_key
+        infos = parse_get_user_social_info_response(response.message)
+        matched = next(
+            (item for item in infos if item.user_id.strip().upper() == target),
+            None,
+        )
+        return matched.name if matched is not None else ""
+    except Exception as error:
+        log.warning("unable to resolve resident controller name for %s: %s", target, error)
+        return ""
 
 
 def _cmd_guild_resident_init(args: argparse.Namespace) -> int:
@@ -571,7 +576,6 @@ def _cmd_guild_resident_init(args: argparse.Namespace) -> int:
             print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
             return 1
 
-        _persist_logged_in_actor(db, discovery, state, state.to_session())
         capacity = int(
             capacity_arg
             if capacity_arg is not None
@@ -584,22 +588,29 @@ def _cmd_guild_resident_init(args: argparse.Namespace) -> int:
                 "cached" if existing is not None and existing.capacity else "unknown"
             ),
         }
-        controller_mid = str(
+        current_master_mid = str(summary.master_user_id or "").strip().upper()
+        explicit_controller_mid = str(
             getattr(args, "controller_mid", "")
             or getattr(args, "master_mid", "")
-            or (existing.controller_mid if existing is not None else "")
             or ""
         ).strip().upper()
-        controller_source = "argument" if controller_mid else ""
-        if not controller_mid and summary.join_method != 0:
-            controller = _resident_controller_candidate(
-                db,
-                excluded={summary.master_user_id, discovery.mid},
-            )
-            if controller is not None:
-                controller_mid = controller.mid
-                controller_source = "auto"
-        details["controller_source"] = controller_source or "existing"
+
+        # Resident private-guild filling uses ApplyGuild from each candidate;
+        # the owner approves those applications on the phone.  No proxy/master
+        # account is needed for the resident flow.  Keep an explicitly passed
+        # controller only as legacy metadata; fill does not use it.
+        controller_mid = explicit_controller_mid
+        controller_source = "argument" if controller_mid else "none"
+
+        controller_name = ""
+        if controller_mid:
+            if controller_mid == current_master_mid:
+                controller_name = summary.master_name or gmname
+            else:
+                controller_name = _resident_lookup_user_name(state, controller_mid)
+        details["controller_source"] = controller_source
+        details["controller_name"] = controller_name
+        _persist_logged_in_actor(db, discovery, state, state.to_session())
         target = db.upsert_managed_guild(
             guild_id=summary.guild_id,
             gname=summary.name or gname,
@@ -618,6 +629,22 @@ def _cmd_guild_resident_init(args: argparse.Namespace) -> int:
             member_count=summary.member_count,
             details=details,
         )
+        # ``upsert_managed_guild`` intentionally preserves an existing
+        # controller when the incoming value is empty for compatibility with
+        # older callers.  Resident init is authoritative, so clear any stale
+        # controller from the previous proxy-based implementation.
+        if not controller_mid and target.controller_mid:
+            target = db.update_managed_guild(target.id, controller_mid="")
+        for old_membership in db.list_guild_memberships(
+            target.id, member_type="reserved"
+        ):
+            if old_membership.mid != controller_mid:
+                db.update_guild_membership(
+                    target.id,
+                    old_membership.mid,
+                    status="retired",
+                    last_error="resident flow does not require a controller",
+                )
         if controller_mid:
             controller_is_master = bool(
                 summary.master_user_id
@@ -629,7 +656,10 @@ def _cmd_guild_resident_init(args: argparse.Namespace) -> int:
                 member_type="reserved",
                 status="active" if controller_is_master else "planned",
                 role=0 if controller_is_master else 1,
-                details={"source": "controller"},
+                details={
+                    "source": "controller",
+                    **({"name": controller_name} if controller_name else {}),
+                },
             )
         payload = ResidentGuildRunner(db, _login_account).status(target)
         init_ok = bool(capacity)
@@ -651,19 +681,13 @@ def _cmd_guild_resident_init(args: argparse.Namespace) -> int:
                 "action": "rerun_init_with_capacity",
                 "message": "GetGuild 未直接返回容量，请补充 --capacity x 后重跑 init。",
             }
-        elif summary.join_method != 0 and not controller_mid:
+        else:
             payload["next_action"] = {
-                "action": "prepare_controller_account",
-                "message": "私有公会需要可登录的常驻代理会长，请补充账号或传入 --controller-mid。",
-            }
-        elif summary.join_method != 0 and controller_mid != summary.master_user_id:
-            payload["next_action"] = {
-                "action": "transfer_master_to_controller",
+                "action": "fill",
                 "message": (
-                    f"请在手机将会长委任给代理账号 {controller_mid}，"
-                    "完成后重跑 guild --gname <name> fill/maintain。"
+                    "init 只初始化配置，不发送邀请；执行 guild --gname <name> fill "
+                    "开始补充常驻成员。"
                 ),
-                "controller_mid": controller_mid,
             }
         print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
     return 0 if init_ok else 1
@@ -683,9 +707,25 @@ def _cmd_guild_resident_status(args: argparse.Namespace) -> int:
 def _cmd_guild_resident_fill(args: argparse.Namespace) -> int:
     with AccountDB(args.db) as db:
         target = _resident_target(db, args)
-        payload = ResidentGuildRunner(db, _login_account).fill(target)
+        runner = ResidentGuildRunner(db, _login_account)
+        # Reconcile first so external/manual members are reflected before we
+        # calculate the vacancies.  After submitting applications (or direct
+        # joins for a public guild), reconcile again and persist who is truly
+        # in the guild; an application is not treated as membership.
+        before = runner.sync(target)
         current = db.get_managed_guild(target.guild_id) or target
-        payload["status"] = ResidentGuildRunner(db, _login_account).status(current)
+        fill = runner.fill(current)
+        current = db.get_managed_guild(target.guild_id) or current
+        after = runner.sync(current)
+        payload = {
+            "ok": bool(fill.get("ok")),
+            "mode": "resident",
+            "before": before,
+            "fill": fill,
+            "after": after,
+        }
+        current = db.get_managed_guild(target.guild_id) or target
+        payload["status"] = runner.status(current)
         print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
     return 0 if payload.get("ok") else 1
 
@@ -2431,12 +2471,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--master-mid",
         help=(
             "private：可选；显式指定临时会长账号 MID。省略时优先复用已有任务，"
-            "否则自动选择钻石最少的可用账号；resident init 可作为 controller"
+            "否则自动选择钻石最少的可用账号；resident init 不需要此参数"
         ),
     )
     sp.add_argument(
         "--controller-mid",
-        help="resident init：指定常驻私有公会的控制/会长账号 MID",
+        help="兼容旧配置：指定常驻公会控制账号；当前 resident fill 不需要代理会长",
     )
     sp.add_argument(
         "--capacity",

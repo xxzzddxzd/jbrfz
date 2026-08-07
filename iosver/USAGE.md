@@ -74,9 +74,9 @@ python main.py guild --gname 'ahhhha' maintain
 ### 常驻公会管理
 
 常驻模式与旧的 `public/private` 临时进会流程相互独立。`init` 会搜索并缓存
-公会 ID、会长、加入方式和容量，默认把容量减去 2 作为常驻自控账号目标；
-审批制公会会自动选择一个低钻石账号作为代理会长候选，并在手机委任完成前
-返回 `next_action`。容量不能从搜索接口得到时必须在 `init` 提供 `--capacity`。
+公会 ID、会长、加入方式和容量，默认把容量减去 2 作为常驻账号目标；
+`init` 只初始化配置，不选择代理会长，也不发送邀请。容量不能从搜索接口得到时
+必须在 `init` 提供 `--capacity`。
 
 ```bash
 python main.py guild --gname 'ahhhha' init --gmname 'absdbld' --capacity 30
@@ -89,11 +89,13 @@ python main.py guild --gname 'ahhhha' maintain   # status → fill → daily
 - `--gname` 支持已初始化公会名称的唯一前缀；`--gmname` 只在 `init` 用于校验会长。
 - `status` 会在线同步成员名单和等级；SQLite 中保存成员 MID、名称/等级快照、角色、槽位、
   最近签到/捐赠/支援时间以及当天动作结果。
-- `fill` 只处理缺少的常驻槽位，不退出已有成员；每天最多招募 50 个账号，并同时检查
-  实际容量，避免外部成员导致超员。审批制公会要求代理账号已由手机委任为会长。
+- `fill` 先刷新当前公会成员，再只处理缺少的常驻槽位，不退出已有成员；每天最多提交
+  50 个入会申请，并同时检查实际容量，避免外部成员导致超员。公开公会直接加入；
+  审批制公会由各候选账号自己提交申请，命令返回 `next_action=approve_applications`，
+  由用户在手机同意后重跑 `fill`/`maintain`。申请状态不会冒充已入会成员。
 - `daily` 每个常驻账号每天只执行一次；重复执行会读取 `guild_daily_actions` 并跳过已完成账号。
   公会等级升级后的免费次数、钻石余额和支援请求都会写回 SQLite。
-- `maintain` 遇到容量不足、招募 50 人上限、代理会长权限或缺少账号时不会等待，直接返回
+- `maintain` 遇到容量不足、招募 50 人上限、待审批申请或缺少账号时不会等待，直接返回
   `state` 与 `next_action`，按提示处理后重跑同一命令。
 
 ---
