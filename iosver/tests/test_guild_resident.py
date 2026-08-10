@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -758,19 +760,27 @@ class ResidentGuildTests(unittest.TestCase):
             )
             calls = []
 
-            def fake_support(guild_row, supporter_mid, api, day_key, requests=None):
+            def fake_support(
+                guild_row,
+                supporter_mid,
+                api,
+                requests,
+                *,
+                available,
+            ):
                 calls.append(
-                    (guild_row.guild_id, supporter_mid, day_key, requests)
+                    (guild_row.guild_id, supporter_mid, requests)
                 )
                 return {
                     "ok": True,
                     "attempted": 1,
                     "count": 1,
-                    "available": len(requests or []),
+                    "available": available,
                     "requests": [],
+                    "_actions": [],
                 }
 
-            runner._support_one = fake_support
+            runner._perform_support_requests = fake_support
             progress = []
             result = runner.support(guild, on_progress=progress.append)
 
@@ -778,6 +788,7 @@ class ResidentGuildTests(unittest.TestCase):
             self.assertEqual(result["count"], 2)
             self.assertEqual(result["attempted"], 2)
             self.assertEqual(result["accounts_attempted"], 2)
+            self.assertEqual(result["workers"], 5)
             self.assertEqual(rpc_paths, [GET_GUILD_SUPPORT_REQUESTS_PATH])
             self.assertEqual(
                 [item["phase"] for item in progress],
@@ -789,10 +800,11 @@ class ResidentGuildTests(unittest.TestCase):
                 "[████████████████] 2/2｜成功 2｜失败 0｜完成",
                 cli._guild_support_progress_line(progress[-1]),
             )
+            calls.sort(key=lambda item: item[1])
             self.assertEqual(calls[0][0:2], ("G1", "BOT0"))
             self.assertEqual(calls[1][0:2], ("G1", "BOT1"))
             self.assertEqual(
-                [item.support_request_id for item in calls[0][3]], ["REQ1"]
+                [item.support_request_id for item in calls[0][2]], ["REQ1"]
             )
             self.assertIsNone(
                 db.get_daily_guild_action(guild.id, result["day"], "BOT0")
@@ -800,6 +812,166 @@ class ResidentGuildTests(unittest.TestCase):
             membership = db.get_guild_membership(guild.id, "BOT0")
             self.assertEqual(membership.details["name"], "bot-0")
             self.assertEqual(membership.details["last_support_day"], result["day"])
+
+    def test_support_uses_five_concurrent_accounts(self) -> None:
+        with AccountDB(self.db_path) as db:
+            self._add_accounts(db, count=10)
+            guild = db.upsert_managed_guild(
+                guild_id="G1",
+                gname="ahhhha",
+                gmname="absdbld",
+                capacity=12,
+            )
+            for index in range(10):
+                db.upsert_guild_membership(
+                    guild.id,
+                    f"BOT{index}",
+                    slot_no=index + 1,
+                    member_type="managed",
+                    status="active",
+                    details={"name": f"bot-{index}"},
+                )
+
+            request = pb.encode_string_field(1, "REQ1")
+
+            class SupportClient:
+                def __init__(self, _endpoint: str) -> None:
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args) -> None:
+                    return None
+
+                def unary(self, path: str, _message: bytes, *, metadata=None):
+                    if path == GET_GUILD_SUPPORT_REQUESTS_PATH:
+                        return GrpcResponse(
+                            pb.encode_message_field(1, request), {}, {}
+                        )
+                    raise AssertionError(path)
+
+            runner = ResidentGuildRunner(
+                db,
+                self._login,
+                client_factory=SupportClient,
+            )
+            lock = threading.Lock()
+            active = 0
+            maximum = 0
+
+            def fake_support(
+                _guild,
+                _supporter_mid,
+                _api,
+                _requests,
+                *,
+                available,
+            ):
+                nonlocal active, maximum
+                with lock:
+                    active += 1
+                    maximum = max(maximum, active)
+                time.sleep(0.03)
+                with lock:
+                    active -= 1
+                return {
+                    "ok": True,
+                    "attempted": 1,
+                    "count": 1,
+                    "available": available,
+                    "requests": [],
+                    "_actions": [],
+                }
+
+            runner._perform_support_requests = fake_support
+            result = runner.support(guild)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["workers"], 5)
+            self.assertEqual(result["accounts_attempted"], 10)
+            self.assertEqual(result["count"], 10)
+            self.assertEqual(maximum, 5)
+
+    def test_support_limit_stops_after_in_flight_batch(self) -> None:
+        with AccountDB(self.db_path) as db:
+            self._add_accounts(db, count=10)
+            guild = db.upsert_managed_guild(
+                guild_id="G1",
+                gname="ahhhha",
+                gmname="absdbld",
+                capacity=12,
+            )
+            for index in range(10):
+                db.upsert_guild_membership(
+                    guild.id,
+                    f"BOT{index}",
+                    slot_no=index + 1,
+                    member_type="managed",
+                    status="active",
+                )
+
+            request = pb.encode_string_field(1, "REQ1")
+
+            class SupportClient:
+                def __init__(self, _endpoint: str) -> None:
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args) -> None:
+                    return None
+
+                def unary(self, path: str, _message: bytes, *, metadata=None):
+                    if path == GET_GUILD_SUPPORT_REQUESTS_PATH:
+                        return GrpcResponse(
+                            pb.encode_message_field(1, request), {}, {}
+                        )
+                    raise AssertionError(path)
+
+            runner = ResidentGuildRunner(
+                db,
+                self._login,
+                client_factory=SupportClient,
+            )
+            calls = []
+
+            def fake_support(
+                _guild,
+                supporter_mid,
+                _api,
+                _requests,
+                *,
+                available,
+            ):
+                calls.append(supporter_mid)
+                if supporter_mid == "BOT0":
+                    return {
+                        "ok": False,
+                        "attempted": 1,
+                        "count": 0,
+                        "available": available,
+                        "requests": [],
+                        "_actions": [],
+                        "stopped_reason": "support_limit",
+                    }
+                time.sleep(0.03)
+                return {
+                    "ok": True,
+                    "attempted": 1,
+                    "count": 1,
+                    "available": available,
+                    "requests": [],
+                    "_actions": [],
+                }
+
+            runner._perform_support_requests = fake_support
+            result = runner.support(guild)
+
+            self.assertEqual(result["stopped_reason"], "support_limit")
+            self.assertEqual(result["accounts_attempted"], 5)
+            self.assertEqual(len(calls), 5)
 
     def test_support_progress_display_rewrites_tty_line(self) -> None:
         class TtyBuffer(io.StringIO):

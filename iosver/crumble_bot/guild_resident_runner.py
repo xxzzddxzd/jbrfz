@@ -10,6 +10,7 @@ import logging
 import json
 import re
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict
 from datetime import datetime
 from typing import Callable, Optional, Type
@@ -54,6 +55,7 @@ log = logging.getLogger(__name__)
 ClientFactory = Type[GrpcClient]
 LoginAccount = Callable[[AccountRow], AccountState]
 SupportProgress = Callable[[dict], None]
+RESIDENT_SUPPORT_WORKERS = 5
 
 
 def resident_day_key(now: Optional[float] = None) -> str:
@@ -769,26 +771,25 @@ class ResidentGuildRunner:
         support_count = 0
         support_attempted = 0
         failed = 0
-        cached_requests: Optional[list] = None
-        query_attempted = False
         query_info: dict = {
             "ok": False,
             "attempted": False,
             "request_count": 0,
         }
         stopped_reason = ""
+
+        runnable = []
         for membership in memberships:
             row = self.db.get(membership.mid)
-            item = {
-                "ok": False,
-                "mid": membership.mid,
-                "name": str(membership.details.get("name") or ""),
-                "support": None,
-            }
-            member_stop_reason = ""
             if row is None:
                 message = "account_not_found"
-                item["error"] = message
+                item = {
+                    "ok": False,
+                    "mid": membership.mid,
+                    "name": str(membership.details.get("name") or ""),
+                    "support": None,
+                    "error": message,
+                }
                 self.db.update_guild_membership(
                     guild.id,
                     membership.mid,
@@ -812,115 +813,94 @@ class ResidentGuildRunner:
                     },
                 )
                 continue
+            runnable.append((membership, row))
 
-            try:
-                state = self.login_account(row)
-                self._persist_logged_in(
-                    row, state, note=f"resident:{guild.guild_id}"
-                )
-                session = state.to_session()
-                with self.client_factory(state.endpoint or ENDPOINT) as client:
-                    api = Guild(client, session)
-                    if cached_requests is None:
-                        # The request list is shared by all supporters in this
-                        # invocation.  Querying it once avoids one extra RPC
-                        # per account; only the ProvideGuildSupports call is
-                        # repeated for each supporter.
-                        query_attempted = True
-                        cached_requests = parse_get_guild_support_requests_response(
-                            api.get_guild_support_requests(guild.guild_id).message
-                        )
-                        query_info = {
-                            "ok": True,
-                            "attempted": True,
-                            "queried_by_mid": membership.mid,
-                            "request_count": len(cached_requests),
-                        }
-                        self._notify_support_progress(
-                            on_progress,
-                            {
-                                "phase": "queried",
-                                "processed": len(results),
-                                "total": total_accounts,
-                                "support_count": support_count,
-                                "failed": failed,
-                                "request_count": len(cached_requests),
-                            },
-                        )
-                    if cached_requests:
-                        support_result = self._support_one(
-                            guild,
-                            membership.mid,
-                            api,
-                            day_key,
-                            requests=cached_requests,
-                        )
-                    else:
-                        support_result = {
-                            "ok": True,
-                            "attempted": 0,
-                            "count": 0,
-                            "available": 0,
-                            "requests": [],
-                        }
-                    state.resource_key = api.session.resource_key
-                self._persist_logged_in(row, state)
+        if not runnable:
+            stopped_reason = "no_active_accounts"
+            self.db.update_managed_guild(guild.id, status="degraded")
+            self._notify_support_progress(
+                on_progress,
+                {
+                    "phase": "done",
+                    "processed": len(results),
+                    "total": total_accounts,
+                    "support_count": support_count,
+                    "failed": failed,
+                    "stopped_reason": stopped_reason,
+                },
+            )
+            return {
+                "ok": False,
+                "mode": "resident_support",
+                "day": day_key,
+                "state": stopped_reason,
+                "count": 0,
+                "attempted": 0,
+                "accounts_attempted": len(results),
+                "failed": failed,
+                "query": query_info,
+                "stopped_reason": stopped_reason,
+                "workers": RESIDENT_SUPPORT_WORKERS,
+                "results": results,
+            }
 
-                support_count += int(support_result.get("count", 0) or 0)
-                support_attempted += int(
-                    support_result.get("attempted", 0) or 0
+        query_membership, query_row = runnable[0]
+        try:
+            state = self.login_account(query_row)
+            session = state.to_session()
+            with self.client_factory(state.endpoint or ENDPOINT) as client:
+                api = Guild(client, session)
+                cached_requests = parse_get_guild_support_requests_response(
+                    api.get_guild_support_requests(guild.guild_id).message
                 )
-                support_error = str(support_result.get("error") or "")
-                now = time.time()
-                self.db.update_guild_membership(
-                    guild.id,
-                    membership.mid,
-                    status="active",
-                    last_seen_at=now,
-                    last_support_at=(
-                        now
-                        if int(support_result.get("attempted", 0) or 0) > 0
-                        else membership.last_support_at
-                    ),
-                    last_error=support_error,
-                    details={
-                        **membership.details,
-                        "last_support_day": day_key,
-                    },
-                )
-                item.update(
-                    {
-                        "ok": bool(support_result.get("ok", False)),
-                        "support": support_result,
-                    }
-                )
-                if not item["ok"]:
-                    item["error"] = support_error or "support_failed"
-                    failed += 1
-                if support_result.get("stopped_reason") == "support_limit":
-                    member_stop_reason = "support_limit"
-                elif not cached_requests:
-                    member_stop_reason = "no_pending_requests"
-            except Exception as error:
-                message = f"{type(error).__name__}: {error}"
-                item["error"] = message
-                self.db.update_guild_membership(
-                    guild.id,
-                    membership.mid,
-                    status="active",
-                    last_error=message,
-                )
-                failed += 1
-                if query_attempted and cached_requests is None:
-                    query_info = {
-                        "ok": False,
-                        "attempted": True,
-                        "queried_by_mid": membership.mid,
-                        "request_count": 0,
-                        "error": message,
-                    }
-                    member_stop_reason = "query_failed"
+                state.resource_key = api.session.resource_key
+            self._persist_logged_in(
+                query_row,
+                state,
+                note=f"resident:{guild.guild_id}",
+            )
+            query_info = {
+                "ok": True,
+                "attempted": True,
+                "queried_by_mid": query_membership.mid,
+                "request_count": len(cached_requests),
+            }
+            self._notify_support_progress(
+                on_progress,
+                {
+                    "phase": "queried",
+                    "processed": len(results),
+                    "total": total_accounts,
+                    "support_count": support_count,
+                    "failed": failed,
+                    "request_count": len(cached_requests),
+                },
+            )
+        except Exception as error:
+            message = f"{type(error).__name__}: {error}"
+            item = {
+                "ok": False,
+                "mid": query_membership.mid,
+                "name": str(query_membership.details.get("name") or ""),
+                "support": None,
+                "error": message,
+            }
             results.append(item)
+            failed += 1
+            stopped_reason = "query_failed"
+            query_info = {
+                "ok": False,
+                "attempted": True,
+                "queried_by_mid": query_membership.mid,
+                "request_count": 0,
+                "error": message,
+            }
+            self.db.update_guild_membership(
+                guild.id,
+                query_membership.mid,
+                status="active",
+                last_error=message,
+            )
             self._notify_support_progress(
                 on_progress,
                 {
@@ -929,18 +909,170 @@ class ResidentGuildRunner:
                     "total": total_accounts,
                     "support_count": support_count,
                     "failed": failed,
-                    "mid": membership.mid,
+                    "mid": query_membership.mid,
                     "name": item["name"],
-                    "status": (
-                        member_stop_reason
-                        or ("ok" if item.get("ok") else "failed")
-                    ),
-                    "error": str(item.get("error") or ""),
+                    "status": stopped_reason,
+                    "error": message,
                 },
             )
-            if member_stop_reason:
-                stopped_reason = member_stop_reason
-                break
+            cached_requests = []
+
+        if not cached_requests:
+            if not stopped_reason:
+                stopped_reason = "no_pending_requests"
+            self.db.update_managed_guild(
+                guild.id,
+                status="active" if failed == 0 else "degraded",
+            )
+            self._notify_support_progress(
+                on_progress,
+                {
+                    "phase": "done",
+                    "processed": len(results),
+                    "total": total_accounts,
+                    "support_count": support_count,
+                    "failed": failed,
+                    "stopped_reason": stopped_reason,
+                },
+            )
+            return {
+                "ok": failed == 0,
+                "mode": "resident_support",
+                "day": day_key,
+                "state": stopped_reason,
+                "count": support_count,
+                "attempted": support_attempted,
+                "accounts_attempted": len(results),
+                "failed": failed,
+                "query": query_info,
+                "stopped_reason": stopped_reason,
+                "workers": RESIDENT_SUPPORT_WORKERS,
+                "results": results,
+            }
+
+        work_items = []
+        for index, (membership, row) in enumerate(runnable):
+            done_ids = self.db.list_guild_support_action_ids(
+                guild.id,
+                day_key,
+                membership.mid,
+            )
+            requests = [
+                request
+                for request in cached_requests
+                if request.support_request_id not in done_ids
+                and request.requester_mid != membership.mid
+            ]
+            work_items.append((index, membership, row, requests))
+
+        work_iter = iter(work_items)
+        pending = {}
+        with ThreadPoolExecutor(
+            max_workers=RESIDENT_SUPPORT_WORKERS,
+            thread_name_prefix="guild-support",
+        ) as executor:
+            for _ in range(RESIDENT_SUPPORT_WORKERS):
+                work = next(work_iter, None)
+                if work is None:
+                    break
+                index, membership, row, requests = work
+                future = executor.submit(
+                    self._support_network_one,
+                    guild,
+                    membership,
+                    row,
+                    requests,
+                    len(cached_requests),
+                )
+                pending[future] = (index, membership, row)
+
+            while pending:
+                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    index, membership, row = pending.pop(future)
+                    item, state = future.result()
+                    support_result = item.get("support")
+                    if isinstance(support_result, dict):
+                        support_result = self._persist_support_result(
+                            guild,
+                            day_key,
+                            membership.mid,
+                            support_result,
+                        )
+                        item["support"] = support_result
+                    if state is not None:
+                        self._persist_logged_in(row, state)
+
+                    support_value = int(
+                        (support_result or {}).get("count", 0) or 0
+                    )
+                    attempted_value = int(
+                        (support_result or {}).get("attempted", 0) or 0
+                    )
+                    support_count += support_value
+                    support_attempted += attempted_value
+                    if not item.get("ok"):
+                        failed += 1
+                    member_stop_reason = str(
+                        (support_result or {}).get("stopped_reason") or ""
+                    )
+                    if member_stop_reason == "support_limit":
+                        stopped_reason = "support_limit"
+
+                    now = time.time()
+                    self.db.update_guild_membership(
+                        guild.id,
+                        membership.mid,
+                        status="active",
+                        last_seen_at=now,
+                        last_support_at=(
+                            now
+                            if attempted_value > 0
+                            else membership.last_support_at
+                        ),
+                        last_error=str(item.get("error") or ""),
+                        details={
+                            **membership.details,
+                            "last_support_day": day_key,
+                        },
+                    )
+                    item["_index"] = index
+                    results.append(item)
+                    self._notify_support_progress(
+                        on_progress,
+                        {
+                            "phase": "account",
+                            "processed": len(results),
+                            "total": total_accounts,
+                            "support_count": support_count,
+                            "failed": failed,
+                            "mid": membership.mid,
+                            "name": item["name"],
+                            "status": (
+                                member_stop_reason
+                                or ("ok" if item.get("ok") else "failed")
+                            ),
+                            "error": str(item.get("error") or ""),
+                        },
+                    )
+
+                if not stopped_reason:
+                    while len(pending) < RESIDENT_SUPPORT_WORKERS:
+                        work = next(work_iter, None)
+                        if work is None:
+                            break
+                        index, membership, row, requests = work
+                        future = executor.submit(
+                            self._support_network_one,
+                            guild,
+                            membership,
+                            row,
+                            requests,
+                            len(cached_requests),
+                        )
+                        pending[future] = (index, membership, row)
+
+        results.sort(key=lambda item: int(item.pop("_index", -1)))
 
         self.db.update_managed_guild(
             guild.id,
@@ -971,9 +1103,52 @@ class ResidentGuildRunner:
             "accounts_attempted": len(results),
             "failed": failed,
             "query": query_info,
+            "workers": RESIDENT_SUPPORT_WORKERS,
             **({"stopped_reason": stopped_reason} if stopped_reason else {}),
             "results": results,
         }
+
+    def _support_network_one(
+        self,
+        guild: ManagedGuildRow,
+        membership: GuildMembershipRow,
+        row: AccountRow,
+        requests: list,
+        available: int,
+    ) -> tuple[dict, Optional[AccountState]]:
+        item = {
+            "ok": False,
+            "mid": membership.mid,
+            "name": str(membership.details.get("name") or ""),
+            "support": None,
+        }
+        try:
+            state = self.login_account(row)
+            session = state.to_session()
+            with self.client_factory(state.endpoint or ENDPOINT) as client:
+                api = Guild(client, session)
+                support_result = self._perform_support_requests(
+                    guild,
+                    membership.mid,
+                    api,
+                    requests,
+                    available=available,
+                )
+                state.resource_key = api.session.resource_key
+            item.update(
+                {
+                    "ok": bool(support_result.get("ok", False)),
+                    "support": support_result,
+                }
+            )
+            if not item["ok"]:
+                item["error"] = str(
+                    support_result.get("error") or "support_failed"
+                )
+            return item, state
+        except Exception as error:
+            item["error"] = f"{type(error).__name__}: {error}"
+            return item, None
 
     @staticmethod
     def _notify_support_progress(
@@ -1442,39 +1617,63 @@ class ResidentGuildRunner:
             if request.support_request_id not in done_ids
             and request.requester_mid != supporter_mid
         ]
+        result = self._perform_support_requests(
+            guild,
+            supporter_mid,
+            api,
+            candidates,
+            available=len(requests),
+        )
+        return self._persist_support_result(
+            guild,
+            day_key,
+            supporter_mid,
+            result,
+        )
+
+    def _perform_support_requests(
+        self,
+        guild: ManagedGuildRow,
+        supporter_mid: str,
+        api: Guild,
+        requests: list,
+        *,
+        available: int,
+    ) -> dict:
+        """Perform support RPCs without touching SQLite (worker-thread safe)."""
         results: list[dict] = []
+        actions: list[dict] = []
         stopped_reason = ""
-        for request in candidates:
+        for request in requests:
             try:
                 response = api.provide_guild_supports(
                     guild.guild_id, [request.support_request_id]
                 )
                 parsed = parse_provide_guild_supports_response(response.message)
-                self.db.upsert_guild_support_action(
-                    guild.id,
-                    day_key,
-                    supporter_mid,
-                    request.support_request_id,
-                    requester_mid=request.requester_mid,
-                    support_type=request.support_type,
-                    status="success",
-                    reduced_time_millis=request.reduced_time_millis,
-                    response={"action": asdict(parsed)},
+                actions.append(
+                    {
+                        "request_id": request.support_request_id,
+                        "requester_mid": request.requester_mid,
+                        "support_type": request.support_type,
+                        "status": "success",
+                        "reduced_time_millis": request.reduced_time_millis,
+                        "response": {"action": asdict(parsed)},
+                    }
                 )
                 results.append(
                     {"ok": True, "request_id": request.support_request_id}
                 )
             except Exception as error:
                 message = f"{type(error).__name__}: {error}"
-                self.db.upsert_guild_support_action(
-                    guild.id,
-                    day_key,
-                    supporter_mid,
-                    request.support_request_id,
-                    requester_mid=request.requester_mid,
-                    support_type=request.support_type,
-                    status="failed",
-                    error=message,
+                actions.append(
+                    {
+                        "request_id": request.support_request_id,
+                        "requester_mid": request.requester_mid,
+                        "support_type": request.support_type,
+                        "status": "failed",
+                        "reduced_time_millis": request.reduced_time_millis,
+                        "error": message,
+                    }
                 )
                 results.append(
                     {
@@ -1491,10 +1690,37 @@ class ResidentGuildRunner:
             "ok": all(item.get("ok") for item in results),
             "attempted": len(results),
             "count": count,
-            "available": len(requests),
+            "available": available,
             "requests": results,
+            "_actions": actions,
             **({"stopped_reason": stopped_reason} if stopped_reason else {}),
         }
+
+    def _persist_support_result(
+        self,
+        guild: ManagedGuildRow,
+        day_key: str,
+        supporter_mid: str,
+        result: dict,
+    ) -> dict:
+        """Persist one worker result from the SQLite-owning main thread."""
+        actions = list(result.get("_actions") or [])
+        for action in actions:
+            self.db.upsert_guild_support_action(
+                guild.id,
+                day_key,
+                supporter_mid,
+                str(action.get("request_id") or ""),
+                requester_mid=str(action.get("requester_mid") or ""),
+                support_type=str(action.get("support_type") or ""),
+                status=str(action.get("status") or "failed"),
+                reduced_time_millis=int(
+                    action.get("reduced_time_millis") or 0
+                ),
+                error=str(action.get("error") or ""),
+                response=action.get("response") or {},
+            )
+        return {key: value for key, value in result.items() if key != "_actions"}
 
     def _reconcile_members(self, guild: ManagedGuildRow, snapshot) -> None:
         live_ids = {member.mid for member in snapshot.members}
