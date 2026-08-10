@@ -141,7 +141,7 @@ python main.py guild --gname 'ahhhha' maintain   # status → fill → daily
 |------|------|------|
 | `--db` | 否 | sqlite，默认 `data/accounts.db` |
 
-SOP：重新登录 → `SignUp` 每日登录同步 → 刷新并领取放置奖励 → 补领每日 1 次免费放置加成 → 补领每日 3 次放置广告加成 → 查看邮箱并全部领取普通附件 → 未达到每日上限时领取邮箱广告奖励。
+SOP：重新登录 → `SignUp` 每日登录同步 → 刷新并领取放置奖励 → 补领每日 1 次免费放置加成 → 补领每日 3 次放置广告加成 → 查看邮箱并全部领取普通附件 → 未达到每日上限时领取邮箱广告奖励 → 执行 1 次碎屑副本（已完成当天则跳过）。
 
 - 账号必须 `ready=1`、`next_stage>30`、`invalid=0`；`used` 和公会冷却均不影响选择。
 - 命令不限制账号数量，会扫描所有符合条件的账号。
@@ -153,7 +153,8 @@ SOP：重新登录 → `SignUp` 每日登录同步 → 刷新并领取放置奖�
 - 每个账号的 `mailbox` 记录信件总数、可领取数、实际领取数、附件汇总及领取前后钻石；普通邮件只批量领取“未领取且有附件”的服务端邮件。
 - `mailbox.advertisement` 记录广告 ID、每日计数前后值、请求/成功次数和响应奖励。10101 的信箱广告 ID 为 `1673636113`、每日上限 1 次、配置奖励 1000 钻石；已达到每日上限时不会请求。
 - 广告领取使用 `CrumbleService/ReceiveMailAdvertisementReward`。成员函数暴露 `advertisement_data_id` 和可选 `skip_count`；SOP 按正常客户端行为不发送 `skip_count`。
-- 最新资源密钥、登录令牌和钻石余额会回写 SQLite。`totals` 汇总登录、放置奖励、放置免费/广告加成、普通邮件、邮箱广告及钻石变化。
+- 碎屑副本使用 `DungeonService/StartCrumbleDungeonBattle` 和 `FinishCrumbleDungeonBattle`，读取 `SignUp` 中账号最近使用的队伍；服务端提示当天已完成时按成功跳过处理。
+- 最新资源密钥、登录令牌和钻石余额会回写 SQLite。`totals` 汇总登录、放置奖励、放置免费/广告加成、普通邮件、邮箱广告、碎屑副本及钻石变化。
 
 ### `guild joblist`
 

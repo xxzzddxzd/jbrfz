@@ -10,20 +10,19 @@ import logging
 import json
 import time
 from dataclasses import asdict
-from datetime import datetime
 from typing import Callable, Optional, Type
 
 from .auth import AccountState
 from .constants import ENDPOINT
 from .crumble_dungeon import CrumbleDungeonRunner
 from .db import (
-    DAILY_TIMEZONE,
     AccountDB,
     AccountRow,
     GuildMembershipRow,
     ManagedGuildRow,
 )
 from .grpc_client import GrpcClient, GrpcError
+from .guild_calendar import guild_day_key
 from .guild import (
     Guild,
     GuildActionResult,
@@ -54,8 +53,7 @@ LoginAccount = Callable[[AccountRow], AccountState]
 
 
 def resident_day_key(now: Optional[float] = None) -> str:
-    timestamp = time.time() if now is None else float(now)
-    return datetime.fromtimestamp(timestamp, DAILY_TIMEZONE).date().isoformat()
+    return guild_day_key(now)
 
 
 class ResidentGuildRunner:
@@ -1436,6 +1434,15 @@ class ResidentGuildRunner:
             role=saved.get("role"),
             guild_id=saved.get("guild_id") or guild.guild_id,
             guild_name=saved.get("guild_name") or guild.gname,
+            last_free_researched_at_millis=int(
+                saved.get("last_free_researched_at_millis") or 0
+            ),
+            last_paid_researched_at_millis=int(
+                saved.get("last_paid_researched_at_millis") or 0
+            ),
+            last_support_rewarded_at_millis=int(
+                saved.get("last_support_rewarded_at_millis") or 0
+            ),
         )
         return GuildActionResult(member_state=state)
 

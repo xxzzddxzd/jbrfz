@@ -2,19 +2,25 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from crumble_bot import pbutil as pb
 from crumble_bot.auth import AccountState
 from crumble_bot.db import AccountDB
 from crumble_bot.grpc_client import GrpcResponse
+from crumble_bot.guild_calendar import guild_daily_count, guild_day_key
 from crumble_bot.guild import (
     APPLY_GUILD_PATH,
     GET_GUILD_APPLICATIONS_FOR_USER_PATH,
     GET_GUILD_SUPPORT_REQUESTS_PATH,
     JOIN_GUILD_PATH,
+    GuildActionResult,
+    GuildMemberStateSnapshot,
 )
-from crumble_bot.guild_resident_runner import ResidentGuildRunner
+from crumble_bot.guild_resident_runner import ResidentGuildRunner, resident_day_key
+from crumble_bot.guild_runner import GuildProgress
 from crumble_bot.social import GET_USER_SOCIAL_INFO_PATH
 
 
@@ -104,6 +110,53 @@ class ResidentGuildTests(unittest.TestCase):
                 ready=True,
                 invalid=False,
             )
+
+    def test_guild_day_rolls_over_at_kst_midnight(self) -> None:
+        before = datetime(2026, 8, 10, 14, 59, tzinfo=timezone.utc).timestamp()
+        after = datetime(2026, 8, 10, 15, 0, tzinfo=timezone.utc).timestamp()
+
+        self.assertEqual(guild_day_key(before), "2026-08-10")
+        self.assertEqual(guild_day_key(after), "2026-08-11")
+        self.assertEqual(resident_day_key(after), "2026-08-11")
+
+    def test_guild_daily_count_uses_server_action_day(self) -> None:
+        previous_day = int(
+            datetime(2026, 8, 10, 14, 59, tzinfo=timezone.utc).timestamp()
+            * 1000
+        )
+        current_day = int(
+            datetime(2026, 8, 10, 15, 1, tzinfo=timezone.utc).timestamp()
+            * 1000
+        )
+        now = datetime(2026, 8, 10, 15, 2, tzinfo=timezone.utc).timestamp()
+
+        self.assertEqual(guild_daily_count(26, previous_day, now=now), 0)
+        self.assertEqual(guild_daily_count(2, current_day, now=now), 2)
+        self.assertEqual(guild_daily_count(2, 0, now=now), 2)
+
+    def test_guild_progress_resets_stale_server_counters(self) -> None:
+        previous_day = int(
+            datetime(2026, 8, 10, 14, 59, tzinfo=timezone.utc).timestamp()
+            * 1000
+        )
+        now = datetime(2026, 8, 10, 15, 2, tzinfo=timezone.utc).timestamp()
+        action = GuildActionResult(
+            member_state=GuildMemberStateSnapshot(
+                guild_level=7,
+                daily_free_research_count=4,
+                daily_paid_research_count=26,
+                last_free_researched_at_millis=previous_day,
+                last_paid_researched_at_millis=previous_day,
+            )
+        )
+        progress = GuildProgress()
+
+        with patch("crumble_bot.guild_calendar.time.time", return_value=now):
+            progress.observe_action(action, initial=True)
+
+        self.assertEqual(progress.daily_free_research_count_before, 0)
+        self.assertEqual(progress.daily_donation_count_before, 0)
+        self.assertEqual(progress.next_donation_diamond_cost_before, 10)
 
     def test_legacy_daily_action_is_replayed_after_daily_sop_upgrade(self) -> None:
         self.assertFalse(

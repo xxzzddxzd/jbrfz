@@ -1,4 +1,4 @@
-"""One-account daily login, stage reward, and mailbox workflow."""
+"""One-account daily login, reward, mailbox, and optional dungeon workflow."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Callable, Optional
 
 from .currency import DIAMOND_CURRENCY_DATA_ID, parse_signup_currency_balance
-from .crumble_dungeon import parse_signup_cookie_ids
+from .crumble_dungeon import CrumbleDungeonRunner, parse_signup_cookie_ids
 from .grpc_client import GrpcClient
 from .headers import Session, build_metadata
 from .mailbox import (
@@ -450,6 +450,10 @@ class DailyWorkflowResult:
     error: str = ""
     skipped: bool = False
     cookie_ids: tuple[int, ...] = field(default_factory=tuple)
+    # Empty means the caller did not request the optional dungeon step.  The
+    # top-level account-pool daily enables it; resident-guild daily keeps its
+    # existing explicit dungeon call for compatibility with older runners.
+    crumble_dungeon: dict = field(default_factory=dict)
     stage_rewards: DailyStageRewardProgress = field(
         default_factory=DailyStageRewardProgress
     )
@@ -463,6 +467,10 @@ class DailyWorkflowResult:
             self.login_completed
             and self.stage_rewards.ok
             and self.mailbox.ok
+            and (
+                not self.crumble_dungeon
+                or bool(self.crumble_dungeon.get("ok", True))
+            )
             and self.diamond_balance_final is not None
             and not self.error
         )
@@ -484,10 +492,12 @@ class DailyRunner:
         session: Session,
         *,
         on_balance: Optional[Callable[[int], None]] = None,
+        include_crumble_dungeon: bool = False,
     ) -> None:
         self.client = client
         self.session = session
         self.on_balance = on_balance
+        self.include_crumble_dungeon = bool(include_crumble_dungeon)
 
     def run(self) -> DailyWorkflowResult:
         result = DailyWorkflowResult()
@@ -582,6 +592,14 @@ class DailyRunner:
                 balance, _ = self._sync_account_state()
             result.mailbox.diamond_balance_after = balance
             result.diamond_balance_final = balance
+
+            if self.include_crumble_dungeon:
+                result.crumble_dungeon = CrumbleDungeonRunner(
+                    self.client,
+                    self.session,
+                    cookie_ids=result.cookie_ids,
+                ).run()
+
             log.info(
                 "daily offline_claimed=%s bonus_free=%s bonus_advertisement=%s "
                 "mailbox_total=%s mailbox_claimable=%s mailbox_claimed=%s "
@@ -623,6 +641,11 @@ class DailyRunner:
                     f"{result.mailbox.advertisement.claim_requested_count}, "
                     "advertisement_claimed="
                     f"{result.mailbox.advertisement.claimed_count}"
+                )
+            if result.crumble_dungeon and not result.crumble_dungeon.get("ok"):
+                raise RuntimeError(
+                    "crumble dungeon failed: "
+                    f"{result.crumble_dungeon.get('error') or 'unknown error'}"
                 )
         except Exception as error:
             result.error = f"{type(error).__name__}: {error}"

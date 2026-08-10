@@ -116,6 +116,9 @@ def guild_member_state(
     role: int | None = None,
     guild_id: str = "",
     guild_name: str = "",
+    last_free_at_millis: int = 0,
+    last_paid_at_millis: int = 0,
+    last_support_at_millis: int = 0,
 ) -> bytes:
     parts = [
         pb.encode_int32_field(7, level),
@@ -128,6 +131,24 @@ def guild_member_state(
         parts.append(pb.encode_string_field(1, guild_id))
     if guild_name:
         parts.append(pb.encode_string_field(2, guild_name))
+    if last_free_at_millis:
+        parts.append(
+            pb.encode_message_field(
+                9, pb.encode_int64_field(1, last_free_at_millis)
+            )
+        )
+    if last_paid_at_millis:
+        parts.append(
+            pb.encode_message_field(
+                11, pb.encode_int64_field(1, last_paid_at_millis)
+            )
+        )
+    if last_support_at_millis:
+        parts.append(
+            pb.encode_message_field(
+                13, pb.encode_int64_field(1, last_support_at_millis)
+            )
+        )
     return b"".join(parts)
 
 
@@ -380,7 +401,14 @@ def guild_invitations_response() -> bytes:
 def accept_guild_invitation_response() -> bytes:
     return pb.encode_message_field(
         2,
-        guild_member_state(level=4, free_count=1, paid_count=2),
+        guild_member_state(
+            level=4,
+            free_count=1,
+            paid_count=2,
+            last_free_at_millis=1_786_000_001_000,
+            last_paid_at_millis=1_786_000_002_000,
+            last_support_at_millis=1_786_000_003_000,
+        ),
     )
 
 
@@ -546,6 +574,18 @@ class GuildParserTests(unittest.TestCase):
         self.assertEqual(accepted.member_state.guild_level, 4)
         self.assertEqual(accepted.member_state.daily_free_research_count, 1)
         self.assertEqual(accepted.member_state.daily_paid_research_count, 2)
+        self.assertEqual(
+            accepted.member_state.last_free_researched_at_millis,
+            1_786_000_001_000,
+        )
+        self.assertEqual(
+            accepted.member_state.last_paid_researched_at_millis,
+            1_786_000_002_000,
+        )
+        self.assertEqual(
+            accepted.member_state.last_support_rewarded_at_millis,
+            1_786_000_003_000,
+        )
 
     def test_guild_application_and_master_transfer_protocol(self) -> None:
         self.assertEqual(

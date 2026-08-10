@@ -12,6 +12,7 @@ from .currency import (
     parse_currency_payments,
 )
 from .grpc_client import GrpcClient, GrpcError
+from .guild_calendar import guild_daily_count
 from .guild import (
     Guild,
     GuildActionResult,
@@ -55,33 +56,33 @@ class GuildProgress:
     ) -> None:
         member_state = action.member_state
         if member_state is not None:
+            free_count = guild_daily_count(
+                member_state.daily_free_research_count,
+                member_state.last_free_researched_at_millis,
+            )
+            paid_count = guild_daily_count(
+                member_state.daily_paid_research_count,
+                member_state.last_paid_researched_at_millis,
+            )
             free_limit = guild_daily_free_research_limit(member_state.guild_level)
             free_remaining = (
-                max(0, free_limit - member_state.daily_free_research_count)
+                max(0, free_limit - free_count)
                 if free_limit is not None
                 else None
             )
-            next_paid_cost = guild_paid_research_cost(
-                member_state.daily_paid_research_count + 1
-            )
+            next_paid_cost = guild_paid_research_cost(paid_count + 1)
             if initial:
                 self.level_before = member_state.guild_level
-                self.daily_free_research_count_before = (
-                    member_state.daily_free_research_count
-                )
+                self.daily_free_research_count_before = free_count
                 self.daily_free_research_limit_before = free_limit
                 self.daily_free_research_remaining_before = free_remaining
-                self.daily_donation_count_before = (
-                    member_state.daily_paid_research_count
-                )
+                self.daily_donation_count_before = paid_count
                 self.next_donation_diamond_cost_before = next_paid_cost
             self.level_after = member_state.guild_level
-            self.daily_free_research_count_after = (
-                member_state.daily_free_research_count
-            )
+            self.daily_free_research_count_after = free_count
             self.daily_free_research_limit_after = free_limit
             self.daily_free_research_remaining_after = free_remaining
-            self.daily_donation_count_after = member_state.daily_paid_research_count
+            self.daily_donation_count_after = paid_count
             self.next_donation_diamond_cost_after = next_paid_cost
 
         progression = action.progression

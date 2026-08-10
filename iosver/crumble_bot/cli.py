@@ -448,6 +448,12 @@ def _numeric_change(before: int | None, after: int | None) -> int | None:
 
 
 def _daily_run_totals(workflows: list[DailyWorkflowResult]) -> dict:
+    dungeons = [
+        workflow.crumble_dungeon
+        for workflow in workflows
+        if isinstance(workflow.crumble_dungeon, dict)
+        and workflow.crumble_dungeon
+    ]
     return {
         "login_completed_count": sum(
             1 for workflow in workflows if workflow.login_completed
@@ -537,6 +543,30 @@ def _daily_run_totals(workflows: list[DailyWorkflowResult]) -> dict:
             )
             or 0
             for workflow in workflows
+        ),
+        "crumble_dungeon_checked_count": len(dungeons),
+        "crumble_dungeon_started_count": sum(
+            1 for dungeon in dungeons if dungeon.get("started")
+        ),
+        "crumble_dungeon_finished_count": sum(
+            1 for dungeon in dungeons if dungeon.get("finished")
+        ),
+        "crumble_dungeon_completed_count": sum(
+            1
+            for dungeon in dungeons
+            if dungeon.get("ok") and not dungeon.get("skipped")
+        ),
+        "crumble_dungeon_skipped_count": sum(
+            1 for dungeon in dungeons if dungeon.get("skipped")
+        ),
+        "crumble_dungeon_failed_count": sum(
+            1
+            for dungeon in dungeons
+            if not dungeon.get("ok", True) and not dungeon.get("skipped")
+        ),
+        "crumble_dungeon_reward_count": sum(
+            int((dungeon.get("result") or {}).get("reward_count") or 0)
+            for dungeon in dungeons
         ),
     }
 
@@ -1643,11 +1673,16 @@ def cmd_daily(args: argparse.Namespace) -> int:
                     note=row.note,
                 )
                 with GrpcClient(state.endpoint or ENDPOINT) as client:
-                    workflow = DailyRunner(
+                    daily_runner = DailyRunner(
                         client,
                         session,
                         on_balance=persist_balance,
-                    ).run()
+                    )
+                    # Keep the switch as an attribute assignment so older
+                    # test/integration runners with the original constructor
+                    # signature remain compatible.
+                    daily_runner.include_crumble_dungeon = True
+                    workflow = daily_runner.run()
                     workflows.append(workflow)
 
                 state.resource_key = session.resource_key

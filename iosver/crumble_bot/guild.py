@@ -127,6 +127,9 @@ class GuildMemberStateSnapshot:
     role: int | None = None
     guild_id: str = ""
     guild_name: str = ""
+    last_free_researched_at_millis: int = 0
+    last_paid_researched_at_millis: int = 0
+    last_support_rewarded_at_millis: int = 0
 
 
 @dataclass(frozen=True)
@@ -596,6 +599,15 @@ def _parse_guild_action_response(
             role=_optional_int_value(member_fields, 4),
             guild_id=_string_value(member_fields, 1),
             guild_name=_string_value(member_fields, 2),
+            last_free_researched_at_millis=_time_millis(
+                _message_value(member_fields, 9)
+            ),
+            last_paid_researched_at_millis=_time_millis(
+                _message_value(member_fields, 11)
+            ),
+            last_support_rewarded_at_millis=_time_millis(
+                _message_value(member_fields, 13)
+            ),
         )
 
     progression = None
