@@ -91,6 +91,9 @@ python main.py guild --gname 'ahhhha' maintain   # status → fill → daily
 # 需要完整结构化结果时加 --json；默认终端只显示简明摘要
 ```
 
+`fill` 会先用候选账号校验 SQLite 中的待审批申请；手机端已清空或拒绝的
+申请会由同一账号重新提交，仍存在的申请不会重复发送。
+
 - `--gname` 支持已初始化公会名称的唯一前缀；`--gmname` 只在 `init` 用于校验会长。
 - `status` 会在线同步成员名单和等级；SQLite 中保存成员 MID、名称/等级快照、角色、槽位、
   最近签到/捐赠/支援时间以及当天动作结果。

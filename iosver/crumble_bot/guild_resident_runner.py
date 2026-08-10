@@ -253,6 +253,36 @@ class ResidentGuildRunner:
             if row.member_type == "managed"
             and row.status in {"planned", "applied", "invited", "accepted"}
         ]
+        pending_validation: list[dict] = []
+        stale_pending_mids: set[str] = set()
+        if guild.join_method != 0:
+            for membership in pending:
+                if membership.status != "applied":
+                    continue
+                validation = self._validate_pending_application(
+                    guild,
+                    membership,
+                )
+                pending_validation.append(validation)
+                if validation.get("invalidated"):
+                    stale_pending_mids.add(membership.mid)
+            if pending_validation:
+                # Validation may have invalidated rows that the phone rejected
+                # or cleared.  Reload before calculating vacancies so they no
+                # longer reserve a slot in this same fill invocation.
+                memberships = self.db.list_guild_memberships(guild.id)
+                active = [
+                    row
+                    for row in memberships
+                    if row.member_type == "managed" and row.status == "active"
+                ]
+                pending = [
+                    row
+                    for row in memberships
+                    if row.member_type == "managed"
+                    and row.status
+                    in {"planned", "applied", "invited", "accepted"}
+                ]
         # Existing non-managed members already consume server slots.  They
         # satisfy the configured reserve first; when reserve is zero, subtract
         # them from the managed target so a full guild is reported as at target
@@ -307,6 +337,10 @@ class ResidentGuildRunner:
                 "vacancy": 0,
                 "results": pending_results,
             }
+            if pending_validation:
+                payload["pending_validation"] = self._pending_validation_summary(
+                    pending_validation
+                )
             if pending_approval:
                 payload["next_action"] = {
                     "action": "approve_applications",
@@ -380,6 +414,12 @@ class ResidentGuildRunner:
         limit = vacancy if not max_accounts else min(vacancy, max(0, int(max_accounts)))
         limit = min(limit, recruit_remaining)
         candidates = self.db.list_resident_candidates(guild.id)
+        if stale_pending_mids:
+            # A removed application should be retried with the same selected
+            # account, not silently replaced by another random pool account.
+            candidates.sort(
+                key=lambda row: (row.mid not in stale_pending_mids, row.created_at, row.mid)
+            )
         slots = {
             row.slot_no
             for row in memberships
@@ -396,6 +436,8 @@ class ResidentGuildRunner:
             if slot is None:
                 break
             item = self._join_one(guild, candidate, None, slot)
+            if candidate.mid in stale_pending_mids:
+                item["reapplied"] = bool(item.get("applied"))
             results.append(item)
             if item.get("ok"):
                 self.db.mark_used(candidate.mid, True)
@@ -455,6 +497,10 @@ class ResidentGuildRunner:
             ),
             "results": results,
         }
+        if pending_validation:
+            payload["pending_validation"] = self._pending_validation_summary(
+                pending_validation
+            )
         if applied:
             payload["next_action"] = {
                 "action": "approve_applications",
@@ -470,6 +516,120 @@ class ResidentGuildRunner:
                 "message": "公会今日招募人数已达上限，明日重跑 maintain。",
             }
         return payload
+
+    def _validate_pending_application(
+        self,
+        guild: ManagedGuildRow,
+        membership: GuildMembershipRow,
+    ) -> dict:
+        """Verify one locally pending application against applicant state."""
+        row = self.db.get(membership.mid)
+        if row is None:
+            message = "account_not_found"
+            self.db.update_guild_membership(
+                guild.id,
+                membership.mid,
+                slot_no=0,
+                status="error",
+                last_error=message,
+            )
+            return {
+                "ok": False,
+                "mid": membership.mid,
+                "pending": False,
+                "invalidated": True,
+                "error": message,
+            }
+        try:
+            state = self.login_account(row)
+            self._persist_logged_in(
+                row,
+                state,
+                note=f"resident:{guild.guild_id}",
+            )
+            with self.client_factory(state.endpoint or ENDPOINT) as client:
+                api = Guild(client, state.to_session())
+                applications = parse_guild_applications_for_user_response(
+                    api.get_guild_applications_for_user().message
+                )
+                current = next(
+                    (
+                        item
+                        for item in applications
+                        if item.guild.guild_id == guild.guild_id
+                    ),
+                    None,
+                )
+                state.resource_key = api.session.resource_key
+            self._persist_logged_in(row, state)
+            checked_at = time.time()
+            if current is not None:
+                self.db.update_guild_membership(
+                    guild.id,
+                    membership.mid,
+                    last_seen_at=checked_at,
+                    last_error="",
+                    details={
+                        **membership.details,
+                        "application_id": current.application_id,
+                        "application_validated_at": checked_at,
+                    },
+                )
+                return {
+                    "ok": True,
+                    "mid": membership.mid,
+                    "pending": True,
+                    "invalidated": False,
+                    "application_id": current.application_id,
+                }
+
+            self.db.update_guild_membership(
+                guild.id,
+                membership.mid,
+                status="stale",
+                last_seen_at=checked_at,
+                last_error="guild_application_not_found",
+                details={
+                    **membership.details,
+                    "application_invalidated_at": checked_at,
+                },
+            )
+            return {
+                "ok": True,
+                "mid": membership.mid,
+                "pending": False,
+                "invalidated": True,
+            }
+        except Exception as error:
+            message = f"{type(error).__name__}: {error}"
+            # A failed check must not trigger a duplicate application.  Keep
+            # the row pending and expose the error for the next retry.
+            self.db.update_guild_membership(
+                guild.id,
+                membership.mid,
+                last_error=f"application_check_failed: {message}",
+            )
+            return {
+                "ok": False,
+                "mid": membership.mid,
+                "pending": True,
+                "invalidated": False,
+                "error": message,
+            }
+
+    @staticmethod
+    def _pending_validation_summary(results: list[dict]) -> dict:
+        return {
+            "checked": len(results),
+            "confirmed": sum(
+                1 for item in results if item.get("ok") and item.get("pending")
+            ),
+            "invalidated": sum(
+                1 for item in results if item.get("invalidated")
+            ),
+            "failed": sum(1 for item in results if not item.get("ok")),
+            "results": results,
+        }
 
     def daily(self, guild: ManagedGuildRow) -> dict:
         """Run attendance, research/donation, and support for active accounts."""

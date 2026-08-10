@@ -86,6 +86,53 @@ class _PrivateApplyClient:
         raise AssertionError(path)
 
 
+def _pending_application_response(guild_id: str = "G1") -> bytes:
+    settings = pb.encode_int32_field(4, 1)
+    master = b"".join(
+        (
+            pb.encode_string_field(1, "OWNER"),
+            pb.encode_string_field(2, "owner"),
+        )
+    )
+    guild = b"".join(
+        (
+            pb.encode_string_field(1, guild_id),
+            pb.encode_string_field(2, "ahhhha"),
+            pb.encode_message_field(3, settings),
+            pb.encode_int32_field(4, 1),
+            pb.encode_message_field(5, master),
+        )
+    )
+    application = b"".join(
+        (
+            pb.encode_string_field(1, "APP-SERVER"),
+            pb.encode_message_field(3, guild),
+        )
+    )
+    return pb.encode_message_field(1, application)
+
+
+class _ExistingPrivateApplicationClient:
+    apply_calls = 0
+
+    def __init__(self, _endpoint: str) -> None:
+        pass
+
+    def __enter__(self) -> "_ExistingPrivateApplicationClient":
+        return self
+
+    def __exit__(self, *args) -> None:
+        return None
+
+    def unary(self, path: str, _message: bytes, *, metadata=None) -> GrpcResponse:
+        if path == GET_GUILD_APPLICATIONS_FOR_USER_PATH:
+            return GrpcResponse(_pending_application_response(), {}, {})
+        if path == APPLY_GUILD_PATH:
+            type(self).apply_calls += 1
+            raise AssertionError("existing application must not be submitted again")
+        raise AssertionError(path)
+
+
 class ResidentGuildTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -371,6 +418,79 @@ class ResidentGuildTests(unittest.TestCase):
                 ],
                 ["bot-1", "bot-2", "bot-3"],
             )
+
+    def test_private_fill_reapplies_stale_local_application(self) -> None:
+        with AccountDB(self.db_path) as db:
+            self._add_accounts(db, count=1)
+            guild = db.upsert_managed_guild(
+                guild_id="G1",
+                gname="ahhhha",
+                gmname="absdbld",
+                join_method=1,
+                capacity=3,
+                reserve_slots=2,
+            )
+            db.upsert_guild_membership(
+                guild.id,
+                "BOT0",
+                slot_no=1,
+                member_type="managed",
+                status="applied",
+                details={"application_id": "APP-STALE", "name": "bot-0"},
+            )
+            runner = ResidentGuildRunner(
+                db,
+                self._login,
+                client_factory=_PrivateApplyClient,
+            )
+
+            result = runner.fill(guild)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["requested"], 1)
+            self.assertEqual(result["applied"], 1)
+            self.assertTrue(result["results"][0]["reapplied"])
+            self.assertEqual(result["results"][0]["mid"], "BOT0")
+            self.assertEqual(result["pending_validation"]["invalidated"], 1)
+            membership = db.get_guild_membership(guild.id, "BOT0")
+            self.assertEqual(membership.status, "applied")
+            self.assertEqual(membership.details["application_id"], "APP1")
+
+    def test_private_fill_keeps_server_pending_application(self) -> None:
+        _ExistingPrivateApplicationClient.apply_calls = 0
+        with AccountDB(self.db_path) as db:
+            self._add_accounts(db, count=1)
+            guild = db.upsert_managed_guild(
+                guild_id="G1",
+                gname="ahhhha",
+                gmname="absdbld",
+                join_method=1,
+                capacity=3,
+                reserve_slots=2,
+            )
+            db.upsert_guild_membership(
+                guild.id,
+                "BOT0",
+                slot_no=1,
+                member_type="managed",
+                status="applied",
+                details={"application_id": "APP-LOCAL", "name": "bot-0"},
+            )
+            runner = ResidentGuildRunner(
+                db,
+                self._login,
+                client_factory=_ExistingPrivateApplicationClient,
+            )
+
+            result = runner.fill(guild)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["state"], "awaiting_approval")
+            self.assertEqual(result["requested"], 0)
+            self.assertEqual(result["pending_validation"]["confirmed"], 1)
+            self.assertEqual(_ExistingPrivateApplicationClient.apply_calls, 0)
+            membership = db.get_guild_membership(guild.id, "BOT0")
+            self.assertEqual(membership.details["application_id"], "APP-SERVER")
 
     def test_support_is_standalone_and_does_not_create_daily_action(self) -> None:
         with AccountDB(self.db_path) as db:

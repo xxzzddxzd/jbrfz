@@ -284,6 +284,13 @@ def _guild_human_output(payload: object) -> str:
             lines.append(f"今日招募剩余：{fill['daily_recruit_remaining']}")
         if fill.get("pending_approval"):
             lines.append(f"当前待审批：{fill['pending_approval']} 个")
+        pending_validation = fill.get("pending_validation")
+        if isinstance(pending_validation, dict):
+            lines.append(
+                f"待审批校验：有效 {pending_validation.get('confirmed', 0)}，"
+                f"失效 {pending_validation.get('invalidated', 0)}，"
+                f"失败 {pending_validation.get('failed', 0)}"
+            )
         member_names = {}
         members = status.get("members")
         if not isinstance(members, list):
@@ -310,7 +317,11 @@ def _guild_human_output(payload: object) -> str:
                 if item.get("joined"):
                     state_label = "已入会"
                 elif item.get("applied"):
-                    state_label = "待审批"
+                    state_label = (
+                        "已重新申请，待审批"
+                        if item.get("reapplied")
+                        else "待审批"
+                    )
                 elif item.get("status") in {
                     "planned",
                     "invited",
