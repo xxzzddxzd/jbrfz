@@ -1502,8 +1502,13 @@ class ResidentGuildRunner:
         now = time.time()
         for member in snapshot.members:
             current = existing.get(member.mid)
+            account = self.db.get(member.mid)
+            locally_controlled = bool(
+                account is not None
+                and account.guest_secret
+                and not account.invalid
+            )
             if current is None:
-                account = self.db.get(member.mid)
                 if account is not None:
                     self.db.mark_guild_joined(
                         member.mid,
@@ -1513,7 +1518,9 @@ class ResidentGuildRunner:
                 self.db.upsert_guild_membership(
                     guild.id,
                     member.mid,
-                    member_type="external",
+                    member_type=(
+                        "managed" if locally_controlled else "external"
+                    ),
                     status="active",
                     role=member.role,
                     last_seen_at=now,
@@ -1521,7 +1528,6 @@ class ResidentGuildRunner:
                 )
             else:
                 joined_at = current.joined_at or now
-                account = self.db.get(member.mid)
                 if account is not None and account.guild_joined_at <= account.guild_left_at:
                     self.db.mark_guild_joined(
                         member.mid, guild.guild_id, joined_at=joined_at
@@ -1529,6 +1535,11 @@ class ResidentGuildRunner:
                 self.db.update_guild_membership(
                     guild.id,
                     member.mid,
+                    member_type=(
+                        "managed"
+                        if current.member_type == "managed" or locally_controlled
+                        else current.member_type
+                    ),
                     status="active",
                     role=member.role,
                     joined_at=joined_at,

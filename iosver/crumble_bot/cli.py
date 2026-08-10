@@ -1314,6 +1314,11 @@ def _cmd_guild_resident_support(args: argparse.Namespace) -> int:
     with AccountDB(args.db) as db:
         target = _resident_target(db, args)
         runner = ResidentGuildRunner(db, _login_account)
+        # A member may have been manually approved, joined, or removed since
+        # the last resident command.  Refresh first so support uses every
+        # login-capable local member and does not include stale rows.
+        sync = runner.sync(target)
+        target = db.get_managed_guild(target.guild_id) or target
         progress_display = _GuildSupportProgressDisplay(
             sys.stderr,
             enabled=not bool(getattr(args, "quiet", False)),
@@ -1322,6 +1327,7 @@ def _cmd_guild_resident_support(args: argparse.Namespace) -> int:
             payload = runner.support(target, on_progress=progress_display.update)
         finally:
             progress_display.close()
+        payload["sync"] = sync
         current = db.get_managed_guild(target.guild_id) or target
         payload["status"] = runner.status(current)
         _print_guild_payload(payload, args)

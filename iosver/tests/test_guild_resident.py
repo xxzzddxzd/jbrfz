@@ -18,6 +18,7 @@ from crumble_bot.guild import (
     GET_GUILD_SUPPORT_REQUESTS_PATH,
     JOIN_GUILD_PATH,
     GuildActionResult,
+    GuildMemberSummarySnapshot,
     GuildMemberStateSnapshot,
 )
 from crumble_bot.guild_resident_runner import ResidentGuildRunner, resident_day_key
@@ -426,6 +427,46 @@ class ResidentGuildTests(unittest.TestCase):
                     for item in status["members"]
                 )
             )
+
+    def test_reconcile_promotes_login_capable_external_member(self) -> None:
+        with AccountDB(self.db_path) as db:
+            self._add_accounts(db, count=1)
+            guild = db.upsert_managed_guild(
+                guild_id="G1",
+                gname="ahhhha",
+                gmname="absdbld",
+                capacity=3,
+            )
+            db.upsert_guild_membership(
+                guild.id,
+                "BOT0",
+                member_type="external",
+                status="active",
+            )
+            runner = ResidentGuildRunner(db, self._login)
+
+            class Snapshot:
+                members = (
+                    GuildMemberSummarySnapshot(
+                        mid="BOT0",
+                        name="bot-0",
+                        crumble_level=31,
+                        role=1,
+                        joined_at_millis=1,
+                        last_accessed_at_millis=1,
+                        total_combat_power=100.0,
+                        contribution_point=0,
+                    ),
+                )
+
+            runner._reconcile_members(guild, Snapshot())
+
+            membership = db.get_guild_membership(guild.id, "BOT0")
+            self.assertEqual(membership.member_type, "managed")
+            self.assertEqual(membership.status, "active")
+            status = runner.status(guild)
+            self.assertEqual(status["roster"]["managed_active"], 1)
+            self.assertTrue(status["members"][0]["controlled"])
 
     def test_sync_prefers_managed_members_and_retries_next_actor(self) -> None:
         with AccountDB(self.db_path) as db:
