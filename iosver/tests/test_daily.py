@@ -14,6 +14,8 @@ from crumble_bot import cli, pbutil as pb
 from crumble_bot.auth import AccountState
 from crumble_bot.currency import DIAMOND_CURRENCY_DATA_ID
 from crumble_bot.daily_runner import (
+    DAILY_ACTION_VERSIONS,
+    DAILY_BASE_ACTION_VERSIONS,
     DailyStageRewardProgress,
     DailyRunner,
     DailyWorkflowResult,
@@ -344,6 +346,16 @@ class DailyRunnerTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertTrue(result.login_completed)
+        self.assertEqual(result.required_actions, DAILY_BASE_ACTION_VERSIONS)
+        self.assertEqual(
+            set(result.action_states), set(DAILY_BASE_ACTION_VERSIONS)
+        )
+        self.assertTrue(
+            all(
+                action["status"] == "done"
+                for action in result.action_states.values()
+            )
+        )
         self.assertEqual(result.diamond_balance_final, 2000)
         offline = result.stage_rewards.offline
         self.assertTrue(offline.checked)
@@ -414,6 +426,43 @@ class DailyRunnerTests(unittest.TestCase):
             client.calls.count(RECEIVE_STAGE_BONUS_AUTO_PRODUCTION_REWARDS_PATH),
             0,
         )
+
+    def test_daily_runner_only_executes_missing_action(self) -> None:
+        client = FakeDailyClient(
+            advertisement_count=1,
+            stage_free_count=1,
+            stage_advertisement_count=3,
+        )
+        saved_actions = {
+            action_key: {"version": version, "status": "done"}
+            for action_key, version in DAILY_BASE_ACTION_VERSIONS.items()
+        }
+        completed: list[tuple[str, dict]] = []
+
+        with patch("crumble_bot.daily_runner.CrumbleDungeonRunner") as dungeon:
+            dungeon.return_value.run.return_value = {
+                "ok": True,
+                "started": True,
+                "finished": True,
+                "result": {"reward_count": 1},
+            }
+            result = DailyRunner(
+                client,
+                AccountState(mid="MID", game_access_token="token").to_session(),
+                include_crumble_dungeon=True,
+                daily_action_state={"actions": saved_actions},
+                on_action_completed=lambda key, state: completed.append(
+                    (key, state)
+                ),
+            ).run()
+
+        self.assertTrue(result.ok)
+        self.assertEqual(client.calls, [SIGNUP_PATH])
+        self.assertEqual([key for key, _ in completed], ["crumble_dungeon"])
+        self.assertEqual(
+            result.action_states["crumble_dungeon"]["status"], "done"
+        )
+        dungeon.assert_called_once()
 
     def test_stage_reward_wire_requests_match_device_capture(self) -> None:
         self.assertEqual(
@@ -554,6 +603,75 @@ class DailyCommandTests(unittest.TestCase):
             self.assertEqual(status["eligible"], 2)
             self.assertEqual(status["completed_today"], 1)
 
+    def test_daily_json_backfills_new_action_after_legacy_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            now = datetime(2026, 8, 4, 16, tzinfo=DAILY_TIMEZONE).timestamp()
+            completed_at = datetime(
+                2026, 8, 4, 8, tzinfo=DAILY_TIMEZONE
+            ).timestamp()
+            with AccountDB(db_path) as db:
+                db.upsert_state(
+                    AccountState(mid="LEGACY", next_stage=31),
+                    ready=True,
+                    invalid=False,
+                )
+                db.mark_daily_completed("LEGACY", completed_at=completed_at)
+
+                rows = db.list_daily_accounts(
+                    now=now,
+                    required_action_versions=DAILY_ACTION_VERSIONS,
+                    legacy_action_versions=DAILY_BASE_ACTION_VERSIONS,
+                )
+                self.assertEqual([row.mid for row in rows], ["LEGACY"])
+
+                state = db.prepare_daily_state(
+                    rows[0],
+                    now=now,
+                    legacy_action_versions=DAILY_BASE_ACTION_VERSIONS,
+                )
+                self.assertTrue(
+                    all(
+                        state["actions"][key]["status"] == "done"
+                        for key in DAILY_BASE_ACTION_VERSIONS
+                    )
+                )
+                self.assertNotIn("crumble_dungeon", state["actions"])
+                db.save_daily_state("LEGACY", state)
+                db.update_daily_action_state(
+                    "LEGACY",
+                    day_key="2026-08-04",
+                    action_key="crumble_dungeon",
+                    action_state={"version": 1, "status": "skipped"},
+                )
+
+                status = db.daily_pool_status(
+                    now=now,
+                    required_action_versions=DAILY_ACTION_VERSIONS,
+                    legacy_action_versions=DAILY_BASE_ACTION_VERSIONS,
+                )
+                rows_after = db.list_daily_accounts(
+                    now=now,
+                    required_action_versions=DAILY_ACTION_VERSIONS,
+                    legacy_action_versions=DAILY_BASE_ACTION_VERSIONS,
+                )
+                upgraded_versions = {
+                    **DAILY_ACTION_VERSIONS,
+                    "crumble_dungeon": 2,
+                }
+                rows_after_upgrade = db.list_daily_accounts(
+                    now=now,
+                    required_action_versions=upgraded_versions,
+                    legacy_action_versions=DAILY_BASE_ACTION_VERSIONS,
+                )
+
+            self.assertEqual(status["eligible"], 0)
+            self.assertEqual(status["completed_today"], 1)
+            self.assertEqual(rows_after, [])
+            self.assertEqual(
+                [row.mid for row in rows_after_upgrade], ["LEGACY"]
+            )
+
     def test_daily_uses_ready_accounts_regardless_of_used_or_guild_cooldown(
         self,
     ) -> None:
@@ -623,6 +741,45 @@ class DailyCommandTests(unittest.TestCase):
                 second_summary["stopped_reason"],
                 "all_accounts_completed_today",
             )
+
+    def test_daily_command_backfills_same_day_legacy_account(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "accounts.db"
+            with AccountDB(db_path) as db:
+                db.upsert_state(
+                    AccountState(
+                        mid="LEGACY",
+                        guest_secret="secret",
+                        game_access_token="token",
+                        next_stage=31,
+                    ),
+                    ready=True,
+                    invalid=False,
+                )
+                db.mark_daily_completed("LEGACY")
+
+            args = argparse.Namespace(db=str(db_path))
+            output = io.StringIO()
+            with (
+                patch.object(cli, "GrpcClient", DummyClient),
+                patch.object(cli, "DailyRunner", FakeDailyRunner),
+                patch.object(
+                    cli, "_login_account", side_effect=lambda row: row.to_state()
+                ),
+                redirect_stdout(output),
+            ):
+                code = cli.cmd_daily(args)
+
+            self.assertEqual(code, 0)
+            summary = json.loads(output.getvalue())
+            self.assertEqual(summary["pool"]["eligible"], 1)
+            self.assertEqual(summary["attempted"], 1)
+            self.assertEqual(summary["count"], 1)
+            with AccountDB(db_path) as db:
+                state = db.get("LEGACY").daily_state
+                self.assertTrue(
+                    db.daily_state_is_complete(state, DAILY_ACTION_VERSIONS)
+                )
 
     def test_daily_command_has_no_count_argument(self) -> None:
         args = cli.build_parser().parse_args(["daily"])

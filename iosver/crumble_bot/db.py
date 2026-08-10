@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 from .auth import AccountState
@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     diamond_balance INTEGER NOT NULL DEFAULT 0,
     guild REAL NOT NULL DEFAULT 0,
     daily REAL NOT NULL DEFAULT 0,
+    daily_state_json TEXT NOT NULL DEFAULT '{}',
     guild_last_id TEXT NOT NULL DEFAULT '',
     guild_joined_at REAL NOT NULL DEFAULT 0,
     guild_left_at REAL NOT NULL DEFAULT 0,
@@ -239,6 +240,7 @@ class AccountRow:
     diamond_balance: int
     guild: float
     daily: float
+    daily_state: Dict[str, Any]
     guild_last_id: str
     guild_joined_at: float
     guild_left_at: float
@@ -395,6 +397,7 @@ class AccountDB:
             "diamond_balance": "INTEGER NOT NULL DEFAULT 0",
             "guild": "REAL NOT NULL DEFAULT 0",
             "daily": "REAL NOT NULL DEFAULT 0",
+            "daily_state_json": "TEXT NOT NULL DEFAULT '{}'",
             "guild_last_id": "TEXT NOT NULL DEFAULT ''",
             "guild_joined_at": "REAL NOT NULL DEFAULT 0",
             "guild_left_at": "REAL NOT NULL DEFAULT 0",
@@ -452,8 +455,8 @@ class AccountDB:
         # marker so future resident-guild migrations can be ordered without
         # breaking databases created by older releases.
         user_version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
-        if user_version < 2:
-            self._conn.execute("PRAGMA user_version=2")
+        if user_version < 3:
+            self._conn.execute("PRAGMA user_version=3")
 
     def close(self) -> None:
         self._conn.close()
@@ -635,12 +638,39 @@ class AccountDB:
         *,
         now: Optional[float] = None,
         limit: int = 0,
+        required_action_versions: Optional[Mapping[str, int]] = None,
+        legacy_action_versions: Optional[Mapping[str, int]] = None,
     ) -> List[AccountRow]:
         """Ready, valid accounts not successfully processed today.
 
         ``used`` and the guild cooldown intentionally do not affect this pool.
         A day follows the account login timezone, Asia/Shanghai.
         """
+        if required_action_versions:
+            rows = [
+                self._row(row)
+                for row in self._conn.execute(
+                    """
+                    SELECT * FROM accounts
+                    WHERE ready=1 AND invalid=0 AND next_stage>30
+                    ORDER BY created_at ASC
+                    """
+                )
+            ]
+            pending = [
+                row
+                for row in rows
+                if not self.daily_state_is_complete(
+                    self.prepare_daily_state(
+                        row,
+                        now=now,
+                        legacy_action_versions=legacy_action_versions,
+                    ),
+                    required_action_versions,
+                )
+            ]
+            return pending[: int(limit)] if limit > 0 else pending
+
         day_start, _ = self._daily_window(now)
         sql = """
             SELECT * FROM accounts
@@ -654,10 +684,45 @@ class AccountDB:
             params = (day_start, int(limit))
         return [self._row(row) for row in self._conn.execute(sql, params)]
 
-    def daily_pool_status(self, *, now: Optional[float] = None) -> Dict[str, Any]:
+    def daily_pool_status(
+        self,
+        *,
+        now: Optional[float] = None,
+        required_action_versions: Optional[Mapping[str, int]] = None,
+        legacy_action_versions: Optional[Mapping[str, int]] = None,
+    ) -> Dict[str, Any]:
         """Return today's eligible and completed daily-account counts."""
         day_start, next_day_start = self._daily_window(now)
         base = "ready=1 AND invalid=0 AND next_stage>30"
+        if required_action_versions:
+            rows = [
+                self._row(row)
+                for row in self._conn.execute(
+                    f"SELECT * FROM accounts WHERE {base} ORDER BY created_at ASC"
+                )
+            ]
+            completed_today = sum(
+                1
+                for row in rows
+                if self.daily_state_is_complete(
+                    self.prepare_daily_state(
+                        row,
+                        now=now,
+                        legacy_action_versions=legacy_action_versions,
+                    ),
+                    required_action_versions,
+                )
+            )
+            return {
+                "day": datetime.fromtimestamp(
+                    day_start, DAILY_TIMEZONE
+                ).date().isoformat(),
+                "timezone": str(DAILY_TIMEZONE),
+                "total": len(rows),
+                "eligible": len(rows) - completed_today,
+                "completed_today": completed_today,
+            }
+
         total = self._conn.execute(
             f"SELECT COUNT(*) FROM accounts WHERE {base}"
         ).fetchone()[0]
@@ -676,6 +741,118 @@ class AccountDB:
             "eligible": int(eligible),
             "completed_today": int(completed_today),
         }
+
+    def prepare_daily_state(
+        self,
+        account: AccountRow,
+        *,
+        now: Optional[float] = None,
+        legacy_action_versions: Optional[Mapping[str, int]] = None,
+    ) -> Dict[str, Any]:
+        """Return today's normalized per-action state for one account.
+
+        A same-day legacy ``accounts.daily`` timestamp predates per-action
+        persistence.  Seed only the original reward actions from that marker;
+        newly introduced actions remain missing and are therefore backfilled.
+        """
+        day_start, next_day_start = self._daily_window(now)
+        day_key = datetime.fromtimestamp(
+            day_start, DAILY_TIMEZONE
+        ).date().isoformat()
+        raw = account.daily_state if isinstance(account.daily_state, dict) else {}
+        raw_actions = raw.get("actions")
+        if raw.get("day") == day_key and isinstance(raw_actions, dict):
+            return {
+                **raw,
+                "day": day_key,
+                "timezone": str(DAILY_TIMEZONE),
+                "actions": {
+                    str(key): dict(value)
+                    for key, value in raw_actions.items()
+                    if isinstance(value, dict)
+                },
+            }
+
+        actions: Dict[str, Any] = {}
+        if day_start <= float(account.daily or 0) < next_day_start:
+            for action_key, version in (legacy_action_versions or {}).items():
+                actions[str(action_key)] = {
+                    "version": int(version),
+                    "status": "done",
+                    "completed_at": float(account.daily),
+                    "source": "legacy_daily_timestamp",
+                }
+        return {
+            "day": day_key,
+            "timezone": str(DAILY_TIMEZONE),
+            "actions": actions,
+        }
+
+    @staticmethod
+    def daily_state_is_complete(
+        state: Mapping[str, Any],
+        required_action_versions: Mapping[str, int],
+    ) -> bool:
+        actions = state.get("actions")
+        if not isinstance(actions, dict):
+            return False
+        for action_key, version in required_action_versions.items():
+            action = actions.get(action_key)
+            if not isinstance(action, dict):
+                return False
+            try:
+                version_matches = int(action.get("version") or 0) == int(version)
+            except (TypeError, ValueError):
+                return False
+            if not version_matches:
+                return False
+            if action.get("status") not in {"done", "skipped"}:
+                return False
+        return True
+
+    def save_daily_state(self, mid: str, state: Mapping[str, Any]) -> None:
+        timestamp = time.time()
+        self._conn.execute(
+            "UPDATE accounts SET daily_state_json=?, updated_at=? WHERE mid=?",
+            (
+                json.dumps(dict(state), ensure_ascii=False, sort_keys=True),
+                timestamp,
+                mid,
+            ),
+        )
+        self._conn.commit()
+
+    def update_daily_action_state(
+        self,
+        mid: str,
+        *,
+        day_key: str,
+        action_key: str,
+        action_state: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        account = self.get(mid)
+        if account is None:
+            raise KeyError(f"account not found: {mid}")
+        current = account.daily_state if isinstance(account.daily_state, dict) else {}
+        actions = current.get("actions")
+        if current.get("day") != day_key or not isinstance(actions, dict):
+            current = {
+                "day": day_key,
+                "timezone": str(DAILY_TIMEZONE),
+                "actions": {},
+            }
+            actions = current["actions"]
+        else:
+            current = dict(current)
+            actions = {
+                str(key): dict(value)
+                for key, value in actions.items()
+                if isinstance(value, dict)
+            }
+            current["actions"] = actions
+        actions[str(action_key)] = dict(action_state)
+        self.save_daily_state(mid, current)
+        return current
 
     def mark_daily_completed(
         self,
@@ -1808,6 +1985,13 @@ class AccountDB:
             device = json.loads(row["device_json"] or "{}")
         except Exception:
             device = {}
+        try:
+            raw_daily_state = (
+                row["daily_state_json"] if "daily_state_json" in keys else "{}"
+            )
+            daily_state = json.loads(raw_daily_state or "{}")
+        except Exception:
+            daily_state = {}
         return AccountRow(
             mid=row["mid"],
             guest_secret=row["guest_secret"],
@@ -1823,6 +2007,7 @@ class AccountDB:
             diamond_balance=int(row["diamond_balance"] or 0),
             guild=float(row["guild"] or 0),
             daily=float(row["daily"] or 0) if "daily" in keys else 0,
+            daily_state=daily_state if isinstance(daily_state, dict) else {},
             guild_last_id=(
                 row["guild_last_id"] or "" if "guild_last_id" in keys else ""
             ),

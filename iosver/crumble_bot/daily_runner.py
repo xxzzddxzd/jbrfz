@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import asdict, dataclass, field
-from typing import Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from .currency import DIAMOND_CURRENCY_DATA_ID, parse_signup_currency_balance
 from .crumble_dungeon import CrumbleDungeonRunner, parse_signup_cookie_ids
@@ -36,6 +37,35 @@ from .stage_rewards import (
 from .stage_runner import SIGNUP_PATH
 
 log = logging.getLogger(__name__)
+
+DAILY_BASE_ACTION_VERSIONS: dict[str, int] = {
+    "stage_offline": 1,
+    "stage_bonus_free": 1,
+    "stage_bonus_ad": 1,
+    "mail_claim_all": 1,
+    "mail_ad": 1,
+}
+DAILY_ACTION_VERSIONS: dict[str, int] = {
+    **DAILY_BASE_ACTION_VERSIONS,
+    "crumble_dungeon": 1,
+}
+DAILY_ACTION_COMPLETE_STATUSES = {"done", "skipped"}
+
+
+def daily_action_is_complete(
+    actions: Mapping[str, Any], action_key: str, version: int
+) -> bool:
+    action = actions.get(action_key)
+    if not isinstance(action, dict):
+        return False
+    try:
+        version_matches = int(action.get("version") or 0) == int(version)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        version_matches
+        and action.get("status") in DAILY_ACTION_COMPLETE_STATUSES
+    )
 
 
 def _numeric_change(before: Optional[int], after: Optional[int]) -> Optional[int]:
@@ -450,6 +480,8 @@ class DailyWorkflowResult:
     error: str = ""
     skipped: bool = False
     cookie_ids: tuple[int, ...] = field(default_factory=tuple)
+    required_actions: dict[str, int] = field(default_factory=dict)
+    action_states: dict[str, dict] = field(default_factory=dict)
     # Empty means the caller did not request the optional dungeon step.  The
     # top-level account-pool daily enables it; resident-guild daily keeps its
     # existing explicit dungeon call for compatibility with older runners.
@@ -463,6 +495,17 @@ class DailyWorkflowResult:
     def ok(self) -> bool:
         if self.skipped:
             return True
+        if self.required_actions:
+            actions_complete = all(
+                daily_action_is_complete(self.action_states, action_key, version)
+                for action_key, version in self.required_actions.items()
+            )
+            return bool(
+                self.login_completed
+                and actions_complete
+                and self.diamond_balance_final is not None
+                and not self.error
+            )
         return bool(
             self.login_completed
             and self.stage_rewards.ok
@@ -493,17 +536,35 @@ class DailyRunner:
         *,
         on_balance: Optional[Callable[[int], None]] = None,
         include_crumble_dungeon: bool = False,
+        daily_action_state: Optional[Mapping[str, Any]] = None,
+        on_action_completed: Optional[Callable[[str, dict], None]] = None,
     ) -> None:
         self.client = client
         self.session = session
         self.on_balance = on_balance
         self.include_crumble_dungeon = bool(include_crumble_dungeon)
+        self.daily_action_state = dict(daily_action_state or {})
+        self.on_action_completed = on_action_completed
 
     def run(self) -> DailyWorkflowResult:
         result = DailyWorkflowResult()
+        result.required_actions = dict(DAILY_BASE_ACTION_VERSIONS)
+        if self.include_crumble_dungeon:
+            result.required_actions["crumble_dungeon"] = DAILY_ACTION_VERSIONS[
+                "crumble_dungeon"
+            ]
+        saved_actions = self.daily_action_state.get("actions")
+        if not isinstance(saved_actions, dict):
+            saved_actions = self.daily_action_state
+        result.action_states = {
+            str(key): dict(value)
+            for key, value in saved_actions.items()
+            if isinstance(value, dict)
+        }
         mailbox = Mailbox(self.client, self.session)
         stage_rewards = StageRewards(self.client, self.session)
         balance: Optional[int] = None
+        current_action = ""
 
         try:
             balance, signup_body = self._sync_account_state()
@@ -537,50 +598,143 @@ class DailyRunner:
                 )
             result.mailbox.advertisement.observe_daily_count(advertisement_count)
 
-            result.stage_rewards.offline.begin_refresh()
-            offline_stack = parse_receive_stage_auto_production_rewards_response(
-                stage_rewards.refresh_offline_stack().message
-            )
-            result.stage_rewards.offline.observe_stack(offline_stack)
-            if result.stage_rewards.offline.claimable:
-                result.stage_rewards.offline.begin_claim()
-                offline_claim = parse_receive_stage_auto_production_rewards_response(
-                    stage_rewards.receive_offline_rewards().message
+            if not self._action_complete(result, "stage_offline"):
+                current_action = "stage_offline"
+                result.stage_rewards.offline.begin_refresh()
+                offline_stack = parse_receive_stage_auto_production_rewards_response(
+                    stage_rewards.refresh_offline_stack().message
                 )
-                result.stage_rewards.offline.observe_claim(offline_claim)
-
-            for _ in range(result.stage_rewards.bonus.free_claimable_count):
-                result.stage_rewards.bonus.begin_free_claim()
-                free_claim = parse_receive_stage_bonus_auto_production_rewards_response(
-                    stage_rewards.receive_bonus_reward().message,
-                    result.stage_rewards.bonus.advertisement_data_id,
-                )
-                result.stage_rewards.bonus.observe_free_claim(free_claim)
-
-            for _ in range(result.stage_rewards.bonus.advertisement_claimable_count):
-                result.stage_rewards.bonus.begin_advertisement_claim()
-                advertisement_claim = (
-                    parse_receive_stage_bonus_auto_production_rewards_response(
-                        stage_rewards.receive_bonus_advertisement_reward(
-                            result.stage_rewards.bonus.advertisement_data_id
-                        ).message,
-                        result.stage_rewards.bonus.advertisement_data_id,
+                result.stage_rewards.offline.observe_stack(offline_stack)
+                if result.stage_rewards.offline.claimable:
+                    result.stage_rewards.offline.begin_claim()
+                    offline_claim = (
+                        parse_receive_stage_auto_production_rewards_response(
+                            stage_rewards.receive_offline_rewards().message
+                        )
                     )
+                    result.stage_rewards.offline.observe_claim(offline_claim)
+                if not result.stage_rewards.offline.ok:
+                    raise RuntimeError(
+                        "stage offline claim incomplete: requested="
+                        f"{result.stage_rewards.offline.claim_requested_count}, "
+                        "claimed="
+                        f"{result.stage_rewards.offline.claimed_count}"
+                    )
+                self._record_action(
+                    result,
+                    current_action,
                 )
-                result.stage_rewards.bonus.observe_advertisement_claim(
-                    advertisement_claim
-                )
+                current_action = ""
 
-            mail_result = mailbox.receive_all_rewards()
-            result.mailbox.observe(mail_result)
-            for _ in range(result.mailbox.advertisement.claimable_count):
-                result.mailbox.advertisement.begin_claim()
-                response = mailbox.receive_mail_advertisement_reward(
-                    result.mailbox.advertisement.advertisement_data_id
+            if not self._action_complete(result, "stage_bonus_free"):
+                current_action = "stage_bonus_free"
+                for _ in range(result.stage_rewards.bonus.free_claimable_count):
+                    result.stage_rewards.bonus.begin_free_claim()
+                    free_claim = (
+                        parse_receive_stage_bonus_auto_production_rewards_response(
+                            stage_rewards.receive_bonus_reward().message,
+                            result.stage_rewards.bonus.advertisement_data_id,
+                        )
+                    )
+                    result.stage_rewards.bonus.observe_free_claim(free_claim)
+                if not (
+                    result.stage_rewards.bonus.checked
+                    and result.stage_rewards.bonus.free_claimable_count
+                    == result.stage_rewards.bonus.free_claim_requested_count
+                    == result.stage_rewards.bonus.free_claimed_count
+                ):
+                    raise RuntimeError(
+                        "stage free bonus claim incomplete: requested="
+                        f"{result.stage_rewards.bonus.free_claim_requested_count}, "
+                        "claimed="
+                        f"{result.stage_rewards.bonus.free_claimed_count}"
+                    )
+                self._record_action(
+                    result,
+                    current_action,
                 )
-                result.mailbox.advertisement.observe_claim(
-                    parse_receive_mail_advertisement_reward_response(response.message)
+                current_action = ""
+
+            if not self._action_complete(result, "stage_bonus_ad"):
+                current_action = "stage_bonus_ad"
+                for _ in range(
+                    result.stage_rewards.bonus.advertisement_claimable_count
+                ):
+                    result.stage_rewards.bonus.begin_advertisement_claim()
+                    advertisement_claim = (
+                        parse_receive_stage_bonus_auto_production_rewards_response(
+                            stage_rewards.receive_bonus_advertisement_reward(
+                                result.stage_rewards.bonus.advertisement_data_id
+                            ).message,
+                            result.stage_rewards.bonus.advertisement_data_id,
+                        )
+                    )
+                    result.stage_rewards.bonus.observe_advertisement_claim(
+                        advertisement_claim
+                    )
+                if not (
+                    result.stage_rewards.bonus.checked
+                    and result.stage_rewards.bonus.advertisement_claimable_count
+                    == result.stage_rewards.bonus.advertisement_claim_requested_count
+                    == result.stage_rewards.bonus.advertisement_claimed_count
+                ):
+                    raise RuntimeError(
+                        "stage advertisement bonus claim incomplete: requested="
+                        f"{result.stage_rewards.bonus.advertisement_claim_requested_count}, "
+                        "claimed="
+                        f"{result.stage_rewards.bonus.advertisement_claimed_count}"
+                    )
+                self._record_action(
+                    result,
+                    current_action,
                 )
+                current_action = ""
+
+            if not self._action_complete(result, "mail_claim_all"):
+                current_action = "mail_claim_all"
+                mail_result = mailbox.receive_all_rewards()
+                result.mailbox.observe(mail_result)
+                if not (
+                    result.mailbox.checked
+                    and result.mailbox.claimable_count
+                    == result.mailbox.claim_requested_count
+                    == result.mailbox.claimed_count
+                ):
+                    raise RuntimeError(
+                        "mail claim-all incomplete: requested="
+                        f"{result.mailbox.claim_requested_count}, "
+                        f"claimed={result.mailbox.claimed_count}"
+                    )
+                self._record_action(
+                    result,
+                    current_action,
+                )
+                current_action = ""
+
+            if not self._action_complete(result, "mail_ad"):
+                current_action = "mail_ad"
+                for _ in range(result.mailbox.advertisement.claimable_count):
+                    result.mailbox.advertisement.begin_claim()
+                    response = mailbox.receive_mail_advertisement_reward(
+                        result.mailbox.advertisement.advertisement_data_id
+                    )
+                    result.mailbox.advertisement.observe_claim(
+                        parse_receive_mail_advertisement_reward_response(
+                            response.message
+                        )
+                    )
+                if not result.mailbox.advertisement.ok:
+                    raise RuntimeError(
+                        "mail advertisement claim incomplete: requested="
+                        f"{result.mailbox.advertisement.claim_requested_count}, "
+                        "claimed="
+                        f"{result.mailbox.advertisement.claimed_count}"
+                    )
+                self._record_action(
+                    result,
+                    current_action,
+                )
+                current_action = ""
 
             if (
                 result.stage_rewards.offline.claim_requested_count
@@ -593,12 +747,31 @@ class DailyRunner:
             result.mailbox.diamond_balance_after = balance
             result.diamond_balance_final = balance
 
-            if self.include_crumble_dungeon:
+            if (
+                self.include_crumble_dungeon
+                and not self._action_complete(result, "crumble_dungeon")
+            ):
+                current_action = "crumble_dungeon"
                 result.crumble_dungeon = CrumbleDungeonRunner(
                     self.client,
                     self.session,
                     cookie_ids=result.cookie_ids,
                 ).run()
+                if not result.crumble_dungeon.get("ok"):
+                    raise RuntimeError(
+                        "crumble dungeon failed: "
+                        f"{result.crumble_dungeon.get('error') or 'unknown error'}"
+                    )
+                self._record_action(
+                    result,
+                    current_action,
+                    status=(
+                        "skipped"
+                        if result.crumble_dungeon.get("skipped")
+                        else "done"
+                    ),
+                )
+                current_action = ""
 
             log.info(
                 "daily offline_claimed=%s bonus_free=%s bonus_advertisement=%s "
@@ -616,45 +789,54 @@ class DailyRunner:
                     result.mailbox.diamond_balance_after,
                 ),
             )
-            if not result.stage_rewards.ok:
-                raise RuntimeError(
-                    "stage reward claim incomplete: "
-                    "offline_requested="
-                    f"{result.stage_rewards.offline.claim_requested_count}, "
-                    "offline_claimed="
-                    f"{result.stage_rewards.offline.claimed_count}; "
-                    "free_requested="
-                    f"{result.stage_rewards.bonus.free_claim_requested_count}, "
-                    "free_claimed="
-                    f"{result.stage_rewards.bonus.free_claimed_count}; "
-                    "advertisement_requested="
-                    f"{result.stage_rewards.bonus.advertisement_claim_requested_count}, "
-                    "advertisement_claimed="
-                    f"{result.stage_rewards.bonus.advertisement_claimed_count}"
-                )
-            if not result.mailbox.ok:
-                raise RuntimeError(
-                    "mail claim-all incomplete: "
-                    f"requested={result.mailbox.claim_requested_count}, "
-                    f"claimed={result.mailbox.claimed_count}; "
-                    "advertisement_requested="
-                    f"{result.mailbox.advertisement.claim_requested_count}, "
-                    "advertisement_claimed="
-                    f"{result.mailbox.advertisement.claimed_count}"
-                )
-            if result.crumble_dungeon and not result.crumble_dungeon.get("ok"):
-                raise RuntimeError(
-                    "crumble dungeon failed: "
-                    f"{result.crumble_dungeon.get('error') or 'unknown error'}"
-                )
         except Exception as error:
             result.error = f"{type(error).__name__}: {error}"
+            if current_action:
+                try:
+                    self._record_action(
+                        result,
+                        current_action,
+                        status="failed",
+                        error=result.error,
+                    )
+                except Exception as persist_error:  # noqa: BLE001
+                    result.error += (
+                        "; action state persistence failed: "
+                        f"{type(persist_error).__name__}: {persist_error}"
+                    )
             log.error("daily workflow failed: %s", result.error)
             if balance is not None:
                 result.mailbox.diamond_balance_after = balance
                 result.diamond_balance_final = balance
 
         return result
+
+    @staticmethod
+    def _action_complete(result: DailyWorkflowResult, action_key: str) -> bool:
+        version = result.required_actions[action_key]
+        return daily_action_is_complete(result.action_states, action_key, version)
+
+    def _record_action(
+        self,
+        result: DailyWorkflowResult,
+        action_key: str,
+        *,
+        status: str = "done",
+        error: str = "",
+    ) -> None:
+        timestamp = time.time()
+        action_state: dict[str, Any] = {
+            "version": int(result.required_actions[action_key]),
+            "status": status,
+            "updated_at": timestamp,
+        }
+        if status in DAILY_ACTION_COMPLETE_STATUSES:
+            action_state["completed_at"] = timestamp
+        if error:
+            action_state["error"] = error
+        result.action_states[action_key] = action_state
+        if self.on_action_completed is not None:
+            self.on_action_completed(action_key, dict(action_state))
 
     def _sync_account_state(self) -> tuple[int, bytes]:
         response = self.client.unary(

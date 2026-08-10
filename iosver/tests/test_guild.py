@@ -3263,6 +3263,7 @@ class GuildCommandTests(unittest.TestCase):
                         "diamond_balance",
                         "guild",
                         "daily",
+                        "daily_state_json",
                         "guild_last_id",
                         "guild_joined_at",
                         "guild_left_at",

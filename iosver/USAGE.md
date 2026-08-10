@@ -145,8 +145,9 @@ SOP：重新登录 → `SignUp` 每日登录同步 → 刷新并领取放置奖�
 
 - 账号必须 `ready=1`、`next_stage>30`、`invalid=0`；`used` 和公会冷却均不影响选择。
 - 命令不限制账号数量，会扫描所有符合条件的账号。
-- `accounts.daily` 保存最近一次成功完成整套 daily SOP 的 Unix 时间；同一 `Asia/Shanghai` 自然日已经完成的账号会跳过。
-- 只有整套 SOP 成功才更新时间；中途失败的账号保留为可执行状态，下一次运行会重试。
+- `accounts.daily_state_json` 按 `Asia/Shanghai` 自然日保存各 action 的版本、状态和完成时间；再次执行只补跑缺失、失败或版本变化的 action。每项成功后立即写库，因此后续步骤失败不会丢失前面的进度。
+- 当前 action 为 `stage_offline`、`stage_bonus_free`、`stage_bonus_ad`、`mail_claim_all`、`mail_ad`、`crumble_dungeon`。以后新增 action 或提高其版本号，当天已跑过旧 SOP 的账号也会自动进入补跑队列。
+- `accounts.daily` 继续保存当前整套 SOP 全部完成的汇总时间，但不再作为唯一跳过条件。旧数据库执行命令时会自动增加 JSON 列；同日旧 `daily` 记录会映射为前五项已完成，并补跑新增的碎屑副本。
 - 放置奖励先调用 `AdventureService/ReceiveStageAutoProductionRewards` 的 `OFFLINE_STACK` 刷新服务端累计值；存在可领取累计奖励时，再以 `OFFLINE` 领取。成员函数同时暴露可选的全局/当前关卡未上报击杀数；daily 没有本地战斗增量，因此不发送这两个可选字段。
 - 放置加成使用 `AdventureService/ReceiveStageBonusAutoProductionRewards`。免费请求为空；广告请求携带 10101 广告 ID `1246517436`。`SignUp` 中的当日免费计数和广告计数用于只补领剩余次数，免费上限 1 次、广告上限 3 次。
 - 每个账号的 `stage_rewards.offline` 记录累计时长、待领取/已领取奖励和请求次数；`stage_rewards.bonus` 记录免费及广告计数前后值、实际领取次数、奖励类型与奖励汇总。

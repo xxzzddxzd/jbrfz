@@ -11,7 +11,13 @@ from pathlib import Path
 
 from .auth import AccountState, guest_login, new_device_ids
 from .constants import ENDPOINT, FALLBACK_RESOURCE_KEY, TO_STAGE
-from .daily_runner import DailyRunner, DailyWorkflowResult
+from .daily_runner import (
+    DAILY_ACTION_VERSIONS,
+    DAILY_BASE_ACTION_VERSIONS,
+    DailyRunner,
+    DailyWorkflowResult,
+    daily_action_is_complete,
+)
 from .db import (
     DEFAULT_DB,
     DAILY_TIMEZONE,
@@ -1611,8 +1617,12 @@ def cmd_daily(args: argparse.Namespace) -> int:
     attempted = 0
 
     with AccountDB(args.db) as db:
-        pool = db.daily_pool_status()
-        eligible_rows = db.list_daily_accounts()
+        daily_pool_options = {
+            "required_action_versions": DAILY_ACTION_VERSIONS,
+            "legacy_action_versions": DAILY_BASE_ACTION_VERSIONS,
+        }
+        pool = db.daily_pool_status(**daily_pool_options)
+        eligible_rows = db.list_daily_accounts(**daily_pool_options)
         if not eligible_rows:
             stopped_reason = (
                 "all_accounts_completed_today"
@@ -1645,6 +1655,14 @@ def cmd_daily(args: argparse.Namespace) -> int:
             )
 
             try:
+                daily_state = db.prepare_daily_state(
+                    row,
+                    legacy_action_versions=DAILY_BASE_ACTION_VERSIONS,
+                )
+                # Persist the normalized day document before the first RPC so
+                # legacy same-day completion flags and partial progress survive
+                # a process interruption.
+                db.save_daily_state(row.mid, daily_state)
                 state = _login_account(row)
                 session = state.to_session()
 
@@ -1665,6 +1683,20 @@ def cmd_daily(args: argparse.Namespace) -> int:
                         note=_row.note,
                     )
 
+                def persist_action(
+                    action_key: str,
+                    action_state: dict,
+                    *,
+                    _mid=row.mid,
+                    _day=pool["day"],
+                ) -> None:
+                    db.update_daily_action_state(
+                        _mid,
+                        day_key=_day,
+                        action_key=action_key,
+                        action_state=action_state,
+                    )
+
                 db.upsert_state(
                     state,
                     used=row.used,
@@ -1682,6 +1714,8 @@ def cmd_daily(args: argparse.Namespace) -> int:
                     # test/integration runners with the original constructor
                     # signature remain compatible.
                     daily_runner.include_crumble_dungeon = True
+                    daily_runner.daily_action_state = daily_state
+                    daily_runner.on_action_completed = persist_action
                     workflow = daily_runner.run()
                     workflows.append(workflow)
 
@@ -1698,6 +1732,28 @@ def cmd_daily(args: argparse.Namespace) -> int:
 
                 item = {"mid": row.mid, **workflow.to_dict()}
                 if workflow.ok:
+                    # Compatibility runners may return the legacy aggregate
+                    # result without per-action states.  A successful aggregate
+                    # run still satisfies every action in the current SOP.
+                    persisted = db.prepare_daily_state(
+                        db.get(row.mid) or row,
+                        legacy_action_versions=DAILY_BASE_ACTION_VERSIONS,
+                    )
+                    persisted_actions = persisted.setdefault("actions", {})
+                    for action_key, version in DAILY_ACTION_VERSIONS.items():
+                        if daily_action_is_complete(
+                            persisted_actions, action_key, version
+                        ):
+                            continue
+                        timestamp = time.time()
+                        persisted_actions[action_key] = {
+                            "version": int(version),
+                            "status": "done",
+                            "completed_at": timestamp,
+                            "updated_at": timestamp,
+                            "source": "aggregate_workflow_compat",
+                        }
+                    db.save_daily_state(row.mid, persisted)
                     completed_at = db.mark_daily_completed(row.mid)
                     item["daily_completed_at"] = _local_timestamp(completed_at)
                     completed += 1
@@ -1731,7 +1787,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
                     item["error"],
                 )
 
-        pool_after = db.daily_pool_status()
+        pool_after = db.daily_pool_status(**daily_pool_options)
         summary = {
             "ok": failures == 0,
             "count": completed,
