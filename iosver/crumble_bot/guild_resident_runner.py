@@ -122,8 +122,8 @@ class ResidentGuildRunner:
 
     def sync(self, guild: ManagedGuildRow) -> dict:
         """Refresh member identities and mutable guild summary fields."""
-        actor = self._actor_row(guild)
-        if actor is None:
+        actors = self._actor_rows(guild)
+        if not actors:
             return {
                 "ok": False,
                 "state": "no_member_actor",
@@ -134,87 +134,114 @@ class ResidentGuildRunner:
                 },
             }
 
-        try:
-            state = self.login_account(actor)
-            with self.client_factory(state.endpoint or ENDPOINT) as client:
-                api = Guild(client, state.to_session())
-                summaries = parse_guild_search_response(
-                    api.search_guilds(guild.gname).message
+        errors = []
+        for actor in actors:
+            try:
+                payload = self._sync_with_actor(guild, actor)
+                payload["sync_actor_mid"] = actor.mid
+                payload["sync_attempts"] = len(errors) + 1
+                return payload
+            except Exception as error:
+                message = f"{type(error).__name__}: {error}"
+                errors.append({"mid": actor.mid, "error": message})
+                log.warning(
+                    "resident guild sync failed with %s, trying next actor: %s",
+                    actor.mid,
+                    message,
                 )
-                summary = next(
-                    (item for item in summaries if item.guild_id == guild.guild_id),
-                    None,
-                )
-                member_response = api.get_guild_members(guild.guild_id)
-                members = parse_get_guild_members_response(member_response.message)
-                detail_response = api.get_guild(guild.guild_id)
-                detail = parse_guild_detail_response(detail_response.message)
 
-            self._persist_logged_in(actor, state)
-            self._reconcile_members(guild, members)
-            live_level = (
-                int(summary.guild_level)
-                if summary is not None and summary.guild_level
-                else int(guild.guild_level)
+        message = errors[-1]["error"]
+        self.db.update_managed_guild(
+            guild.id,
+            status="degraded",
+            details={
+                **guild.details,
+                "last_sync_error": message,
+                "last_sync_attempts": errors,
+            },
+        )
+        return {
+            **self.status(guild),
+            "ok": False,
+            "synced": False,
+            "state": "sync_failed",
+            "stopped_reason": "sync_failed",
+            "error": message,
+            "sync_attempts": len(errors),
+            "sync_errors": errors,
+        }
+
+    def _sync_with_actor(
+        self,
+        guild: ManagedGuildRow,
+        actor: AccountRow,
+    ) -> dict:
+        state = self.login_account(actor)
+        with self.client_factory(state.endpoint or ENDPOINT) as client:
+            api = Guild(client, state.to_session())
+            summaries = parse_guild_search_response(
+                api.search_guilds(guild.gname).message
             )
-            live_capacity = guild_max_member_count(live_level)
-            capacity_source = "guild_level" if live_capacity is not None else ""
-            changes = {
-                "member_count": len(members.members),
-                "last_sync_at": time.time(),
-                "status": "active",
-                "details": {
-                    **guild.details,
-                    "search_summary": (
-                        asdict(summary)
-                        if summary is not None
-                        else guild.details.get("search_summary", {})
+            summary = next(
+                (item for item in summaries if item.guild_id == guild.guild_id),
+                None,
+            )
+            member_response = api.get_guild_members(guild.guild_id)
+            members = parse_get_guild_members_response(member_response.message)
+            detail_response = api.get_guild(guild.guild_id)
+            detail = parse_guild_detail_response(detail_response.message)
+            state.resource_key = api.session.resource_key
+
+        self._persist_logged_in(actor, state)
+        self._reconcile_members(guild, members)
+        live_level = (
+            int(summary.guild_level)
+            if summary is not None and summary.guild_level
+            else int(guild.guild_level)
+        )
+        live_capacity = guild_max_member_count(live_level)
+        capacity_source = "guild_level" if live_capacity is not None else ""
+        changes = {
+            "member_count": len(members.members),
+            "last_sync_at": time.time(),
+            "status": "active",
+            "details": {
+                **guild.details,
+                "search_summary": (
+                    asdict(summary)
+                    if summary is not None
+                    else guild.details.get("search_summary", {})
+                ),
+                "guild_detail": asdict(detail),
+                "members": [asdict(member) for member in members.members],
+            },
+        }
+        if live_capacity is not None:
+            changes.update(
+                {
+                    "capacity": live_capacity,
+                    "target_managed_count": max(
+                        0,
+                        live_capacity - int(guild.reserve_slots),
                     ),
-                    "guild_detail": asdict(detail),
-                    "members": [asdict(member) for member in members.members],
-                },
-            }
-            if live_capacity is not None:
-                changes.update(
-                    {
-                        "capacity": live_capacity,
-                        "target_managed_count": max(
-                            0,
-                            live_capacity - int(guild.reserve_slots),
-                        ),
-                    }
-                )
-            if summary is not None:
-                changes.update(
-                    {
-                        "gname": summary.name or guild.gname,
-                        "gmname": summary.master_name or guild.gmname,
-                        "join_method": summary.join_method,
-                        "guild_level": summary.guild_level,
-                    }
-                )
-            if capacity_source:
-                changes["details"]["capacity_source"] = capacity_source
-                changes["details"]["capacity_level"] = live_level
-            refreshed = self.db.update_managed_guild(guild.id, **changes)
-            payload = self.status(refreshed)
-            payload.update({"ok": True, "synced": True})
-            return payload
-        except Exception as error:
-            message = f"{type(error).__name__}: {error}"
-            self.db.update_managed_guild(
-                guild.id,
-                status="degraded",
-                details={**guild.details, "last_sync_error": message},
+                }
             )
-            return {
-                **self.status(guild),
-                "ok": False,
-                "synced": False,
-                "state": "sync_failed",
-                "stopped_reason": "sync_failed",
-                "error": message,
-            }
+        if summary is not None:
+            changes.update(
+                {
+                    "gname": summary.name or guild.gname,
+                    "gmname": summary.master_name or guild.gmname,
+                    "join_method": summary.join_method,
+                    "guild_level": summary.guild_level,
+                }
+            )
+        if capacity_source:
+            changes["details"]["capacity_source"] = capacity_source
+            changes["details"]["capacity_level"] = live_level
+        refreshed = self.db.update_managed_guild(guild.id, **changes)
+        payload = self.status(refreshed)
+        payload.update({"ok": True, "synced": True})
+        return payload
 
     def fill(self, guild: ManagedGuildRow, *, max_accounts: int = 0) -> dict:
         """Fill missing managed slots without removing existing members."""
@@ -1475,21 +1502,36 @@ class ResidentGuildRunner:
                 last_error="member_not_in_live_guild",
             )
 
-    def _actor_row(self, guild: ManagedGuildRow) -> Optional[AccountRow]:
-        mids = []
-        if guild.controller_mid:
+    def _actor_rows(self, guild: ManagedGuildRow) -> list[AccountRow]:
+        """Return login-capable live members in safest sync order."""
+        memberships = self.db.list_guild_memberships(guild.id)
+        mids = [
+            row.mid
+            for row in memberships
+            if row.member_type == "managed" and row.status == "active"
+        ]
+        mids.extend(
+            row.mid
+            for row in memberships
+            if row.member_type == "reserved"
+            and row.status == "active"
+            and row.mid not in mids
+        )
+        if guild.controller_mid and guild.controller_mid not in mids:
             mids.append(guild.controller_mid)
         mids.extend(
             row.mid
-            for row in self.db.list_guild_memberships(guild.id)
-            if row.status in {"active", "applied"}
-            if row.mid not in mids
+            for row in memberships
+            if row.member_type == "external"
+            and row.status == "active"
+            and row.mid not in mids
         )
+        actors = []
         for mid in mids:
             row = self.db.get(mid)
-            if row is not None and row.guest_secret:
-                return row
-        return None
+            if row is not None and row.guest_secret and not row.invalid:
+                actors.append(row)
+        return actors
 
     def _persist_logged_in(
         self,

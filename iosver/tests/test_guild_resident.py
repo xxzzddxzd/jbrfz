@@ -345,6 +345,53 @@ class ResidentGuildTests(unittest.TestCase):
                 )
             )
 
+    def test_sync_prefers_managed_members_and_retries_next_actor(self) -> None:
+        with AccountDB(self.db_path) as db:
+            self._add_accounts(db, count=3)
+            guild = db.upsert_managed_guild(
+                guild_id="G1",
+                gname="ahhhha",
+                gmname="absdbld",
+                controller_mid="BOT2",
+                capacity=5,
+            )
+            db.upsert_guild_membership(
+                guild.id,
+                "BOT2",
+                member_type="external",
+                status="active",
+            )
+            db.upsert_guild_membership(
+                guild.id,
+                "BOT0",
+                slot_no=1,
+                member_type="managed",
+                status="active",
+            )
+            db.upsert_guild_membership(
+                guild.id,
+                "BOT1",
+                slot_no=2,
+                member_type="managed",
+                status="active",
+            )
+            runner = ResidentGuildRunner(db, self._login)
+            attempted = []
+
+            def fake_sync_with_actor(_guild, actor):
+                attempted.append(actor.mid)
+                if actor.mid == "BOT0":
+                    raise RuntimeError("no longer a guild member")
+                return {"ok": True, "synced": True}
+
+            runner._sync_with_actor = fake_sync_with_actor
+            result = runner.sync(guild)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(attempted, ["BOT0", "BOT1"])
+            self.assertEqual(result["sync_actor_mid"], "BOT1")
+            self.assertEqual(result["sync_attempts"], 2)
+
     def test_fill_reserve_slots_parser_and_member_control_output(self) -> None:
         args = cli.build_parser().parse_args(
             [
