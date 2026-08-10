@@ -1453,22 +1453,27 @@ class ResidentGuildRunner:
                 )
         for member in existing.values():
             if (
-                member.member_type == "managed"
-                and member.status not in {"applied", "invited", "accepted"}
-                and member.mid not in live_ids
+                member.mid in live_ids
+                or member.status in {"applied", "invited", "accepted"}
+                or member.status != "active"
             ):
+                continue
+            if member.member_type == "managed":
                 account = self.db.get(member.mid)
                 if account is not None and account.guild_joined_at > account.guild_left_at:
                     # A manual kick/leave is still subject to the same
                     # server cooldown as the transient workflows.
                     self.db.mark_guild_left(member.mid, left_at=now)
-                self.db.update_guild_membership(
-                    guild.id,
-                    member.mid,
-                    status="missing",
-                    left_at=now,
-                    last_error="member_not_in_live_guild",
-                )
+            # External members must be reconciled too.  Otherwise a member
+            # removed manually on the phone remains ``active`` forever and is
+            # still printed as part of the current guild roster.
+            self.db.update_guild_membership(
+                guild.id,
+                member.mid,
+                status="missing",
+                left_at=now,
+                last_error="member_not_in_live_guild",
+            )
 
     def _actor_row(self, guild: ManagedGuildRow) -> Optional[AccountRow]:
         mids = []

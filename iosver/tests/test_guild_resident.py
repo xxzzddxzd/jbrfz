@@ -310,6 +310,41 @@ class ResidentGuildTests(unittest.TestCase):
             self.assertFalse(controlled["OWNER"])
             self.assertTrue(controlled["BOT0"])
 
+    def test_reconcile_marks_removed_external_member_missing(self) -> None:
+        with AccountDB(self.db_path) as db:
+            guild = db.upsert_managed_guild(
+                guild_id="G1",
+                gname="ahhhha",
+                gmname="absdbld",
+                capacity=5,
+            )
+            db.upsert_guild_membership(
+                guild.id,
+                "EXTERNAL",
+                member_type="external",
+                status="active",
+                role=1,
+                details={"name": "former-member"},
+            )
+            runner = ResidentGuildRunner(db, self._login)
+
+            class EmptySnapshot:
+                members = ()
+
+            runner._reconcile_members(guild, EmptySnapshot())
+
+            membership = db.get_guild_membership(guild.id, "EXTERNAL")
+            self.assertEqual(membership.status, "missing")
+            self.assertEqual(membership.last_error, "member_not_in_live_guild")
+            status = runner.status(guild)
+            self.assertEqual(status["roster"]["non_managed_active"], 0)
+            self.assertFalse(
+                any(
+                    item["mid"] == "EXTERNAL" and item["status"] == "active"
+                    for item in status["members"]
+                )
+            )
+
     def test_fill_reserve_slots_parser_and_member_control_output(self) -> None:
         args = cli.build_parser().parse_args(
             [
