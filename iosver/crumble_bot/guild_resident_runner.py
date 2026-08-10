@@ -100,6 +100,26 @@ class ResidentGuildRunner:
                 actions.append(action)
         return self._status_payload(guild, memberships, managed, reserved, actions)
 
+    def set_reserve_slots(
+        self,
+        guild: ManagedGuildRow,
+        reserve_slots: int,
+    ) -> ManagedGuildRow:
+        """Persist the fill policy and recalculate its configured target."""
+        reserve = int(reserve_slots)
+        if reserve < 0:
+            raise ValueError("--reserve-slots 不能小于 0")
+        capacity = max(0, int(guild.capacity))
+        if capacity > 0 and reserve > capacity:
+            raise ValueError(
+                f"--reserve-slots 不能大于当前公会容量 {capacity}"
+            )
+        return self.db.update_managed_guild(
+            guild.id,
+            reserve_slots=reserve,
+            target_managed_count=max(0, capacity - reserve),
+        )
+
     def sync(self, guild: ManagedGuildRow) -> dict:
         """Refresh member identities and mutable guild summary fields."""
         actor = self._actor_row(guild)
@@ -233,9 +253,22 @@ class ResidentGuildRunner:
             if row.member_type == "managed"
             and row.status in {"planned", "applied", "invited", "accepted"}
         ]
+        # Existing non-managed members already consume server slots.  They
+        # satisfy the configured reserve first; when reserve is zero, subtract
+        # them from the managed target so a full guild is reported as at target
+        # instead of permanently showing an impossible one-account vacancy.
+        non_managed_active = sum(
+            1
+            for row in memberships
+            if row.member_type != "managed" and row.status == "active"
+        )
+        effective_managed_target = min(
+            int(guild.target_managed_count),
+            max(0, int(guild.capacity) - non_managed_active),
+        )
         target_vacancy = max(
             0,
-            guild.target_managed_count - len(active) - len(pending),
+            effective_managed_target - len(active) - len(pending),
         )
         if target_vacancy <= 0:
             pending_approval = [
@@ -359,7 +392,7 @@ class ResidentGuildRunner:
         results: list[dict] = []
         joined_so_far = 0
         for candidate in candidates[:limit]:
-            slot = self._next_slot(slots, guild.target_managed_count)
+            slot = self._next_slot(slots, effective_managed_target)
             if slot is None:
                 break
             item = self._join_one(guild, candidate, None, slot)
@@ -1418,6 +1451,15 @@ class ResidentGuildRunner:
         reserved: list[GuildMembershipRow],
         actions: list[dict],
     ) -> dict:
+        non_managed_active = sum(
+            1
+            for row in memberships
+            if row.member_type != "managed" and row.status == "active"
+        )
+        effective_managed_target = min(
+            int(guild.target_managed_count),
+            max(0, int(guild.capacity) - non_managed_active),
+        )
         return {
             "mode": "resident",
             "guild": {
@@ -1439,9 +1481,11 @@ class ResidentGuildRunner:
             },
             "roster": {
                 "managed_active": len(managed),
-                "managed_target": guild.target_managed_count,
-                "vacancy": max(0, guild.target_managed_count - len(managed)),
+                "managed_target": effective_managed_target,
+                "configured_managed_target": guild.target_managed_count,
+                "vacancy": max(0, effective_managed_target - len(managed)),
                 "reserved": len(reserved),
+                "non_managed_active": non_managed_active,
                 "all_local_rows": len(memberships),
             },
             "recruitment": {
@@ -1458,6 +1502,7 @@ class ResidentGuildRunner:
                     "mid": row.mid,
                     "slot_no": row.slot_no,
                     "member_type": row.member_type,
+                    "controlled": row.member_type == "managed",
                     "status": row.status,
                     "role": row.role,
                     "joined_at": row.joined_at,

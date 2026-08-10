@@ -226,9 +226,13 @@ def _guild_human_output(payload: object) -> str:
         capacity_level = guild.get("capacity_level")
         if capacity_source == "guild_level":
             lines.append(f"容量来源：公会等级 {capacity_level or '-'}")
-        target = guild.get("target_managed_count")
+        roster = status.get("roster")
+        target = (
+            roster.get("managed_target")
+            if isinstance(roster, dict)
+            else guild.get("target_managed_count")
+        )
         if target is not None:
-            roster = status.get("roster")
             active = (
                 roster.get("managed_active")
                 if isinstance(roster, dict)
@@ -255,6 +259,8 @@ def _guild_human_output(payload: object) -> str:
                 lines.append(
                     f"常驻：{active}/{target}{pending_text}"
                 )
+        if guild.get("reserve_slots") is not None:
+            lines.append(f"预留位置：{guild.get('reserve_slots', 0)}")
 
     roster = status.get("roster")
     if isinstance(roster, dict) and operation_name == "fill":
@@ -280,7 +286,9 @@ def _guild_human_output(payload: object) -> str:
             lines.append(f"当前待审批：{fill['pending_approval']} 个")
         member_names = {}
         members = status.get("members")
-        if isinstance(members, list):
+        if not isinstance(members, list):
+            members = []
+        else:
             member_names = {
                 str(item.get("mid") or "").upper(): str(item.get("name") or "")
                 for item in members
@@ -312,6 +320,26 @@ def _guild_human_output(payload: object) -> str:
                 else:
                     state_label = "失败"
                 lines.append(f"  - {label}：{state_label}")
+
+        live_members = [
+            item
+            for item in members
+            if isinstance(item, dict) and item.get("status") == "active"
+        ]
+        if live_members:
+            controlled_count = sum(
+                1 for item in live_members if bool(item.get("controlled"))
+            )
+            lines.append(
+                f"成员控制状态：受控 {controlled_count}，"
+                f"非受控 {len(live_members) - controlled_count}"
+            )
+            for item in live_members:
+                mid = str(item.get("mid") or "-").strip()
+                name = str(item.get("name") or "").strip()
+                label = f"{name}（{mid}）" if name else mid
+                control_label = "受控" if item.get("controlled") else "非受控"
+                lines.append(f"  - [{control_label}] {label}")
 
     daily = payload.get("daily")
     if (
@@ -1216,6 +1244,12 @@ def _cmd_guild_resident_fill(args: argparse.Namespace) -> int:
         # in the guild; an application is not treated as membership.
         before = runner.sync(target)
         current = db.get_managed_guild(target.guild_id) or target
+        reserve_slots = getattr(args, "reserve_slots", None)
+        if reserve_slots is not None:
+            try:
+                current = runner.set_reserve_slots(current, reserve_slots)
+            except ValueError as error:
+                raise SystemExit(str(error)) from error
         fill = runner.fill(current)
         current = db.get_managed_guild(target.guild_id) or current
         after = runner.sync(current)
@@ -1257,35 +1291,83 @@ def _cmd_guild_resident_support(args: argparse.Namespace) -> int:
     with AccountDB(args.db) as db:
         target = _resident_target(db, args)
         runner = ResidentGuildRunner(db, _login_account)
-
-        def show_progress(progress: dict) -> None:
-            if bool(getattr(args, "quiet", False)):
-                return
-            print(_guild_support_progress_line(progress), file=sys.stderr, flush=True)
-
-        payload = runner.support(target, on_progress=show_progress)
+        progress_display = _GuildSupportProgressDisplay(
+            sys.stderr,
+            enabled=not bool(getattr(args, "quiet", False)),
+        )
+        try:
+            payload = runner.support(target, on_progress=progress_display.update)
+        finally:
+            progress_display.close()
         current = db.get_managed_guild(target.guild_id) or target
         payload["status"] = runner.status(current)
         _print_guild_payload(payload, args)
     return 0 if payload.get("ok") else 1
 
 
+class _GuildSupportProgressDisplay:
+    """Render live support progress without adding one line per account."""
+
+    def __init__(self, stream, *, enabled: bool = True) -> None:
+        self.stream = stream
+        self.enabled = enabled
+        isatty = getattr(stream, "isatty", None)
+        self.interactive = bool(isatty and isatty())
+        self.line_open = False
+
+    def update(self, progress: dict) -> None:
+        if not self.enabled:
+            return
+        phase = str(progress.get("phase") or "")
+        line = _guild_support_progress_line(progress)
+        if self.interactive:
+            # Clear and rewrite the current terminal row.  The final event is
+            # the only one that advances to a new line.
+            final = phase == "done"
+            self.stream.write(f"\r\x1b[2K{line}{'\n' if final else ''}")
+            self.stream.flush()
+            self.line_open = not final
+            return
+
+        # Pipes and captured logs cannot redraw a line.  Emit milestones only
+        # so long-running jobs remain observable without producing one row per
+        # account.
+        processed = max(0, int(progress.get("processed") or 0))
+        total = max(0, int(progress.get("total") or 0))
+        should_emit = phase in {"querying", "queried", "done"} or (
+            phase == "account"
+            and (processed == 1 or processed == total or processed % 5 == 0)
+        )
+        if should_emit:
+            print(line, file=self.stream, flush=True)
+
+    def close(self) -> None:
+        if self.enabled and self.interactive and self.line_open:
+            self.stream.write("\n")
+            self.stream.flush()
+            self.line_open = False
+
+
 def _guild_support_progress_line(progress: dict) -> str:
     total = max(0, int(progress.get("total") or 0))
     processed = max(0, min(total, int(progress.get("processed") or 0)))
-    width = 20
-    filled = width if total == 0 else min(width, int(width * processed / total))
-    bar = "#" * filled + "-" * (width - filled)
+    width = 16
+    filled = (
+        width
+        if total == 0
+        else min(width, (width * processed + total - 1) // total)
+    )
+    bar = "█" * filled + "░" * (width - filled)
     phase = str(progress.get("phase") or "")
     suffix = ""
     if phase == "querying":
-        suffix = "正在查询支援列表"
+        suffix = "查询支援列表…"
     elif phase == "queried":
-        suffix = f"发现 {int(progress.get('request_count') or 0)} 条请求"
+        suffix = f"待支援 {int(progress.get('request_count') or 0)} 条"
     elif phase == "account":
         identity = str(progress.get("name") or progress.get("mid") or "-")
         status_map = {
-            "ok": "已处理",
+            "ok": "成功",
             "failed": "失败",
             "support_limit": "支援已达上限",
             "no_pending_requests": "没有待支援请求",
@@ -1300,11 +1382,16 @@ def _guild_support_progress_line(progress: dict) -> str:
         suffix = "完成"
         stopped_reason = str(progress.get("stopped_reason") or "")
         if stopped_reason:
-            suffix += f"（{stopped_reason}）"
+            reason_map = {
+                "support_limit": "支援已达上限",
+                "no_pending_requests": "没有待支援请求",
+                "query_failed": "查询失败",
+            }
+            suffix += f"（{reason_map.get(stopped_reason, stopped_reason)}）"
     return (
-        f"支援进度 [{bar}] {processed}/{total} "
-        f"成功 {int(progress.get('support_count') or 0)} "
-        f"失败 {int(progress.get('failed') or 0)} {suffix}"
+        f"支援 [{bar}] {processed}/{total}｜"
+        f"成功 {int(progress.get('support_count') or 0)}｜"
+        f"失败 {int(progress.get('failed') or 0)}｜{suffix}"
     ).rstrip()
 
 
@@ -1866,6 +1953,8 @@ def cmd_guild(args: argparse.Namespace) -> int:
             raise SystemExit("常驻公会命令不接受 --totalcount")
         if bool(getattr(args, "confirm", False)):
             raise SystemExit("常驻公会命令不接受 --confirm")
+        if action != "fill" and getattr(args, "reserve_slots", None) is not None:
+            raise SystemExit("--reserve-slots 只能用于 guild fill")
         if action == "init":
             return _cmd_guild_resident_init(args)
         if action == "status":
@@ -1890,7 +1979,11 @@ def cmd_guild(args: argparse.Namespace) -> int:
             raise SystemExit(f"guild joblist 不接受参数: {formatted}")
         if bool(getattr(args, "confirm", False)):
             raise SystemExit("--confirm 只能用于 guild private")
+        if getattr(args, "reserve_slots", None) is not None:
+            raise SystemExit("--reserve-slots 只能用于 guild fill")
         return _cmd_guild_joblist(args)
+    if getattr(args, "reserve_slots", None) is not None:
+        raise SystemExit("--reserve-slots 只能用于 guild fill")
     if action == "private":
         if private_action == "return":
             if bool(getattr(args, "confirm", False)):
@@ -3177,6 +3270,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "resident init：旧版本或未知公会等级时的容量兜底；"
             "当前版本会按公会等级自动读取"
+        ),
+    )
+    sp.add_argument(
+        "--reserve-slots",
+        type=int,
+        help=(
+            "resident fill：保留的非受控成员席位数；设为 0 时用受控账号填满"
+            "所有剩余成员位，并持久化到 sqlite"
         ),
     )
     sp.add_argument(

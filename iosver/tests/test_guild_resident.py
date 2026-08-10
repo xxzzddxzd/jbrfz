@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -222,6 +223,105 @@ class ResidentGuildTests(unittest.TestCase):
             self.assertEqual([row.slot_no for row in memberships], [1, 2, 3])
             self.assertTrue(all(db.get(row.mid).used for row in memberships))
 
+    def test_fill_reserve_zero_fills_around_external_member(self) -> None:
+        with AccountDB(self.db_path) as db:
+            self._add_accounts(db)
+            guild = db.upsert_managed_guild(
+                guild_id="G1",
+                gname="ahhhha",
+                gmname="absdbld",
+                capacity=5,
+            )
+            db.upsert_guild_membership(
+                guild.id,
+                "OWNER",
+                member_type="external",
+                status="active",
+                role=0,
+                details={"name": "owner"},
+            )
+            runner = ResidentGuildRunner(
+                db,
+                self._login,
+                client_factory=_PublicJoinClient,
+            )
+
+            guild = runner.set_reserve_slots(guild, 0)
+            result = runner.fill(guild)
+            status = runner.status(db.get_managed_guild("G1"))
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["joined"], 4)
+            self.assertEqual(status["guild"]["reserve_slots"], 0)
+            self.assertEqual(status["roster"]["configured_managed_target"], 5)
+            self.assertEqual(status["roster"]["managed_target"], 4)
+            self.assertEqual(status["roster"]["managed_active"], 4)
+            self.assertEqual(status["roster"]["vacancy"], 0)
+            controlled = {
+                item["mid"]: item["controlled"] for item in status["members"]
+            }
+            self.assertFalse(controlled["OWNER"])
+            self.assertTrue(controlled["BOT0"])
+
+    def test_fill_reserve_slots_parser_and_member_control_output(self) -> None:
+        args = cli.build_parser().parse_args(
+            [
+                "guild",
+                "fill",
+                "--gname",
+                "ahhhha",
+                "--reserve-slots",
+                "0",
+            ]
+        )
+        self.assertEqual(args.reserve_slots, 0)
+
+        output = cli._guild_human_output(
+            {
+                "ok": True,
+                "mode": "resident",
+                "fill": {
+                    "ok": True,
+                    "requested": 0,
+                    "joined": 0,
+                    "applied": 0,
+                    "results": [],
+                },
+                "status": {
+                    "guild": {
+                        "name": "ahhhha",
+                        "capacity": 2,
+                        "member_count": 2,
+                        "reserve_slots": 0,
+                    },
+                    "roster": {
+                        "managed_active": 1,
+                        "managed_target": 1,
+                    },
+                    "members": [
+                        {
+                            "mid": "BOT0",
+                            "name": "bot-0",
+                            "member_type": "managed",
+                            "controlled": True,
+                            "status": "active",
+                        },
+                        {
+                            "mid": "OWNER",
+                            "name": "owner",
+                            "member_type": "external",
+                            "controlled": False,
+                            "status": "active",
+                        },
+                    ],
+                },
+            }
+        )
+        self.assertIn("预留位置：0", output)
+        self.assertIn("成员控制状态：受控 1，非受控 1", output)
+        self.assertIn("[受控] bot-0（BOT0）", output)
+        self.assertIn("[非受控] owner（OWNER）", output)
+
     def test_private_fill_submits_applications_without_controller(self) -> None:
         with AccountDB(self.db_path) as db:
             self._add_accounts(db)
@@ -361,7 +461,7 @@ class ResidentGuildTests(unittest.TestCase):
             self.assertEqual(progress[-1]["processed"], 2)
             self.assertEqual(progress[-1]["support_count"], 2)
             self.assertIn(
-                "[####################] 2/2 成功 2 失败 0",
+                "[████████████████] 2/2｜成功 2｜失败 0｜完成",
                 cli._guild_support_progress_line(progress[-1]),
             )
             self.assertEqual(calls[0][0:2], ("G1", "BOT0"))
@@ -375,6 +475,73 @@ class ResidentGuildTests(unittest.TestCase):
             membership = db.get_guild_membership(guild.id, "BOT0")
             self.assertEqual(membership.details["name"], "bot-0")
             self.assertEqual(membership.details["last_support_day"], result["day"])
+
+    def test_support_progress_display_rewrites_tty_line(self) -> None:
+        class TtyBuffer(io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        output = TtyBuffer()
+        display = cli._GuildSupportProgressDisplay(output)
+        display.update(
+            {
+                "phase": "account",
+                "processed": 1,
+                "total": 22,
+                "support_count": 1,
+                "failed": 0,
+                "name": "bot-1",
+                "status": "ok",
+            }
+        )
+        display.update(
+            {
+                "phase": "done",
+                "processed": 1,
+                "total": 22,
+                "support_count": 1,
+                "failed": 0,
+                "stopped_reason": "support_limit",
+            }
+        )
+
+        rendered = output.getvalue()
+        self.assertEqual(rendered.count("\n"), 1)
+        self.assertEqual(rendered.count("\r\x1b[2K"), 2)
+        self.assertIn("1/22｜成功 1", rendered)
+        self.assertIn("完成（支援已达上限）", rendered)
+
+    def test_support_progress_display_throttles_non_tty_output(self) -> None:
+        output = io.StringIO()
+        display = cli._GuildSupportProgressDisplay(output)
+        for processed in range(1, 13):
+            display.update(
+                {
+                    "phase": "account",
+                    "processed": processed,
+                    "total": 22,
+                    "support_count": processed,
+                    "failed": 0,
+                    "mid": f"BOT{processed}",
+                    "status": "ok",
+                }
+            )
+        display.update(
+            {
+                "phase": "done",
+                "processed": 12,
+                "total": 22,
+                "support_count": 12,
+                "failed": 0,
+            }
+        )
+
+        lines = output.getvalue().splitlines()
+        self.assertEqual(len(lines), 4)
+        self.assertIn("1/22", lines[0])
+        self.assertIn("5/22", lines[1])
+        self.assertIn("10/22", lines[2])
+        self.assertIn("12/22", lines[3])
 
 
 if __name__ == "__main__":

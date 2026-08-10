@@ -84,8 +84,9 @@ python main.py guild --gname 'ahhhha' maintain
 python main.py guild --gname 'ahhhha' init --gmname 'absdbld'
 python main.py guild --gname 'ahhhha' status
 python main.py guild --gname 'ahhhha' fill       # 只补充缺少的常驻账号
+python main.py guild --gname 'ahhhha' fill --reserve-slots 0  # 用受控账号填满剩余席位
 python main.py guild --gname 'ahhhha' daily      # 签到、免费研究、钻石捐赠、支援
-python main.py guild --gname 'ahhhha' support    # 只执行支援中心
+python main.py guild --gname 'ahhhha' support    # 只执行支援中心；终端单行显示进度
 python main.py guild --gname 'ahhhha' maintain   # status → fill → daily
 # 需要完整结构化结果时加 --json；默认终端只显示简明摘要
 ```
