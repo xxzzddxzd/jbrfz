@@ -893,6 +893,92 @@ class ResidentGuildTests(unittest.TestCase):
             self.assertEqual(result["count"], 10)
             self.assertEqual(maximum, 5)
 
+    def test_support_rechecks_empty_list_before_starting_workers(self) -> None:
+        with AccountDB(self.db_path) as db:
+            self._add_accounts(db, count=2)
+            guild = db.upsert_managed_guild(
+                guild_id="G1",
+                gname="ahhhha",
+                gmname="absdbld",
+                capacity=5,
+            )
+            for index in range(2):
+                db.upsert_guild_membership(
+                    guild.id,
+                    f"BOT{index}",
+                    slot_no=index + 1,
+                    member_type="managed",
+                    status="active",
+                )
+
+            request = b"".join(
+                (
+                    pb.encode_string_field(1, "REQ1"),
+                    pb.encode_message_field(
+                        2, pb.encode_string_field(1, "BOT0")
+                    ),
+                )
+            )
+
+            class SupportClient:
+                query_count = 0
+
+                def __init__(self, _endpoint: str) -> None:
+                    pass
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args) -> None:
+                    return None
+
+                def unary(self, path: str, _message: bytes, *, metadata=None):
+                    if path != GET_GUILD_SUPPORT_REQUESTS_PATH:
+                        raise AssertionError(path)
+                    type(self).query_count += 1
+                    if type(self).query_count == 1:
+                        return GrpcResponse(b"", {}, {})
+                    return GrpcResponse(
+                        pb.encode_message_field(1, request), {}, {}
+                    )
+
+            runner = ResidentGuildRunner(
+                db,
+                self._login,
+                client_factory=SupportClient,
+            )
+
+            def fake_support(
+                _guild,
+                _supporter_mid,
+                _api,
+                requests,
+                *,
+                available,
+            ):
+                return {
+                    "ok": True,
+                    "attempted": len(requests),
+                    "count": len(requests),
+                    "available": available,
+                    "requests": [],
+                    "_actions": [],
+                }
+
+            runner._perform_support_requests = fake_support
+            result = runner.support(guild)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(SupportClient.query_count, 2)
+            self.assertEqual(result["query"]["attempt_count"], 2)
+            self.assertEqual(result["query"]["request_count"], 1)
+            self.assertEqual(
+                [item["mid"] for item in result["query"]["attempts"]],
+                ["BOT0", "BOT1"],
+            )
+            self.assertEqual(result["accounts_attempted"], 2)
+            self.assertEqual(result["count"], 1)
+
     def test_support_limit_stops_after_in_flight_batch(self) -> None:
         with AccountDB(self.db_path) as db:
             self._add_accounts(db, count=10)

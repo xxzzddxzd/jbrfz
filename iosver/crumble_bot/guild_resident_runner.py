@@ -844,78 +844,97 @@ class ResidentGuildRunner:
                 "results": results,
             }
 
-        query_membership, query_row = runnable[0]
-        try:
-            state = self.login_account(query_row)
-            session = state.to_session()
-            with self.client_factory(state.endpoint or ENDPOINT) as client:
-                api = Guild(client, session)
-                cached_requests = parse_get_guild_support_requests_response(
-                    api.get_guild_support_requests(guild.guild_id).message
+        # A requester cannot see their own support request. Query with a second
+        # distinct member when the first response is empty, then fan out only
+        # after a concrete support request id has been discovered.
+        query_candidates = sorted(
+            runnable,
+            key=lambda item: (
+                item[0].slot_no <= 0,
+                item[0].slot_no if item[0].slot_no > 0 else 10**9,
+                item[0].mid,
+            ),
+        )
+        query_attempts: list[dict] = []
+        cached_requests = []
+        successful_empty_queries = 0
+        required_empty_queries = min(2, len(query_candidates))
+        last_successful_query_mid = ""
+
+        for query_membership, query_row in query_candidates[:2]:
+            try:
+                state = self.login_account(query_row)
+                session = state.to_session()
+                with self.client_factory(state.endpoint or ENDPOINT) as client:
+                    api = Guild(client, session)
+                    requests = parse_get_guild_support_requests_response(
+                        api.get_guild_support_requests(guild.guild_id).message
+                    )
+                    state.resource_key = api.session.resource_key
+                self._persist_logged_in(
+                    query_row,
+                    state,
+                    note=f"resident:{guild.guild_id}",
                 )
-                state.resource_key = api.session.resource_key
-            self._persist_logged_in(
-                query_row,
-                state,
-                note=f"resident:{guild.guild_id}",
-            )
-            query_info = {
-                "ok": True,
-                "attempted": True,
-                "queried_by_mid": query_membership.mid,
-                "request_count": len(cached_requests),
-            }
-            self._notify_support_progress(
-                on_progress,
-                {
-                    "phase": "queried",
-                    "processed": len(results),
-                    "total": total_accounts,
-                    "support_count": support_count,
-                    "failed": failed,
-                    "request_count": len(cached_requests),
-                },
-            )
-        except Exception as error:
-            message = f"{type(error).__name__}: {error}"
+                last_successful_query_mid = query_membership.mid
+                query_attempts.append(
+                    {
+                        "ok": True,
+                        "mid": query_membership.mid,
+                        "request_count": len(requests),
+                    }
+                )
+                if requests:
+                    cached_requests = requests
+                    break
+                successful_empty_queries += 1
+            except Exception as error:
+                query_attempts.append(
+                    {
+                        "ok": False,
+                        "mid": query_membership.mid,
+                        "request_count": 0,
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+                )
+
+        empty_confirmed = successful_empty_queries >= required_empty_queries
+        query_ok = bool(cached_requests) or empty_confirmed
+        query_info = {
+            "ok": query_ok,
+            "attempted": True,
+            "attempt_count": len(query_attempts),
+            "queried_by_mid": last_successful_query_mid,
+            "request_count": len(cached_requests),
+            "empty_confirmations": successful_empty_queries,
+            "attempts": query_attempts,
+        }
+        if not query_ok:
+            stopped_reason = "query_failed"
+            failed += 1
+            last_attempt = query_attempts[-1]
+            message = str(last_attempt.get("error") or "support_query_unconfirmed")
             item = {
                 "ok": False,
-                "mid": query_membership.mid,
-                "name": str(query_membership.details.get("name") or ""),
+                "mid": str(last_attempt.get("mid") or ""),
+                "name": "",
                 "support": None,
                 "error": message,
             }
             results.append(item)
-            failed += 1
-            stopped_reason = "query_failed"
-            query_info = {
-                "ok": False,
-                "attempted": True,
-                "queried_by_mid": query_membership.mid,
-                "request_count": 0,
-                "error": message,
-            }
-            self.db.update_guild_membership(
-                guild.id,
-                query_membership.mid,
-                status="active",
-                last_error=message,
-            )
-            self._notify_support_progress(
-                on_progress,
-                {
-                    "phase": "account",
-                    "processed": len(results),
-                    "total": total_accounts,
-                    "support_count": support_count,
-                    "failed": failed,
-                    "mid": query_membership.mid,
-                    "name": item["name"],
-                    "status": stopped_reason,
-                    "error": message,
-                },
-            )
-            cached_requests = []
+
+        self._notify_support_progress(
+            on_progress,
+            {
+                "phase": "queried",
+                "processed": len(results),
+                "total": total_accounts,
+                "support_count": support_count,
+                "failed": failed,
+                "request_count": len(cached_requests),
+                "query_attempt_count": len(query_attempts),
+            },
+        )
 
         if not cached_requests:
             if not stopped_reason:
