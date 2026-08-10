@@ -50,6 +50,7 @@ log = logging.getLogger(__name__)
 
 ClientFactory = Type[GrpcClient]
 LoginAccount = Callable[[AccountRow], AccountState]
+SupportProgress = Callable[[dict], None]
 
 
 def resident_day_key(now: Optional[float] = None) -> str:
@@ -480,7 +481,12 @@ class ResidentGuildRunner:
             "results": results,
         }
 
-    def support(self, guild: ManagedGuildRow) -> dict:
+    def support(
+        self,
+        guild: ManagedGuildRow,
+        *,
+        on_progress: Optional[SupportProgress] = None,
+    ) -> dict:
         """Support pending guild-center requests using active local members.
 
         This is deliberately narrower than :meth:`daily`: it does not run the
@@ -512,6 +518,18 @@ class ResidentGuildRunner:
                     "message": "当前没有可登录的常驻成员；先执行 guild --gname <name> fill。",
                 },
             }
+
+        total_accounts = len(memberships)
+        self._notify_support_progress(
+            on_progress,
+            {
+                "phase": "querying",
+                "processed": 0,
+                "total": total_accounts,
+                "support_count": 0,
+                "failed": 0,
+            },
+        )
 
         results: list[dict] = []
         support_count = 0
@@ -545,6 +563,20 @@ class ResidentGuildRunner:
                 )
                 results.append(item)
                 failed += 1
+                self._notify_support_progress(
+                    on_progress,
+                    {
+                        "phase": "account",
+                        "processed": len(results),
+                        "total": total_accounts,
+                        "support_count": support_count,
+                        "failed": failed,
+                        "mid": membership.mid,
+                        "name": item["name"],
+                        "status": "failed",
+                        "error": message,
+                    },
+                )
                 continue
 
             try:
@@ -570,6 +602,17 @@ class ResidentGuildRunner:
                             "queried_by_mid": membership.mid,
                             "request_count": len(cached_requests),
                         }
+                        self._notify_support_progress(
+                            on_progress,
+                            {
+                                "phase": "queried",
+                                "processed": len(results),
+                                "total": total_accounts,
+                                "support_count": support_count,
+                                "failed": failed,
+                                "request_count": len(cached_requests),
+                            },
+                        )
                     if cached_requests:
                         support_result = self._support_one(
                             guild,
@@ -644,6 +687,23 @@ class ResidentGuildRunner:
                     }
                     member_stop_reason = "query_failed"
             results.append(item)
+            self._notify_support_progress(
+                on_progress,
+                {
+                    "phase": "account",
+                    "processed": len(results),
+                    "total": total_accounts,
+                    "support_count": support_count,
+                    "failed": failed,
+                    "mid": membership.mid,
+                    "name": item["name"],
+                    "status": (
+                        member_stop_reason
+                        or ("ok" if item.get("ok") else "failed")
+                    ),
+                    "error": str(item.get("error") or ""),
+                },
+            )
             if member_stop_reason:
                 stopped_reason = member_stop_reason
                 break
@@ -651,6 +711,17 @@ class ResidentGuildRunner:
         self.db.update_managed_guild(
             guild.id,
             status="active" if failed == 0 else "degraded",
+        )
+        self._notify_support_progress(
+            on_progress,
+            {
+                "phase": "done",
+                "processed": len(results),
+                "total": total_accounts,
+                "support_count": support_count,
+                "failed": failed,
+                "stopped_reason": stopped_reason,
+            },
         )
         return {
             "ok": failed == 0,
@@ -669,6 +740,17 @@ class ResidentGuildRunner:
             **({"stopped_reason": stopped_reason} if stopped_reason else {}),
             "results": results,
         }
+
+    @staticmethod
+    def _notify_support_progress(
+        callback: Optional[SupportProgress], payload: dict
+    ) -> None:
+        if callback is None:
+            return
+        try:
+            callback(dict(payload))
+        except Exception as error:  # noqa: BLE001 - display must not stop support
+            log.debug("support progress callback failed: %s", error)
 
     @staticmethod
     def _daily_action_has_account_workflows(action: dict) -> bool:

@@ -102,7 +102,8 @@ python main.py guild --gname 'ahhhha' maintain   # status → fill → daily
   单次成本超过 300 钻石前停止。
 - `support` 只执行支援中心，支援列表只查询一次，后续账号直接提交支援；达到支援上限
   即停止。它不会触发登录奖励、邮箱、碎屑副本、签到或研究；同一天已成功支援的请求
-  会从 `guild_support_actions` 去重。
+  会从 `guild_support_actions` 去重。执行期间会在 stderr 显示账号处理数、累计成功/失败数
+  和当前账号的进度条；`--quiet` 可关闭。
 - `maintain` 遇到容量不足、招募 50 人上限、待审批申请或缺少账号时不会等待，直接返回
   `state` 与 `next_action`，按提示处理后重跑同一命令。
 

@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import re
+import sys
 from dataclasses import asdict
 from datetime import datetime
 import time
@@ -1256,11 +1257,55 @@ def _cmd_guild_resident_support(args: argparse.Namespace) -> int:
     with AccountDB(args.db) as db:
         target = _resident_target(db, args)
         runner = ResidentGuildRunner(db, _login_account)
-        payload = runner.support(target)
+
+        def show_progress(progress: dict) -> None:
+            if bool(getattr(args, "quiet", False)):
+                return
+            print(_guild_support_progress_line(progress), file=sys.stderr, flush=True)
+
+        payload = runner.support(target, on_progress=show_progress)
         current = db.get_managed_guild(target.guild_id) or target
         payload["status"] = runner.status(current)
         _print_guild_payload(payload, args)
     return 0 if payload.get("ok") else 1
+
+
+def _guild_support_progress_line(progress: dict) -> str:
+    total = max(0, int(progress.get("total") or 0))
+    processed = max(0, min(total, int(progress.get("processed") or 0)))
+    width = 20
+    filled = width if total == 0 else min(width, int(width * processed / total))
+    bar = "#" * filled + "-" * (width - filled)
+    phase = str(progress.get("phase") or "")
+    suffix = ""
+    if phase == "querying":
+        suffix = "正在查询支援列表"
+    elif phase == "queried":
+        suffix = f"发现 {int(progress.get('request_count') or 0)} 条请求"
+    elif phase == "account":
+        identity = str(progress.get("name") or progress.get("mid") or "-")
+        status_map = {
+            "ok": "已处理",
+            "failed": "失败",
+            "support_limit": "支援已达上限",
+            "no_pending_requests": "没有待支援请求",
+            "query_failed": "查询失败",
+        }
+        status = status_map.get(
+            str(progress.get("status") or ""),
+            str(progress.get("status") or "已处理"),
+        )
+        suffix = f"{identity}：{status}"
+    elif phase == "done":
+        suffix = "完成"
+        stopped_reason = str(progress.get("stopped_reason") or "")
+        if stopped_reason:
+            suffix += f"（{stopped_reason}）"
+    return (
+        f"支援进度 [{bar}] {processed}/{total} "
+        f"成功 {int(progress.get('support_count') or 0)} "
+        f"失败 {int(progress.get('failed') or 0)} {suffix}"
+    ).rstrip()
 
 
 def _cmd_guild_resident_maintain(args: argparse.Namespace) -> int:

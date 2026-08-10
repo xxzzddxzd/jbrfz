@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from crumble_bot import pbutil as pb
+from crumble_bot import cli, pbutil as pb
 from crumble_bot.auth import AccountState
 from crumble_bot.db import AccountDB
 from crumble_bot.grpc_client import GrpcResponse
@@ -346,13 +346,24 @@ class ResidentGuildTests(unittest.TestCase):
                 }
 
             runner._support_one = fake_support
-            result = runner.support(guild)
+            progress = []
+            result = runner.support(guild, on_progress=progress.append)
 
             self.assertTrue(result["ok"])
             self.assertEqual(result["count"], 2)
             self.assertEqual(result["attempted"], 2)
             self.assertEqual(result["accounts_attempted"], 2)
             self.assertEqual(rpc_paths, [GET_GUILD_SUPPORT_REQUESTS_PATH])
+            self.assertEqual(
+                [item["phase"] for item in progress],
+                ["querying", "queried", "account", "account", "done"],
+            )
+            self.assertEqual(progress[-1]["processed"], 2)
+            self.assertEqual(progress[-1]["support_count"], 2)
+            self.assertIn(
+                "[####################] 2/2 成功 2 失败 0",
+                cli._guild_support_progress_line(progress[-1]),
+            )
             self.assertEqual(calls[0][0:2], ("G1", "BOT0"))
             self.assertEqual(calls[1][0:2], ("G1", "BOT1"))
             self.assertEqual(
