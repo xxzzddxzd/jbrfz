@@ -8,14 +8,17 @@ from __future__ import annotations
 
 import logging
 import json
+import re
 import time
 from dataclasses import asdict
+from datetime import datetime
 from typing import Callable, Optional, Type
 
 from .auth import AccountState
 from .constants import ENDPOINT
 from .crumble_dungeon import CrumbleDungeonRunner
 from .db import (
+    GUILD_COOLDOWN_SECONDS,
     AccountDB,
     AccountRow,
     GuildMembershipRow,
@@ -458,7 +461,10 @@ class ResidentGuildRunner:
         }
         results: list[dict] = []
         joined_so_far = 0
-        for candidate in candidates[:limit]:
+        filled_so_far = 0
+        for candidate in candidates:
+            if filled_so_far >= limit:
+                break
             slot = self._next_slot(slots, effective_managed_target)
             if slot is None:
                 break
@@ -467,6 +473,7 @@ class ResidentGuildRunner:
                 item["reapplied"] = bool(item.get("applied"))
             results.append(item)
             if item.get("ok"):
+                filled_so_far += 1
                 self.db.mark_used(candidate.mid, True)
                 slots.add(slot)
                 recruited_today += 1
@@ -500,19 +507,26 @@ class ResidentGuildRunner:
         joined = sum(1 for item in results if item.get("joined"))
         applied = sum(1 for item in results if item.get("applied"))
         filled = joined + applied
+        failed = sum(1 for item in results if not item.get("ok"))
         recruitment_limit_hit = any(
             parse_guild_daily_recruitment_limit(item.get("error", "")) is not None
             for item in results
         )
-        state = "daily_recruitment_limit" if recruitment_limit_hit else (
-            "awaiting_approval" if applied and not joined else (
-                "filled" if joined else "fill_failed"
+        state = (
+            "daily_recruitment_limit"
+            if recruitment_limit_hit
+            else (
+                "awaiting_approval"
+                if applied
+                else ("filled" if joined else "fill_failed")
             )
         )
         payload = {
-            "ok": filled == len(results) and filled > 0,
+            "ok": filled >= limit and limit > 0,
             "state": state,
             "requested": limit,
+            "attempted": len(results),
+            "failed": failed,
             "joined": joined,
             "applied": applied,
             "filled": filled,
@@ -1119,6 +1133,7 @@ class ResidentGuildRunner:
                 }
         except Exception as error:
             message = f"{type(error).__name__}: {error}"
+            cooldown_until = self._record_rejoin_cooldown(mid, message)
             self.db.upsert_guild_membership(
                 guild.id,
                 mid,
@@ -1129,7 +1144,14 @@ class ResidentGuildRunner:
                 status="error",
                 last_error=message,
                 details=(
-                    {"name": candidate_name} if candidate_name else {}
+                    {
+                        **({"name": candidate_name} if candidate_name else {}),
+                        **(
+                            {"rejoin_cooldown_until": cooldown_until}
+                            if cooldown_until is not None
+                            else {}
+                        ),
+                    }
                 ),
             )
             return {
@@ -1138,7 +1160,36 @@ class ResidentGuildRunner:
                 **({"name": candidate_name} if candidate_name else {}),
                 "slot_no": slot,
                 "error": message,
+                **(
+                    {"rejoin_cooldown_until": cooldown_until}
+                    if cooldown_until is not None
+                    else {}
+                ),
             }
+
+    def _record_rejoin_cooldown(
+        self,
+        mid: str,
+        message: str,
+    ) -> Optional[float]:
+        matched = re.search(
+            r"rejoin cooldown ends at\s+([0-9]{4}-[0-9]{2}-[0-9]{2}T[^' ]+)",
+            str(message or ""),
+            flags=re.IGNORECASE,
+        )
+        if not matched:
+            return None
+        try:
+            deadline = datetime.fromisoformat(
+                matched.group(1).rstrip(".,;")
+            ).timestamp()
+        except ValueError:
+            return None
+        self.db.mark_guild_left(
+            mid,
+            left_at=deadline - GUILD_COOLDOWN_SECONDS,
+        )
+        return deadline
 
     def _daily_one(
         self,
@@ -1452,6 +1503,13 @@ class ResidentGuildRunner:
         for member in snapshot.members:
             current = existing.get(member.mid)
             if current is None:
+                account = self.db.get(member.mid)
+                if account is not None:
+                    self.db.mark_guild_joined(
+                        member.mid,
+                        guild.guild_id,
+                        joined_at=now,
+                    )
                 self.db.upsert_guild_membership(
                     guild.id,
                     member.mid,
@@ -1463,12 +1521,11 @@ class ResidentGuildRunner:
                 )
             else:
                 joined_at = current.joined_at or now
-                if current.member_type == "managed":
-                    account = self.db.get(member.mid)
-                    if account is not None and account.guild_joined_at <= account.guild_left_at:
-                        self.db.mark_guild_joined(
-                            member.mid, guild.guild_id, joined_at=joined_at
-                        )
+                account = self.db.get(member.mid)
+                if account is not None and account.guild_joined_at <= account.guild_left_at:
+                    self.db.mark_guild_joined(
+                        member.mid, guild.guild_id, joined_at=joined_at
+                    )
                 self.db.update_guild_membership(
                     guild.id,
                     member.mid,
@@ -1485,12 +1542,12 @@ class ResidentGuildRunner:
                 or member.status != "active"
             ):
                 continue
-            if member.member_type == "managed":
-                account = self.db.get(member.mid)
-                if account is not None and account.guild_joined_at > account.guild_left_at:
-                    # A manual kick/leave is still subject to the same
-                    # server cooldown as the transient workflows.
-                    self.db.mark_guild_left(member.mid, left_at=now)
+            account = self.db.get(member.mid)
+            if account is not None:
+                # A manual kick/leave is still subject to the same server
+                # cooldown, including locally owned accounts that were
+                # classified as external because they joined outside fill.
+                self.db.mark_guild_left(member.mid, left_at=now)
             # External members must be reconciled too.  Otherwise a member
             # removed manually on the phone remains ``active`` forever and is
             # still printed as part of the current guild roster.

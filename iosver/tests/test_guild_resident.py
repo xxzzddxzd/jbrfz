@@ -270,6 +270,77 @@ class ResidentGuildTests(unittest.TestCase):
             self.assertEqual([row.slot_no for row in memberships], [1, 2, 3])
             self.assertTrue(all(db.get(row.mid).used for row in memberships))
 
+    def test_fill_continues_after_candidate_failure(self) -> None:
+        with AccountDB(self.db_path) as db:
+            self._add_accounts(db, count=2)
+            guild = db.upsert_managed_guild(
+                guild_id="G1",
+                gname="ahhhha",
+                gmname="absdbld",
+                capacity=3,
+                reserve_slots=2,
+            )
+            runner = ResidentGuildRunner(db, self._login)
+            attempted = []
+
+            def fake_join_one(_guild, row, _controller, slot):
+                attempted.append(row.mid)
+                if row.mid == "BOT0":
+                    return {
+                        "ok": False,
+                        "mid": row.mid,
+                        "slot_no": slot,
+                        "error": "account cooldown",
+                    }
+                db.upsert_guild_membership(
+                    guild.id,
+                    row.mid,
+                    slot_no=slot,
+                    member_type="managed",
+                    status="active",
+                )
+                return {
+                    "ok": True,
+                    "joined": True,
+                    "applied": False,
+                    "mid": row.mid,
+                    "slot_no": slot,
+                }
+
+            runner._join_one = fake_join_one
+            result = runner.fill(guild)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(attempted, ["BOT0", "BOT1"])
+            self.assertEqual(result["requested"], 1)
+            self.assertEqual(result["attempted"], 2)
+            self.assertEqual(result["failed"], 1)
+            self.assertEqual(result["joined"], 1)
+
+    def test_resident_rejoin_cooldown_is_persisted(self) -> None:
+        with AccountDB(self.db_path) as db:
+            self._add_accounts(db, count=1)
+            guild = db.upsert_managed_guild(
+                guild_id="G1",
+                gname="ahhhha",
+                gmname="absdbld",
+                capacity=3,
+            )
+            runner = ResidentGuildRunner(db, self._login)
+            deadline = runner._record_rejoin_cooldown(
+                "BOT0",
+                "Cannot join a guild yet; rejoin cooldown ends at "
+                "2026-08-12T04:30:00+09:00.",
+            )
+
+            self.assertIsNotNone(deadline)
+            row = db.get("BOT0")
+            self.assertAlmostEqual(
+                row.guild_left_at,
+                deadline - 24 * 60 * 60,
+            )
+            self.assertIsNotNone(guild)
+
     def test_fill_reserve_zero_fills_around_external_member(self) -> None:
         with AccountDB(self.db_path) as db:
             self._add_accounts(db)
@@ -312,6 +383,16 @@ class ResidentGuildTests(unittest.TestCase):
 
     def test_reconcile_marks_removed_external_member_missing(self) -> None:
         with AccountDB(self.db_path) as db:
+            db.upsert_state(
+                AccountState(
+                    mid="EXTERNAL",
+                    guest_secret="secret",
+                    game_access_token="token",
+                    next_stage=31,
+                ),
+                ready=True,
+                invalid=False,
+            )
             guild = db.upsert_managed_guild(
                 guild_id="G1",
                 gname="ahhhha",
@@ -336,6 +417,7 @@ class ResidentGuildTests(unittest.TestCase):
             membership = db.get_guild_membership(guild.id, "EXTERNAL")
             self.assertEqual(membership.status, "missing")
             self.assertEqual(membership.last_error, "member_not_in_live_guild")
+            self.assertGreater(db.get("EXTERNAL").guild_left_at, 0)
             status = runner.status(guild)
             self.assertEqual(status["roster"]["non_managed_active"], 0)
             self.assertFalse(

@@ -276,9 +276,11 @@ def _guild_human_output(payload: object) -> str:
         applied = fill.get("applied", 0)
         filled = fill.get("filled", joined + applied)
         waiting = fill.get("pending_approval", applied)
+        attempted = fill.get("attempted", requested)
+        failed_fill = fill.get("failed", 0)
         lines.append(
-            f"补位：请求 {requested}，已入会 {joined}，"
-            f"待审批 {waiting}，完成 {filled}"
+            f"补位：目标 {requested}，尝试 {attempted}，已入会 {joined}，"
+            f"待审批 {waiting}，失败 {failed_fill}，完成 {filled}"
         )
         if fill.get("daily_recruit_remaining") is not None:
             lines.append(f"今日招募剩余：{fill['daily_recruit_remaining']}")
@@ -329,7 +331,17 @@ def _guild_human_output(payload: object) -> str:
                 }:
                     state_label = "处理中"
                 else:
-                    state_label = "失败"
+                    cooldown_until = item.get("rejoin_cooldown_until")
+                    error = str(item.get("error") or "").strip()
+                    if cooldown_until:
+                        state_label = (
+                            "失败（重新入会冷却至 "
+                            f"{_local_timestamp(float(cooldown_until))}）"
+                        )
+                    elif error:
+                        state_label = f"失败（{error}）"
+                    else:
+                        state_label = "失败"
                 lines.append(f"  - {label}：{state_label}")
 
         live_members = [
