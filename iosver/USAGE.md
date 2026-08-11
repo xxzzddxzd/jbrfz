@@ -295,6 +295,24 @@ python main.py guild private return 3
 | `--ready` | 关 | ready |
 | `--limit` | `50` | 条数 |
 
+### Python `CheatService` 模块
+
+`PayAssetsForciblyRequest` 的外层参数是重复的 `commands`；每条命令包含
+`asset_data_id: int32` 和 `amount: int64`。Python 成员函数按游戏自身
+`RemoveCurrencyAsync` 的单条命令调用方式封装，未新增 CLI 指令：
+
+```python
+from crumble_bot.cheat import Cheat
+
+response = Cheat(client, session).pay_assets_forcibly(
+    asset_data_id=1464007916,
+    amount=100,
+)
+```
+
+生产账号是否能执行仍由服务端鉴权决定；无权限时会返回 gRPC
+`permission denied`。
+
 ---
 
 ## sqlite 字段
