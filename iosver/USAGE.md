@@ -311,7 +311,9 @@ response = Cheat(client, session).pay_assets_forcibly(
 ```
 
 生产账号是否能执行仍由服务端鉴权决定；无权限时会返回 gRPC
-`permission denied`。
+`permission denied`。模块还保存了10101生成代码中的50个 `CheatService` 方法和14个
+`CheatPureService` 方法；`probe_method()` / `probe_methods()` 使用无法反序列化的
+protobuf探测路由是否存在，不会进入服务端业务处理。
 
 ---
 

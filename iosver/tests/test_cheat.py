@@ -4,12 +4,16 @@ import unittest
 
 from crumble_bot import pbutil as pb
 from crumble_bot.cheat import (
+    CHEAT_PURE_SERVICE_METHODS,
+    CHEAT_PURE_SERVICE_NAME,
+    CHEAT_SERVICE_METHODS,
+    CHEAT_SERVICE_NAME,
     PAY_ASSETS_FORCIBLY_PATH,
     Cheat,
     PayAssetsForciblyCommand,
     pay_assets_forcibly_request,
 )
-from crumble_bot.grpc_client import GrpcResponse
+from crumble_bot.grpc_client import GrpcError, GrpcResponse
 from crumble_bot.headers import Session
 
 
@@ -42,7 +46,26 @@ class _CheatClient:
         )
 
 
+class _ProbeClient:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def unary(self, path, message, *, metadata=None):
+        self.calls.append((path, message, metadata))
+        if path.endswith("/PayAssetsForcibly"):
+            raise GrpcError(12, f"Method not found: {path.removeprefix('/')}")
+        if path.endswith("/GetContextResourceKey"):
+            return GrpcResponse(b"", {}, {})
+        raise GrpcError(13, "Error parsing request message")
+
+
 class CheatTests(unittest.TestCase):
+    def test_generated_method_registry_is_complete(self) -> None:
+        self.assertEqual(len(CHEAT_SERVICE_METHODS), 50)
+        self.assertEqual(len(CHEAT_PURE_SERVICE_METHODS), 14)
+        self.assertIn("PayAssetsForcibly", CHEAT_SERVICE_METHODS)
+        self.assertIn("GetContextResourceKey", CHEAT_PURE_SERVICE_METHODS)
+
     def test_pay_assets_request_supports_repeated_commands(self) -> None:
         body = pay_assets_forcibly_request(
             (
@@ -95,6 +118,37 @@ class CheatTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             pay_assets_forcibly_request(((1, 2),))
+
+    def test_probe_uses_malformed_body_and_classifies_routes(self) -> None:
+        client = _ProbeClient()
+        cheat = Cheat(client, Session(mid="MID1", game_access_token="token"))
+
+        missing = cheat.probe_method("PayAssetsForcibly")
+        parsing = cheat.probe_method("GetGameBoosts")
+        success = cheat.probe_method(
+            "GetContextResourceKey",
+            service=CHEAT_PURE_SERVICE_NAME,
+        )
+
+        self.assertFalse(missing.exists)
+        self.assertEqual(missing.grpc_status, 12)
+        self.assertTrue(parsing.exists)
+        self.assertEqual(parsing.grpc_status, 13)
+        self.assertTrue(success.exists)
+        self.assertEqual(success.grpc_status, 0)
+        self.assertEqual([call[1] for call in client.calls], [b"\x80"] * 3)
+        self.assertEqual(
+            client.calls[0][0],
+            f"/{CHEAT_SERVICE_NAME}/PayAssetsForcibly",
+        )
+
+    def test_probe_rejects_unknown_service_or_method(self) -> None:
+        cheat = Cheat(_ProbeClient(), Session(mid="MID1", game_access_token="token"))
+
+        with self.assertRaises(ValueError):
+            cheat.probe_method("NotGenerated")
+        with self.assertRaises(ValueError):
+            cheat.probe_method("Fail", service="cc.public.game.Other")
 
 
 if __name__ == "__main__":
