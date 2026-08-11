@@ -7,10 +7,11 @@
 包含的 1.0.101 固定补丁：
 
 - AppSealing 环境检查兼容与状态修复；
+- 打包时静态关闭主程序及 UnityFramework 的 20 个保护线程入口；
 - 免广告路径、RPC 错误 loading 修复；
 - 任务自动领取、烤箱/十连/宝箱动作及需求记录修复；
 - 浮动面板；
-- `UnityEngine.Time.set_timeScale` 固定地址 `UnityFramework + 0x0BB38760`，面板可切换 3×/1×。
+- 通过该版本导出的 `il2cpp_resolve_icall` 解析 `UnityEngine.Time::set_timeScale(System.Single)`，面板可切换 3×/1×；开启后每 500 ms 重申一次倍率。
 
 默认构建并做 ad-hoc 签名（适合 TrollStore/已允许自签包的设备）：
 

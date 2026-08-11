@@ -90,10 +90,20 @@ cp "$MAIN_BINARY" "$APP_MAIN"
 cp "$UNITY_BINARY" "$APP_UNITY"
 cp "$PATCH_DYLIB" "$APP_DIR/Frameworks/JBRFZPatch.dylib"
 chmod 0755 "$APP_MAIN" "$APP_UNITY" "$APP_DIR/Frameworks/JBRFZPatch.dylib"
+
+# AppSealing's native protection constructors run before an injected dylib's
+# constructor on macOS/PlayCover. Patch the version-locked worker entries in
+# the packaged binaries so no delayed fault/exit worker can start first.
+python3 "$SCRIPT_DIR/patch_arm64_rvas.py" "$APP_MAIN" \
+    0x000837FC 0x000838C8 0x00083A24 0x00083A48 0x00083C24 \
+    0x00083D1C 0x00083EAC 0x0008400C 0x00084108 0x0008412C
+python3 "$SCRIPT_DIR/patch_arm64_rvas.py" "$APP_UNITY" \
+    0x000EEC38 0x000EED04 0x000EEE60 0x000EEE84 0x000EF060 \
+    0x000EF158 0x000EF2E8 0x000EF448 0x000EF544 0x000EF568
 python3 "$SCRIPT_DIR/inject_load_dylib.py" "$APP_MAIN" "$PATCH_INSTALL_NAME"
 
 /usr/libexec/PlistBuddy -c 'Delete :JBRFZPatch' "$APP_DIR/Info.plist" 2>/dev/null || true
-/usr/libexec/PlistBuddy -c 'Add :JBRFZPatch string 1.0.101-embedded-no-capture-speed3x' "$APP_DIR/Info.plist"
+/usr/libexec/PlistBuddy -c 'Add :JBRFZPatch string 1.0.101-embedded-no-capture-speed3x-icall' "$APP_DIR/Info.plist"
 rm -rf "$APP_DIR/_CodeSignature"
 
 SIGNING_MODE=adhoc

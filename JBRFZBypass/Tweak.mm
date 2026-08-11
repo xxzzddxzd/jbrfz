@@ -30,9 +30,63 @@ extern "C" void JbrfzCancelAutoActions(const char *reason) {
     }
 }
 
-using JbrfzUnitySetTimeScaleMethod = void (*)(float value, void *methodInfo);
+using JbrfzUnityResolveICallMethod = void *(*)(const char *name);
+using JbrfzUnitySetTimeScaleMethod = void (*)(float value);
 static atomic_bool gJbrfzUnitySpeedEnabled = false;
-static JbrfzUnitySetTimeScaleMethod gJbrfzOriginalUnitySetTimeScale = nullptr;
+static atomic_uint gJbrfzUnitySpeedGeneration = 0;
+static atomic_uintptr_t gJbrfzUnityResolveICallAddress = 0;
+static atomic_uintptr_t gJbrfzUnitySetTimeScaleAddress = 0;
+
+static JbrfzUnitySetTimeScaleMethod JbrfzUnitySetTimeScale(void) {
+    uintptr_t address = atomic_load(&gJbrfzUnitySetTimeScaleAddress);
+    if (address != 0) {
+        return reinterpret_cast<JbrfzUnitySetTimeScaleMethod>(address);
+    }
+
+    auto resolver = reinterpret_cast<JbrfzUnityResolveICallMethod>(
+        atomic_load(&gJbrfzUnityResolveICallAddress));
+    if (resolver == nullptr) {
+        resolver = reinterpret_cast<JbrfzUnityResolveICallMethod>(
+            dlsym(RTLD_DEFAULT, "il2cpp_resolve_icall"));
+        if (resolver != nullptr) {
+            atomic_store(&gJbrfzUnityResolveICallAddress,
+                         reinterpret_cast<uintptr_t>(resolver));
+        }
+    }
+    if (resolver == nullptr) {
+        return nullptr;
+    }
+
+    void *resolved =
+        resolver("UnityEngine.Time::set_timeScale(System.Single)");
+    if (resolved == nullptr) {
+        resolved = resolver("UnityEngine.Time::set_timeScale");
+    }
+    if (resolved == nullptr) {
+        return nullptr;
+    }
+    atomic_store(&gJbrfzUnitySetTimeScaleAddress,
+                 reinterpret_cast<uintptr_t>(resolved));
+    NSLog(@"[JBRFZBypass] Unity timeScale resolved target=%p", resolved);
+    return reinterpret_cast<JbrfzUnitySetTimeScaleMethod>(resolved);
+}
+
+static void JbrfzScheduleUnitySpeedPulse(unsigned generation) {
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+            if (!atomic_load(&gJbrfzUnitySpeedEnabled) ||
+                atomic_load(&gJbrfzUnitySpeedGeneration) != generation) {
+                return;
+            }
+            JbrfzUnitySetTimeScaleMethod setTimeScale =
+                JbrfzUnitySetTimeScale();
+            if (setTimeScale != nullptr) {
+                setTimeScale(3.0f);
+            }
+            JbrfzScheduleUnitySpeedPulse(generation);
+        });
+}
 
 extern "C" bool JbrfzUnitySpeedEnabled(void) {
     return atomic_load(&gJbrfzUnitySpeedEnabled);
@@ -40,17 +94,18 @@ extern "C" bool JbrfzUnitySpeedEnabled(void) {
 
 extern "C" void JbrfzSetUnitySpeedEnabled(bool enabled) {
     atomic_store(&gJbrfzUnitySpeedEnabled, enabled);
-    if (gJbrfzOriginalUnitySetTimeScale != nullptr) {
-        gJbrfzOriginalUnitySetTimeScale(enabled ? 3.0f : 1.0f, nullptr);
+    const unsigned generation =
+        atomic_fetch_add(&gJbrfzUnitySpeedGeneration, 1) + 1;
+    JbrfzUnitySetTimeScaleMethod setTimeScale = JbrfzUnitySetTimeScale();
+    if (setTimeScale != nullptr) {
+        setTimeScale(enabled ? 3.0f : 1.0f);
+        NSLog(@"[JBRFZBypass] Unity timeScale applied %.0fx target=%p",
+              enabled ? 3.0 : 1.0,
+              reinterpret_cast<void *>(setTimeScale));
     }
-}
-
-static void HookedUnitySetTimeScale(float value, void *methodInfo) {
-    if (gJbrfzOriginalUnitySetTimeScale == nullptr) {
-        return;
+    if (enabled) {
+        JbrfzScheduleUnitySpeedPulse(generation);
     }
-    gJbrfzOriginalUnitySetTimeScale(
-        atomic_load(&gJbrfzUnitySpeedEnabled) ? 3.0f : value, methodInfo);
 }
 
 namespace {
@@ -2202,18 +2257,11 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
         reinterpret_cast<void *>(&HookedUpdateUI),
         reinterpret_cast<void **>(&gOriginalUpdateUI));
 
-    // UnityEngine.Time.set_timeScale(float), fixed for 1.0.101 only.
-    // This intentionally avoids cross-version scanning: the surrounding
-    // UnityFramework UUID gate guarantees the RVA belongs to this build.
-    static constexpr uintptr_t unitySetTimeScaleRVA = 0x0BB38760;
-    MSHookFunction(
-        reinterpret_cast<void *>(base + unitySetTimeScaleRVA),
-        reinterpret_cast<void *>(&HookedUnitySetTimeScale),
-        reinterpret_cast<void **>(&gJbrfzOriginalUnitySetTimeScale));
-    JbrfzSetUnitySpeedEnabled(JbrfzUnitySpeedEnabled());
-    JbrfzLog(@"[JBRFZBypass] Unity 3x speed hook armed "
-             @"(Time.set_timeScale @ 0x%lx)",
-             static_cast<unsigned long>(unitySetTimeScaleRVA));
+    // Resolve the engine icall instead of calling an IL2CPP wrapper RVA. The
+    // wrapper requires a managed object ABI and crashes when invoked as the
+    // native one-float setter. A 500 ms pulse keeps the requested scale active
+    // while leaving Unity code unmodified.
+    JbrfzLog(@"[JBRFZBypass] Unity 3x speed controller armed (resolved icall)");
 
     JbrfzLog(@"[JBRFZBypass] Guide automation armed "
           "(progress @ 0x%lx, UpdateUI @ 0x%lx, OvenCtor @ 0x%lx, "
@@ -2265,7 +2313,12 @@ static void InstallAppSealingHooks(const struct mach_header *header,
     const char *mainPath = nullptr;
     if (IsImageWithSuffix(header, mainSuffix, &mainPath)) {
         if (IsSupportedMainExecutable(header)) {
+#if !defined(JBRFZ_EMBEDDED)
             InstallProtectionThreadHooks(header, true);
+#else
+            JbrfzLog(@"[JBRFZBypass] Main protection workers disabled by "
+                     @"embedded binary patch");
+#endif
             atomic_store(&gMainExecutableBase,
                          reinterpret_cast<uintptr_t>(header));
             ScheduleNormalState();
@@ -2307,6 +2360,12 @@ static void InstallAppSealingHooks(const struct mach_header *header,
         return;
     }
 
+    void *resolveICall = dlsym(image, "il2cpp_resolve_icall");
+    if (resolveICall != nullptr) {
+        atomic_store(&gJbrfzUnityResolveICallAddress,
+                     reinterpret_cast<uintptr_t>(resolveICall));
+    }
+
     bool expected = false;
     if (!atomic_compare_exchange_strong(&gInstalled, &expected, true)) {
         dlclose(image);
@@ -2322,7 +2381,12 @@ static void InstallAppSealingHooks(const struct mach_header *header,
     MSHookFunction(swizzlingIter,
                    reinterpret_cast<void *>(&ReturnNormalEnvironment),
                    reinterpret_cast<void **>(&gOriginalSwizzlingIter));
+#if !defined(JBRFZ_EMBEDDED)
     InstallProtectionThreadHooks(header, false);
+#else
+    JbrfzLog(@"[JBRFZBypass] Unity protection workers disabled by "
+             @"embedded binary patch");
+#endif
     InstallManagedFallbackHooks(header);
     atomic_store(&gUnityFrameworkBase,
                  reinterpret_cast<uintptr_t>(header));

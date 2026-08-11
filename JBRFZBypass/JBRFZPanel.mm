@@ -104,7 +104,11 @@ static void JbrfzLoadUnitySpeedDefault(void) {
         [defaults synchronize];
     }
     gUnitySpeedLoaded = true;
-    JbrfzSetUnitySpeedEnabled(enabled);
+    // Global state starts disabled. Avoid touching Unity just to restate 1x;
+    // only an enabled preference needs an initial call/pulse schedule.
+    if (enabled) {
+        JbrfzSetUnitySpeedEnabled(true);
+    }
 }
 
 static void JbrfzSetUnitySpeedPreference(bool enabled) {
