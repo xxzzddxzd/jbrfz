@@ -10,7 +10,16 @@
 #include <stdarg.h>
 #include <string.h>
 #include <time.h>
+#if defined(JBRFZ_EMBEDDED)
+#include "JBRFZDobby.h"
+
+static inline void MSHookFunction(void *target, void *replacement,
+                                  void **original) {
+    DobbyHook(target, replacement, original);
+}
+#else
 #include <substrate.h>
+#endif
 
 // Bridge so the panel (other TU) can cancel delayed auto actions.
 static void (*gJbrfzCancelAutoActionsFn)(const char *reason) = nullptr;
@@ -19,6 +28,29 @@ extern "C" void JbrfzCancelAutoActions(const char *reason) {
     if (gJbrfzCancelAutoActionsFn != nullptr) {
         gJbrfzCancelAutoActionsFn(reason);
     }
+}
+
+using JbrfzUnitySetTimeScaleMethod = void (*)(float value, void *methodInfo);
+static atomic_bool gJbrfzUnitySpeedEnabled = false;
+static JbrfzUnitySetTimeScaleMethod gJbrfzOriginalUnitySetTimeScale = nullptr;
+
+extern "C" bool JbrfzUnitySpeedEnabled(void) {
+    return atomic_load(&gJbrfzUnitySpeedEnabled);
+}
+
+extern "C" void JbrfzSetUnitySpeedEnabled(bool enabled) {
+    atomic_store(&gJbrfzUnitySpeedEnabled, enabled);
+    if (gJbrfzOriginalUnitySetTimeScale != nullptr) {
+        gJbrfzOriginalUnitySetTimeScale(enabled ? 3.0f : 1.0f, nullptr);
+    }
+}
+
+static void HookedUnitySetTimeScale(float value, void *methodInfo) {
+    if (gJbrfzOriginalUnitySetTimeScale == nullptr) {
+        return;
+    }
+    gJbrfzOriginalUnitySetTimeScale(
+        atomic_load(&gJbrfzUnitySpeedEnabled) ? 3.0f : value, methodInfo);
 }
 
 namespace {
@@ -115,6 +147,7 @@ static LoadingSetMethod gOriginalLoadingFlagSet = nullptr;
 static atomic_uintptr_t gLoadingFlagInstance = 0;
 static atomic_uintptr_t gLastLoadingKey = 0;
 
+#if !defined(JBRFZ_NO_CAPTURE)
 // ---- Invite / stage / account capture (for local Python automation) ----
 using ExchangeBeforeRequestMethod = void (*)(void *self, int exchangeId,
                                              void *headers, void *method,
@@ -172,6 +205,7 @@ using RegisterFriendInviterMethod = JbrfzUniTaskShim (*)(void *self,
 static StartStageMethod gOriginalStartStageAsync = nullptr;
 static CompleteStageMethod gOriginalCompleteStageAsync = nullptr;
 static RegisterFriendInviterMethod gOriginalRegisterFriendInviter = nullptr;
+#endif
 
 
 using OvenCtorMethod = void (*)(void *self, void *equipmentApi, void *transactor,
@@ -239,6 +273,7 @@ static int ReturnNormalEnvironment(void) {
 static void ReturnWithoutAction(void) {
 }
 
+#if !defined(JBRFZ_NO_CAPTURE)
 // ===================== Capture helpers (invite / stage / account) =====================
 // Writes Documents/jbrfz_capture.log + optional *.bin for key protobuf bodies.
 // Goal: collect guest secret, tokens, mid, invite link, Start/CompleteStage payloads,
@@ -812,7 +847,7 @@ static JbrfzUniTaskShim HookedCompleteStageAsync(void *self, int stageIndex,
 }
 
 static JbrfzUniTaskShim HookedRegisterFriendInviter(void *self, void *inviterId,
-                                                    void *methodInfo) {
+                                                     void *methodInfo) {
     NSString *mid = Il2CppStringToNSString(inviterId);
     JbrfzCaptureLog(@"[CAPTURE][RegisterFriendInviter] inviter=%@",
                     mid ?: @"?");
@@ -821,6 +856,7 @@ static JbrfzUniTaskShim HookedRegisterFriendInviter(void *self, void *inviterId,
     }
     return JbrfzUniTaskShim{};
 }
+#endif
 
 // Invoke IL2CPP Action<bool> using the same layout the game uses:
 // fn = *(action+0x18), target = *(action+0x40), method = *(action+0x28)
@@ -920,8 +956,10 @@ static void HookedAfterResponseRpcException(void *self, int exchangeId,
     (void)guidHi;
     (void)methodInfo;
 
-    JbrfzCaptureLog(@"[CAPTURE][ERR] id=%d method=%@ exception=%p options=%d",
-                    exchangeId, MethodFullName(method), exception, options);
+    (void)exchangeId;
+    (void)method;
+    (void)exception;
+    (void)options;
 
     void *flag = nullptr;
     if (self != nullptr) {
@@ -939,9 +977,8 @@ static void HookedAfterResponseRpcException(void *self, int exchangeId,
     if (guide != nullptr) {
         reinterpret_cast<uint8_t *>(guide)[0x80] = 0;
     }
-    JbrfzLog(@"[JBRFZBypass] Dismiss loading/wait (AfterResponse(RpcException) "
-             "exchangeId=%d flag=%p)",
-             exchangeId, flag);
+    JbrfzLog(@"[JBRFZBypass] Dismiss loading/wait "
+             @"(AfterResponse(RpcException) flag=%p)", flag);
 }
 
 // AfterError: never restart/login; still clear loading/wait if still stuck.
@@ -1987,6 +2024,7 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
           static_cast<unsigned long>(loadingFlagSetRVA),
           static_cast<unsigned long>(handleOnGuideUIClickRVA));
 
+#if !defined(JBRFZ_NO_CAPTURE)
     // ---- Capture hooks for invite / stage / account reverse ----
     // 1.0.101 keeps ExchangeLogger in the binary but no longer dispatches
     // production traffic to it. MainSceneExchangeEventListener is the active
@@ -2094,6 +2132,7 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
                     static_cast<unsigned long>(completeStageRVA),
                     static_cast<unsigned long>(registerFriendRVA));
     JbrfzLog(@"[JBRFZBypass] Capture hooks armed (invite/stage/account)");
+#endif
 
     // Capture OvenAutoDrawService for checklist OvenStartAuto actions.
     static constexpr uintptr_t ovenAutoDrawCtorRVA = 0x041F6950;
@@ -2162,6 +2201,19 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
         reinterpret_cast<void *>(base + updateUIRVA),
         reinterpret_cast<void *>(&HookedUpdateUI),
         reinterpret_cast<void **>(&gOriginalUpdateUI));
+
+    // UnityEngine.Time.set_timeScale(float), fixed for 1.0.101 only.
+    // This intentionally avoids cross-version scanning: the surrounding
+    // UnityFramework UUID gate guarantees the RVA belongs to this build.
+    static constexpr uintptr_t unitySetTimeScaleRVA = 0x0BB38760;
+    MSHookFunction(
+        reinterpret_cast<void *>(base + unitySetTimeScaleRVA),
+        reinterpret_cast<void *>(&HookedUnitySetTimeScale),
+        reinterpret_cast<void **>(&gJbrfzOriginalUnitySetTimeScale));
+    JbrfzSetUnitySpeedEnabled(JbrfzUnitySpeedEnabled());
+    JbrfzLog(@"[JBRFZBypass] Unity 3x speed hook armed "
+             @"(Time.set_timeScale @ 0x%lx)",
+             static_cast<unsigned long>(unitySetTimeScaleRVA));
 
     JbrfzLog(@"[JBRFZBypass] Guide automation armed "
           "(progress @ 0x%lx, UpdateUI @ 0x%lx, OvenCtor @ 0x%lx, "

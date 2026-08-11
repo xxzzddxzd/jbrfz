@@ -23,3 +23,8 @@ capture_pull/
 # Theos build/package outputs
 JBRFZBypass/.theos/
 JBRFZBypass/packages/
+
+# Repacked/signing artifacts
+ipa_patch/build/
+ipa_patch/dist/
+*.ipa

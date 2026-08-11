@@ -58,6 +58,7 @@ static void JbrfzPanelLog(NSString *fmt, ...) {
 // MARK: - Defaults / master switch
 
 static NSString *const kJbrfzAutoFeaturesKey = @"JBRFZBypass.autoFeaturesEnabled";
+static NSString *const kJbrfzUnitySpeedKey = @"JBRFZBypass.unitySpeed3xEnabled";
 static NSString *const kJbrfzFloatingEdgeLeftKey = @"JBRFZBypass.floatingEdgeLeft";
 static NSString *const kJbrfzFloatingYRatioKey = @"JBRFZBypass.floatingYRatio";
 
@@ -69,6 +70,7 @@ static const CGFloat kFloatingCollapsedAlpha = 0.55;
 // Default OFF so new accounts are not auto-driven.
 static bool gAutoFeaturesEnabled = false;
 static bool gAutoFeaturesLoaded = false;
+static bool gUnitySpeedLoaded = false;
 
 static void JbrfzLoadAutoFeaturesDefault(void) {
     if (gAutoFeaturesLoaded) {
@@ -88,6 +90,30 @@ static void JbrfzLoadAutoFeaturesDefault(void) {
 bool JbrfzAutoFeaturesEnabled(void) {
     JbrfzLoadAutoFeaturesDefault();
     return gAutoFeaturesEnabled;
+}
+
+static void JbrfzLoadUnitySpeedDefault(void) {
+    if (gUnitySpeedLoaded) {
+        return;
+    }
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    const bool enabled = [defaults objectForKey:kJbrfzUnitySpeedKey] != nil &&
+                         [defaults boolForKey:kJbrfzUnitySpeedKey];
+    if ([defaults objectForKey:kJbrfzUnitySpeedKey] == nil) {
+        [defaults setBool:NO forKey:kJbrfzUnitySpeedKey];
+        [defaults synchronize];
+    }
+    gUnitySpeedLoaded = true;
+    JbrfzSetUnitySpeedEnabled(enabled);
+}
+
+static void JbrfzSetUnitySpeedPreference(bool enabled) {
+    JbrfzSetUnitySpeedEnabled(enabled);
+    [NSUserDefaults.standardUserDefaults setBool:enabled
+                                          forKey:kJbrfzUnitySpeedKey];
+    [NSUserDefaults.standardUserDefaults synchronize];
+    JbrfzPanelLog(@"[JBRFZBypass] Unity speed %@",
+                  enabled ? @"3X" : @"NORMAL");
 }
 
 static void JbrfzSetAutoFeaturesEnabled(bool enabled, bool persist) {
@@ -201,6 +227,7 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
 @property(nonatomic, strong) UIButton *floatingButton;
 @property(nonatomic, strong) UIView *panel;
 @property(nonatomic, strong) UISwitch *autoSwitch;
+@property(nonatomic, strong) UISwitch *speedSwitch;
 @property(nonatomic, strong) UILabel *statusLabel;
 @property(nonatomic, assign) BOOL floatingButtonWasDragged;
 @property(nonatomic, assign) BOOL floatingExpandedOnTouch;
@@ -403,7 +430,7 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
 
     UIView *host = window.rootViewController.view;
 
-    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 300, 220)];
+    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 300, 280)];
     panel.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.96];
     panel.layer.cornerRadius = 16.0;
     panel.layer.borderWidth = 1.0;
@@ -455,8 +482,32 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
     [panel addSubview:autoSwitch];
     self.autoSwitch = autoSwitch;
 
+    UILabel *speedLabel =
+        [[UILabel alloc] initWithFrame:CGRectMake(18, 148, 210, 28)];
+    speedLabel.text = @"Unity 加速（固定 3×）";
+    speedLabel.textColor = UIColor.whiteColor;
+    speedLabel.font = [UIFont systemFontOfSize:16.0 weight:UIFontWeightMedium];
+    [panel addSubview:speedLabel];
+
+    UISwitch *speedSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
+    speedSwitch.on = JbrfzUnitySpeedEnabled();
+    speedSwitch.onTintColor =
+        [UIColor colorWithRed:0.96 green:0.55 blue:0.16 alpha:1.0];
+    [speedSwitch addTarget:self
+                    action:@selector(speedSwitchChanged:)
+          forControlEvents:UIControlEventValueChanged];
+    [panel addSubview:speedSwitch];
+    self.speedSwitch = speedSwitch;
+
+    UILabel *speedDetail =
+        [[UILabel alloc] initWithFrame:CGRectMake(18, 178, 250, 20)];
+    speedDetail.text = @"仅适配游戏 1.0.101，关闭后恢复 1×。";
+    speedDetail.textColor = [UIColor colorWithWhite:0.78 alpha:1.0];
+    speedDetail.font = [UIFont systemFontOfSize:12.0];
+    [panel addSubview:speedDetail];
+
     UILabel *status =
-        [[UILabel alloc] initWithFrame:CGRectMake(18, 156, 264, 40)];
+        [[UILabel alloc] initWithFrame:CGRectMake(18, 218, 264, 42)];
     status.textColor = [UIColor colorWithWhite:0.72 alpha:1.0];
     status.font = [UIFont monospacedDigitSystemFontOfSize:12.0
                                                    weight:UIFontWeightRegular];
@@ -754,18 +805,22 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
     CGFloat y = safe.top + 74.0;
     CGFloat availableHeight =
         CGRectGetHeight(host.bounds) - safe.bottom - y - 12.0;
-    CGFloat panelHeight = MIN(220.0, MAX(190.0, availableHeight));
+    CGFloat panelHeight = MIN(280.0, MAX(250.0, availableHeight));
     self.panel.frame = CGRectMake(x, y, panelWidth, panelHeight);
     self.autoSwitch.center = CGPointMake(panelWidth - 46.0, 72.0);
-    self.statusLabel.frame = CGRectMake(18.0, 156.0, panelWidth - 36.0, 40.0);
+    self.speedSwitch.center = CGPointMake(panelWidth - 46.0, 162.0);
+    self.statusLabel.frame = CGRectMake(18.0, 218.0, panelWidth - 36.0, 42.0);
 }
 
 - (void)refreshUI {
     const bool enabled = JbrfzAutoFeaturesEnabled();
+    const bool speedEnabled = JbrfzUnitySpeedEnabled();
     self.autoSwitch.on = enabled;
-    self.statusLabel.text =
-        enabled ? @"状态：自动已开启（领任务 / 烤箱 / 十连 / 开箱）"
-                : @"状态：自动已关闭（仅兼容/采集，适合新手号）";
+    self.speedSwitch.on = speedEnabled;
+    self.statusLabel.text = [NSString
+        stringWithFormat:@"状态：自动%@；Unity %@",
+                         enabled ? @"开启" : @"关闭",
+                         speedEnabled ? @"3×" : @"1×"];
     self.floatingButton.accessibilityValue =
         enabled ? @"自动已开启" : @"自动已关闭";
     self.floatingButton.backgroundColor =
@@ -790,6 +845,11 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
 
 - (void)autoSwitchChanged:(UISwitch *)sender {
     JbrfzSetAutoFeaturesEnabled(sender.isOn, true);
+    [self refreshUI];
+}
+
+- (void)speedSwitchChanged:(UISwitch *)sender {
+    JbrfzSetUnitySpeedPreference(sender.isOn);
     [self refreshUI];
 }
 
@@ -863,6 +923,7 @@ void JbrfzStartPluginPanel(void) {
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
         dispatch_get_main_queue(), ^{
             JbrfzLoadAutoFeaturesDefault();
+            JbrfzLoadUnitySpeedDefault();
             JBRFZPluginOverlay *overlay = JBRFZPluginOverlay.sharedOverlay;
             JbrfzPanelLog(@"[JBRFZBypass] Plugin panel schedule start auto=%d",
                           JbrfzAutoFeaturesEnabled() ? 1 : 0);
