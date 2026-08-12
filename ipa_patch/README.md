@@ -29,3 +29,17 @@ MOBILEPROVISION=/absolute/path/profile.mobileprovision \
 
 可通过 `SOURCE_IPA`、`MAIN_BINARY`、`UNITY_BINARY`、`OUTPUT_IPA` 和
 `DOBBY_LIB` 覆盖默认路径。构建会校验游戏版本、外部 Hook 依赖以及请求采集特征串。
+
+## 通行证 UI 诊断补丁
+
+`patch_pass_ui_diagnostic.py` 仅用于 1.0.101 的客户端显示验证：它让高级奖励格按
+可用状态渲染，同时禁用高级奖励点击处理，因此不会提交高级奖励领取 RPC，也不会
+修改登录数据中的服务端权益字段。
+
+```bash
+python3 ipa_patch/patch_pass_ui_diagnostic.py /path/to/UnityFramework
+python3 ipa_patch/patch_pass_ui_diagnostic.py --restore /path/to/UnityFramework
+```
+
+脚本会校验两处原始指令；版本或二进制不匹配时直接拒绝修改。修改安装副本后需要
+重新签名对应 framework 和 app。
