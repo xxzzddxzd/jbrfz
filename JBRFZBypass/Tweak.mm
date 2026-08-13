@@ -424,7 +424,7 @@ static NSString *MethodFullName(void *methodObj) {
     }
     if (base != 0) {
         auto getRpcName =
-            reinterpret_cast<void *(*)(void *, void *)>(base + 0x03DAE3B0);
+            reinterpret_cast<void *(*)(void *, void *)>(base + 0x03DFD394);
         void *str = nullptr;
         @try {
             str = getRpcName(methodObj, nullptr);
@@ -481,7 +481,7 @@ static NSString *MessageToDiagnosticString(void *message) {
         return nil;
     }
     // Google.Protobuf.JsonFormatter.ToDiagnosticString(IMessage)
-    auto toDiag = reinterpret_cast<void *(*)(void *, void *)>(base + 0x0A9B1494);
+    auto toDiag = reinterpret_cast<void *(*)(void *, void *)>(base + 0x0AA5A6EC);
     void *str = nullptr;
     @try {
         str = toDiag(message, nullptr);
@@ -504,7 +504,7 @@ static NSData *MessageToNSData(void *message) {
     }
     // Google.Protobuf.MessageExtensions.ToByteArray(IMessage)
     auto toBytes =
-        reinterpret_cast<void *(*)(void *, void *)>(base + 0x0A9B7D70);
+        reinterpret_cast<void *(*)(void *, void *)>(base + 0x0AA60FCC);
     void *arr = nullptr;
     @try {
         arr = toBytes(message, nullptr);
@@ -944,7 +944,7 @@ static void ForceClearLoadingFlag(void *loadingFlag, const char *reason) {
     void *key = reinterpret_cast<void *>(atomic_load(&gLastLoadingKey));
     if (key != nullptr && base != 0) {
         auto unset =
-            reinterpret_cast<LoadingUnsetMethod>(base + 0x03BB0D3C);
+            reinterpret_cast<LoadingUnsetMethod>(base + 0x03BFDEFC);
         unset(loadingFlag, key, nullptr);
     }
 
@@ -955,9 +955,9 @@ static void ForceClearLoadingFlag(void *loadingFlag, const char *reason) {
         *reinterpret_cast<void **>(reinterpret_cast<uint8_t *>(loadingFlag) +
                                    0x10);
     if (objectSet != nullptr && base != 0) {
-        // ObjectSetFlag.Clear @ 0x03DBAA58 — empties keys and hides if active.
+        // ObjectSetFlag.Clear @ 0x03E078B4 — empties keys and hides if active.
         auto clear =
-            reinterpret_cast<void (*)(void *, void *)>(base + 0x03DBAA58);
+            reinterpret_cast<void (*)(void *, void *)>(base + 0x03E078B4);
         clear(objectSet, nullptr);
     }
     void *onChanged =
@@ -1062,10 +1062,10 @@ static bool ReturnAdRemoveActive(void *self, void *methodInfo) {
 // ---------------------------------------------------------------------------
 // Navigation guide automation
 // ---------------------------------------------------------------------------
-// GuidePresenter.HandleOnGuideUIClick @ 0x04215764:
+// GuidePresenter.HandleOnGuideUIClick @ 0x0426B12C:
 //   completed -> ClaimGuideRewardAsync().Forget()
 //   incomplete -> OpenShortcutAsync().Forget()
-// IsCompleted MethodInfo: qword_EE1A168
+// IsCompleted MethodInfo: qword_EEF7E80
 //
 // GuideRecord : RequirementRecordBase<GuideId>
 //   +0x10 List<RequirementUnit>* _units
@@ -1123,15 +1123,15 @@ static bool IsAutoClaimExcluded(int requirementType, int64_t target) {
 // Fix 2: CalculateCurrentValue(129/130) returns 0 instead of throwing so a
 // replacement record can be created from server unitCounts / zero baseline.
 //
-// RVAs (UnityFramework 1.0.101 UUID-gated build):
-//   Register              0x3E16814
-//   TryGetRecord          0x3E2491C
-//   RemoveRecordByType    0x3E163D8
-//   CalculateCurrentValue 0x3E1ADF4
-static constexpr uintptr_t kRequirementRegisterRVA = 0x03E16814;
-static constexpr uintptr_t kRequirementTryGetRecordRVA = 0x03E2491C;
-static constexpr uintptr_t kRequirementRemoveRecordByTypeRVA = 0x03E163D8;
-static constexpr uintptr_t kRequirementCalculateCurrentValueRVA = 0x03E1ADF4;
+// RVAs (UnityFramework 1.1.001 UUID-gated build):
+//   Register              0x3E64F28
+//   TryGetRecord          0x3E731D4
+//   RemoveRecordByType    0x3E64AFC
+//   CalculateCurrentValue 0x3E694C8
+static constexpr uintptr_t kRequirementRegisterRVA = 0x03E64F28;
+static constexpr uintptr_t kRequirementTryGetRecordRVA = 0x03E731D4;
+static constexpr uintptr_t kRequirementRemoveRecordByTypeRVA = 0x03E64AFC;
+static constexpr uintptr_t kRequirementCalculateCurrentValueRVA = 0x03E694C8;
 
 static bool HookedRequirementRegister(void *self, unsigned int id,
                                       void *values) {
@@ -1335,9 +1335,9 @@ static void HookedPetGachaOnPageOpen(void *self, void *methodInfo) {
 //   +0x28 RandomRewardItemTable*
 // RandomRewardItemTable (SimpleKeyValueTable): Rows List* @ +0x18
 // RandomRewardItemInfo.Id @ +0x10 (ItemId / int32)
-// TotalItemRecord.get_Item(ItemId) @ 0x03DE7BF8
-// OnItemSelected(ItemId) @ 0x0411C714
-// InventoryItemInfoPresenter.OnUseClicked(long amount) @ 0x04115B04
+// TotalItemRecord.get_Item(ItemId) @ 0x03E347D4
+// OnItemSelected(ItemId) @ 0x04175588
+// InventoryItemInfoPresenter.OnUseClicked(long amount) @ 0x0416B8E4
 using ItemSelectMethod = void (*)(void *self, int itemId, void *methodInfo);
 using ItemUseMethod = void (*)(void *self, int64_t amount, void *methodInfo);
 using TotalItemGetMethod =
@@ -1368,7 +1368,7 @@ static bool FindOwnedRandomRewardItemId(void *inventoryPresenter, uintptr_t base
     }
 
     auto getAmount =
-        reinterpret_cast<TotalItemGetMethod>(base + 0x03DE7BF8);
+        reinterpret_cast<TotalItemGetMethod>(base + 0x03E347D4);
     const auto *arr = reinterpret_cast<const uint8_t *>(items);
     for (int i = 0; i < size; ++i) {
         void *info = *reinterpret_cast<void *const *>(arr + 0x20 +
@@ -1399,7 +1399,7 @@ static void TrySelectRandomRewardItem(void *inventoryPresenter, uintptr_t base) 
     }
     JbrfzLog(@"[JBRFZBypass] Open-box: select itemId=%d", itemId);
     auto onSelect =
-        reinterpret_cast<ItemSelectMethod>(base + 0x0411C714);
+        reinterpret_cast<ItemSelectMethod>(base + 0x04175588);
     onSelect(inventoryPresenter, itemId, nullptr);
 }
 
@@ -1408,7 +1408,7 @@ static void TryUseSelectedItem(void *itemInfoPresenter, uintptr_t base) {
         return;
     }
     JbrfzLog(@"[JBRFZBypass] Open-box: Use x1");
-    auto onUse = reinterpret_cast<ItemUseMethod>(base + 0x04115B04);
+    auto onUse = reinterpret_cast<ItemUseMethod>(base + 0x0416B8E4);
     onUse(itemInfoPresenter, /*amount=*/1, nullptr);
     atomic_store(&gPendingUseRandomRewardBox, false);
 }
@@ -1490,7 +1490,7 @@ static void RunUseRandomRewardBoxAction(void *presenter, uintptr_t base,
     atomic_store(&gPendingUseRandomRewardBox, true);
 
     auto onClick =
-        reinterpret_cast<GuideClickMethod>(base + 0x04215764);
+        reinterpret_cast<GuideClickMethod>(base + 0x0426B12C);
     onClick(presenter, nullptr);
 
     const int64_t remaining = target > current ? (target - current) : 0;
@@ -1523,9 +1523,9 @@ static void ClickGachaTenPull(void *presenter, uintptr_t base, bool isCookie) {
     if (presenter == nullptr || base == 0) {
         return;
     }
-    // CookieGachaPresenter.HandleOnClickPurchase @ 0x04077AD8
-    // PetGachaPresenter.HandleOnClickPurchase   @ 0x040ACA10
-    const uintptr_t rva = isCookie ? 0x04077AD8ULL : 0x040ACA10ULL;
+    // CookieGachaPresenter.HandleOnClickPurchase @ 0x040CDD00
+    // PetGachaPresenter.HandleOnClickPurchase   @ 0x04102A28
+    const uintptr_t rva = isCookie ? 0x040CDD00ULL : 0x04102A28ULL;
     auto purchase = reinterpret_cast<GachaPurchaseMethod>(base + rva);
     purchase(presenter, kGachaTenPullButtonIndex, nullptr);
     JbrfzLog(@"[JBRFZBypass] %s gacha TEN-pull (buttonIndex=%d)",
@@ -1562,7 +1562,7 @@ static bool IsOvenAutoActive(void *service) {
 }
 
 // Guide 14/15: open oven auto-draw (not a one-shot 1/10/30 pull).
-// OvenAutoDrawService.StartAuto(presetIndex, nonstop) @ 0x041F70E0
+// OvenAutoDrawService.StartAuto(presetIndex, nonstop) @ 0x0424C38C
 using OvenStartAutoMethod =
     void (*)(void *self, int presetIndex, bool nonstop, void *methodInfo);
 
@@ -1577,7 +1577,7 @@ static void StartOvenAutoDraw(void *service, uintptr_t base) {
 
     const int preset = ResolveOvenPresetIndex(service);
     auto startAuto =
-        reinterpret_cast<OvenStartAutoMethod>(base + 0x041F70E0);
+        reinterpret_cast<OvenStartAutoMethod>(base + 0x0424C38C);
     // nonstop=true -> AutoDrawMode.NonstopMode, keeps drawing until stopped.
     startAuto(service, preset, /*nonstop=*/true, nullptr);
     JbrfzLog(@"[JBRFZBypass] Oven StartAuto nonstop preset=%d", preset);
@@ -1597,7 +1597,7 @@ static void RunOvenStartAutoAction(void *presenter, uintptr_t base, int guideId,
 
     // Navigate to oven via incomplete-guide click path.
     auto onClick =
-        reinterpret_cast<GuideClickMethod>(base + 0x04215764);
+        reinterpret_cast<GuideClickMethod>(base + 0x0426B12C);
     onClick(presenter, nullptr);
 
     const int64_t remaining = target > current ? (target - current) : 0;
@@ -1629,7 +1629,7 @@ static void RunCookieGachaTenPullAction(void *presenter, uintptr_t base,
                                         int64_t target) {
     const int generation = BumpAutoActionGeneration();
     auto onClick =
-        reinterpret_cast<GuideClickMethod>(base + 0x04215764);
+        reinterpret_cast<GuideClickMethod>(base + 0x0426B12C);
     onClick(presenter, nullptr);
 
     const int64_t remaining = target > current ? (target - current) : 0;
@@ -1662,7 +1662,7 @@ static void RunPetGachaTenPullAction(void *presenter, uintptr_t base,
                                      int64_t target) {
     const int generation = BumpAutoActionGeneration();
     auto onClick =
-        reinterpret_cast<GuideClickMethod>(base + 0x04215764);
+        reinterpret_cast<GuideClickMethod>(base + 0x0426B12C);
     onClick(presenter, nullptr);
 
     const int64_t remaining = target > current ? (target - current) : 0;
@@ -1703,14 +1703,14 @@ static void TryHandleCurrentGuide(void *presenter) {
 
     atomic_store(&gGuidePresenter, reinterpret_cast<uintptr_t>(presenter));
 
-    // GuidePresenter layout (1.0.101):
-    // 0x80 _isWaitingForResponse, 0x88 _currentGuideRecord
+    // GuidePresenter layout (1.1.001):
+    // 0xB8 _isWaitingForResponse, 0xB0 _currentGuideRecord
     auto *bytes = reinterpret_cast<uint8_t *>(presenter);
-    if (bytes[0x80] != 0) {
+    if (bytes[0xB8] != 0) {
         return;
     }
 
-    void *record = *reinterpret_cast<void **>(bytes + 0x88);
+    void *record = *reinterpret_cast<void **>(bytes + 0xB0);
     if (record == nullptr) {
         return;
     }
@@ -1728,14 +1728,14 @@ static void TryHandleCurrentGuide(void *presenter) {
     int64_t target = 0;
     const bool hasUnit = ReadGuideUnit(record, &reqType, &current, &target);
 
-    void *methodInfo = *reinterpret_cast<void **>(base + 0x0EE1A168);
+    void *methodInfo = *reinterpret_cast<void **>(base + 0x0EEF7E80);
     if (methodInfo == nullptr) {
         JbrfzLog(@"[JBRFZBypass] Guide skip: IsCompleted MethodInfo null");
         return;
     }
 
     auto isCompleted =
-        reinterpret_cast<RecordBoolMethod>(base + 0x0904C7FC);
+        reinterpret_cast<RecordBoolMethod>(base + 0x090DC3F8);
     const bool completed = isCompleted(record, methodInfo);
 
     if (atomic_load(&gLastLoggedGuideId) != guideId) {
@@ -1801,7 +1801,7 @@ static void TryHandleCurrentGuide(void *presenter) {
               guideId, reqType, static_cast<long long>(current),
               static_cast<long long>(target));
         auto onClick =
-            reinterpret_cast<GuideClickMethod>(base + 0x04215764);
+            reinterpret_cast<GuideClickMethod>(base + 0x0426B12C);
         onClick(presenter, nullptr);
         return;
     }
@@ -1869,8 +1869,8 @@ static void InstallProtectionThreadHooks(const struct mach_header *header,
     // statically linked SDK copy. Several of them deliberately terminate,
     // fault or loop forever after a delayed environment check.
     static constexpr uintptr_t unityThreadRVAs[] = {
-        0x000EEC38, 0x000EED04, 0x000EEE60, 0x000EEE84, 0x000EF060,
-        0x000EF158, 0x000EF2E8, 0x000EF448, 0x000EF544, 0x000EF568,
+        0x000F0028, 0x000F00F4, 0x000F0250, 0x000F0274, 0x000F0450,
+        0x000F0548, 0x000F06D8, 0x000F0838, 0x000F0934, 0x000F0958,
     };
     static constexpr uintptr_t mainThreadRVAs[] = {
         0x000837FC, 0x000838C8, 0x00083A24, 0x00083A48, 0x00083C24,
@@ -1922,11 +1922,11 @@ static bool HasExpectedUUID(const struct mach_header *header,
 }
 
 static bool IsSupportedMainExecutable(const struct mach_header *header) {
-    // CookieRun: Crumble 1.0.101 (19), main executable UUID
-    // E8B5F894-2448-36FC-8190-3D073663316B.
+    // CookieRun: Crumble 1.1.001 (2026081018), main executable UUID
+    // CF18E626-8D3B-3F43-80E2-5950B54B319B.
     static constexpr uint8_t expectedUUID[16] = {
-        0xE8, 0xB5, 0xF8, 0x94, 0x24, 0x48, 0x36, 0xFC,
-        0x81, 0x90, 0x3D, 0x07, 0x36, 0x63, 0x31, 0x6B,
+        0xCF, 0x18, 0xE6, 0x26, 0x8D, 0x3B, 0x3F, 0x43,
+        0x80, 0xE2, 0x59, 0x50, 0xB5, 0x4B, 0x31, 0x9B,
     };
     return HasExpectedUUID(header, expectedUUID);
 }
@@ -1934,7 +1934,7 @@ static bool IsSupportedMainExecutable(const struct mach_header *header) {
 static void ForceAppSealingNormalState(void) {
     static constexpr uint64_t normalState = 0xB3;
     static constexpr uintptr_t mainStateRVA = 0x003AA300;
-    static constexpr uintptr_t unityStateRVA = 0x0F6580D8;
+    static constexpr uintptr_t unityStateRVA = 0x0F739358;
 
     const uintptr_t mainBase = atomic_load(&gMainExecutableBase);
     const uintptr_t unityBase = atomic_load(&gUnityFrameworkBase);
@@ -1982,11 +1982,11 @@ static void ScheduleNormalState(void) {
 }
 
 static bool IsSupportedUnityFramework(const struct mach_header *header) {
-    // CookieRun: Crumble 1.0.101 (19), UnityFramework UUID
-    // 84EF8300-3180-31B4-ABB8-B176E685CC12.
+    // CookieRun: Crumble 1.1.001 (2026081018), UnityFramework UUID
+    // E88C012F-B793-3566-A040-3B13ABC450A8.
     static constexpr uint8_t expectedUUID[16] = {
-        0x84, 0xEF, 0x83, 0x00, 0x31, 0x80, 0x31, 0xB4,
-        0xAB, 0xB8, 0xB1, 0x76, 0xE6, 0x85, 0xCC, 0x12,
+        0xE8, 0x8C, 0x01, 0x2F, 0xB7, 0x93, 0x35, 0x66,
+        0xA0, 0x40, 0x3B, 0x13, 0xAB, 0xC4, 0x50, 0xA8,
     };
 
     return HasExpectedUUID(header, expectedUUID);
@@ -2004,10 +2004,10 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
     // AppSealingSDK.Check_iOS_Security methods for the UUID above.
     // These narrowly prevent the SDK from starting its delayed monitor or
     // executing its managed exit callback. They are deliberately UUID-gated.
-    static constexpr uintptr_t startRoutineRVA = 0x03A002B0;
-    static constexpr uintptr_t appSealingRoutineRVA = 0x03A00474;
-    static constexpr uintptr_t exitFunctionRVA = 0x03A003A8;
-    static constexpr uintptr_t runtimeLoadRVA = 0x03A00C9C;
+    static constexpr uintptr_t startRoutineRVA = 0x03A400CC;
+    static constexpr uintptr_t appSealingRoutineRVA = 0x03A40290;
+    static constexpr uintptr_t exitFunctionRVA = 0x03A401C4;
+    static constexpr uintptr_t runtimeLoadRVA = 0x03A40AB8;
 
     MSHookFunction(reinterpret_cast<void *>(base + startRoutineRVA),
                    reinterpret_cast<void *>(&ReturnWithoutAction),
@@ -2023,11 +2023,11 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
                    &gOriginalRuntimeLoad);
 
     // Crumble.AdRemoveGameBoostCalculator.IsAdRemoveActive
-    // CookieRun: Crumble 1.0.101 (19) / UnityFramework UUID above.
+    // CookieRun: Crumble 1.1.001 (2026081018) / UnityFramework UUID above.
     // All client "免广告卡" checks funnel through this method:
     // AdService.get_IsRemovedAd, ShowRewardedAsync, red-dot updaters,
     // stage random reward claim UI, and package shop cells.
-    static constexpr uintptr_t isAdRemoveActiveRVA = 0x03D85D74;
+    static constexpr uintptr_t isAdRemoveActiveRVA = 0x03DD44A0;
     MSHookFunction(
         reinterpret_cast<void *>(base + isAdRemoveActiveRVA),
         reinterpret_cast<void *>(&ReturnAdRemoveActive),
@@ -2041,7 +2041,7 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
     atomic_store(&gUnityBaseForGuide, base);
 
     // LoadingFlag.Set: remember key so RPC-error path can Unset without popup.
-    static constexpr uintptr_t loadingFlagSetRVA = 0x03BB0C7C;
+    static constexpr uintptr_t loadingFlagSetRVA = 0x03BFDE3C;
     MSHookFunction(
         reinterpret_cast<void *>(base + loadingFlagSetRVA),
         reinterpret_cast<void *>(&HookedLoadingFlagSet),
@@ -2050,7 +2050,7 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
     // MainSceneExchangeEventListener.AfterResponse(RpcException)
     // Original: Unset loading + open "处理请求过程中出现错误" popup.
     // We Unset loading / clear guide wait, but never open popup / AfterError.
-    static constexpr uintptr_t afterResponseErrorRVA = 0x03A465D0;
+    static constexpr uintptr_t afterResponseErrorRVA = 0x03A8578C;
     MSHookFunction(
         reinterpret_cast<void *>(base + afterResponseErrorRVA),
         reinterpret_cast<void *>(&HookedAfterResponseRpcException),
@@ -2058,14 +2058,14 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
 
     // MainSceneExchangeEventListener.AfterError
     // Prevent RestartApp / return-to-login, but still clear loading.
-    static constexpr uintptr_t afterErrorRVA = 0x03A46A54;
+    static constexpr uintptr_t afterErrorRVA = 0x03A85C10;
     MSHookFunction(
         reinterpret_cast<void *>(base + afterErrorRVA),
         reinterpret_cast<void *>(&HookedAfterError),
         &gOriginalAfterError);
 
     // Track GuidePresenter on manual click; claim itself is never blocked.
-    static constexpr uintptr_t handleOnGuideUIClickRVA = 0x04215764;
+    static constexpr uintptr_t handleOnGuideUIClickRVA = 0x0426B12C;
     MSHookFunction(
         reinterpret_cast<void *>(base + handleOnGuideUIClickRVA),
         reinterpret_cast<void *>(&HookedHandleOnGuideUIClick),
@@ -2081,16 +2081,16 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
 
 #if !defined(JBRFZ_NO_CAPTURE)
     // ---- Capture hooks for invite / stage / account reverse ----
-    // 1.0.101 keeps ExchangeLogger in the binary but no longer dispatches
+    // 1.1.001 keeps ExchangeLogger in the binary but no longer dispatches
     // production traffic to it. MainSceneExchangeEventListener is the active
     // listener for in-game RPCs, including guild join/leave.
-    static constexpr uintptr_t exchangeBeforeRVA = 0x03A46430;
+    static constexpr uintptr_t exchangeBeforeRVA = 0x03A855EC;
     MSHookFunction(
         reinterpret_cast<void *>(base + exchangeBeforeRVA),
         reinterpret_cast<void *>(&HookedExchangeBeforeRequest),
         reinterpret_cast<void **>(&gOriginalExchangeBeforeRequest));
 
-    static constexpr uintptr_t exchangeAfterOkRVA = 0x03A46500;
+    static constexpr uintptr_t exchangeAfterOkRVA = 0x03A856BC;
     MSHookFunction(
         reinterpret_cast<void *>(base + exchangeAfterOkRVA),
         reinterpret_cast<void *>(&HookedExchangeAfterOk),
@@ -2099,49 +2099,49 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
     // Retain the legacy logger error hook as a fallback. The active main-scene
     // error overload is already hooked above by HookedAfterResponseRpcException,
     // which now records the failed RPC before suppressing the popup.
-    static constexpr uintptr_t exchangeAfterErrRVA = 0x03DACB4C;
+    static constexpr uintptr_t exchangeAfterErrRVA = 0x03DFBB30;
     MSHookFunction(
         reinterpret_cast<void *>(base + exchangeAfterErrRVA),
         reinterpret_cast<void *>(&HookedExchangeAfterErr),
         reinterpret_cast<void **>(&gOriginalExchangeAfterErr));
 
-    static constexpr uintptr_t inviteLinkRVA = 0x03D6E50C;
+    static constexpr uintptr_t inviteLinkRVA = 0x03DBCF38;
     MSHookFunction(
         reinterpret_cast<void *>(base + inviteLinkRVA),
         reinterpret_cast<void *>(&HookedCreateFriendInvitationLink),
         reinterpret_cast<void **>(&gOriginalCreateFriendInvitationLink));
 
-    static constexpr uintptr_t guestSetRVA = 0x04BC4CCC;
+    static constexpr uintptr_t guestSetRVA = 0x04C47FA4;
     MSHookFunction(
         reinterpret_cast<void *>(base + guestSetRVA),
         reinterpret_cast<void *>(&HookedGuestLoginKeyChainSet),
         reinterpret_cast<void **>(&gOriginalGuestLoginKeyChainSet));
 
-    static constexpr uintptr_t processLoginRVA = 0x03D70FB4;
+    static constexpr uintptr_t processLoginRVA = 0x03DBF860;
     MSHookFunction(
         reinterpret_cast<void *>(base + processLoginRVA),
         reinterpret_cast<void *>(&HookedProcessLoginResponse),
         reinterpret_cast<void **>(&gOriginalProcessLoginResponse));
 
-    static constexpr uintptr_t grpcChannelCtorRVA = 0x03DADAE0;
+    static constexpr uintptr_t grpcChannelCtorRVA = 0x03DFCAC4;
     MSHookFunction(
         reinterpret_cast<void *>(base + grpcChannelCtorRVA),
         reinterpret_cast<void *>(&HookedGrpcChannelCtor),
         reinterpret_cast<void **>(&gOriginalGrpcChannelCtor));
 
-    static constexpr uintptr_t endpointToStringRVA = 0x03DABCBC;
+    static constexpr uintptr_t endpointToStringRVA = 0x03DFABE4;
     MSHookFunction(
         reinterpret_cast<void *>(base + endpointToStringRVA),
         reinterpret_cast<void *>(&HookedEndpointToString),
         reinterpret_cast<void **>(&gOriginalEndpointToString));
 
-    static constexpr uintptr_t createChannelRVA = 0x03DADCFC;
+    static constexpr uintptr_t createChannelRVA = 0x03DFCCE0;
     MSHookFunction(
         reinterpret_cast<void *>(base + createChannelRVA),
         reinterpret_cast<void *>(&HookedCreateChannel),
         reinterpret_cast<void **>(&gOriginalCreateChannel));
 
-    static constexpr uintptr_t createHeadersRVA = 0x03DAF1DC;
+    static constexpr uintptr_t createHeadersRVA = 0x03DFE1C0;
     MSHookFunction(
         reinterpret_cast<void *>(base + createHeadersRVA),
         reinterpret_cast<void *>(&HookedCreateHeaders),
@@ -2163,19 +2163,19 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
                     static_cast<unsigned long>(createHeadersRVA));
 
     // Direct StageApi / EventApi hooks for invite-bot samples.
-    static constexpr uintptr_t startStageRVA = 0x03D227E8;
+    static constexpr uintptr_t startStageRVA = 0x03D6EE20;
     MSHookFunction(
         reinterpret_cast<void *>(base + startStageRVA),
         reinterpret_cast<void *>(&HookedStartStageAsync),
         reinterpret_cast<void **>(&gOriginalStartStageAsync));
 
-    static constexpr uintptr_t completeStageRVA = 0x03D22920;
+    static constexpr uintptr_t completeStageRVA = 0x03D6EF58;
     MSHookFunction(
         reinterpret_cast<void *>(base + completeStageRVA),
         reinterpret_cast<void *>(&HookedCompleteStageAsync),
         reinterpret_cast<void **>(&gOriginalCompleteStageAsync));
 
-    static constexpr uintptr_t registerFriendRVA = 0x03CF7FBC;
+    static constexpr uintptr_t registerFriendRVA = 0x03D43C98;
     MSHookFunction(
         reinterpret_cast<void *>(base + registerFriendRVA),
         reinterpret_cast<void *>(&HookedRegisterFriendInviter),
@@ -2190,7 +2190,7 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
 #endif
 
     // Capture OvenAutoDrawService for checklist OvenStartAuto actions.
-    static constexpr uintptr_t ovenAutoDrawCtorRVA = 0x041F6950;
+    static constexpr uintptr_t ovenAutoDrawCtorRVA = 0x0424BC0C;
     MSHookFunction(
         reinterpret_cast<void *>(base + ovenAutoDrawCtorRVA),
         reinterpret_cast<void *>(&HookedOvenAutoDrawCtor),
@@ -2198,26 +2198,26 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
 
     // Capture Cookie/Pet gacha presenters when their pages open
     // (guide card OpenShortcut lands here before we press 十连).
-    static constexpr uintptr_t cookieGachaOnPageOpenRVA = 0x04074EE0;
+    static constexpr uintptr_t cookieGachaOnPageOpenRVA = 0x040CB084;
     MSHookFunction(
         reinterpret_cast<void *>(base + cookieGachaOnPageOpenRVA),
         reinterpret_cast<void *>(&HookedCookieGachaOnPageOpen),
         reinterpret_cast<void **>(&gOriginalCookieGachaOnPageOpen));
 
-    static constexpr uintptr_t petGachaOnPageOpenRVA = 0x040A9EE8;
+    static constexpr uintptr_t petGachaOnPageOpenRVA = 0x040FFEF0;
     MSHookFunction(
         reinterpret_cast<void *>(base + petGachaOnPageOpenRVA),
         reinterpret_cast<void *>(&HookedPetGachaOnPageOpen),
         reinterpret_cast<void **>(&gOriginalPetGachaOnPageOpen));
 
     // Inventory open-box chain: ShowInventory -> select RandomReward -> Use x1
-    static constexpr uintptr_t inventoryOnPopupOpenRVA = 0x0411BF9C;
+    static constexpr uintptr_t inventoryOnPopupOpenRVA = 0x04174E28;
     MSHookFunction(
         reinterpret_cast<void *>(base + inventoryOnPopupOpenRVA),
         reinterpret_cast<void *>(&HookedInventoryOnPopupOpen),
         reinterpret_cast<void **>(&gOriginalInventoryOnPopupOpen));
 
-    static constexpr uintptr_t inventoryItemInfoOnPopupOpenRVA = 0x0411573C;
+    static constexpr uintptr_t inventoryItemInfoOnPopupOpenRVA = 0x0416B51C;
     MSHookFunction(
         reinterpret_cast<void *>(base + inventoryItemInfoOnPopupOpenRVA),
         reinterpret_cast<void *>(&HookedInventoryItemInfoOnPopupOpen),
@@ -2241,7 +2241,7 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
     // - completed: auto-claim
     // - incomplete + checklist hit: run matched auto action
     static constexpr uintptr_t handleOnProgressUpdatedRVA =
-        0x04215BEC;
+        0x0426BF38;
     atomic_store(&gUnityBaseForGuide, base);
     atomic_store(&gLastAutoClaimGuideId, 0);
     atomic_store(&gLastAutoActionGuideId, 0);
@@ -2251,7 +2251,7 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
         reinterpret_cast<void *>(&HookedHandleOnProgressUpdated),
         reinterpret_cast<void **>(&gOriginalHandleOnProgressUpdated));
 
-    static constexpr uintptr_t updateUIRVA = 0x042151D4;
+    static constexpr uintptr_t updateUIRVA = 0x0426AA90;
     MSHookFunction(
         reinterpret_cast<void *>(base + updateUIRVA),
         reinterpret_cast<void *>(&HookedUpdateUI),

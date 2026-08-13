@@ -10,7 +10,7 @@ extern "C" {
 // Default: OFF (safe for new/guest accounts).
 bool JbrfzAutoFeaturesEnabled(void);
 
-// Fixed 3x Unity time scale for the 1.0.101 binary.
+// Fixed 3x Unity time scale for the 1.1.001 binary.
 bool JbrfzUnitySpeedEnabled(void);
 void JbrfzSetUnitySpeedEnabled(bool enabled);
 

@@ -505,7 +505,7 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
 
     UILabel *speedDetail =
         [[UILabel alloc] initWithFrame:CGRectMake(18, 178, 250, 20)];
-    speedDetail.text = @"仅适配游戏 1.0.101，关闭后恢复 1×。";
+    speedDetail.text = @"仅适配游戏 1.1.001，关闭后恢复 1×。";
     speedDetail.textColor = [UIColor colorWithWhite:0.78 alpha:1.0];
     speedDetail.font = [UIFont systemFontOfSize:12.0];
     [panel addSubview:speedDetail];

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply or restore the 1.0.101 season-pass UI diagnostic patch.
+"""Apply or restore the 1.1.001 season-pass UI diagnostic patch.
 
 The patch only changes the reward-list rendering flag.  Premium reward clicks
 are disabled at the presenter so this diagnostic build cannot submit a special
@@ -16,13 +16,13 @@ from patch_arm64_rvas import rva_to_file_offset
 
 PATCHES = (
     (
-        0x0421B4B0,
+        0x04272A94,
         bytes.fromhex("04c14039"),  # ldrb w4, [x8, #0x30]
         bytes.fromhex("24008052"),  # mov w4, #1
         "render premium reward cells as available",
     ),
     (
-        0x0421E11C,
+        0x0427566C,
         bytes.fromhex("f657bda9"),  # HandleSpecialRewardClicked prologue
         bytes.fromhex("c0035fd6"),  # ret
         "block premium reward click/RPC",
@@ -65,7 +65,7 @@ def main() -> int:
     parser.add_argument(
         "--restore",
         action="store_true",
-        help="restore the two original 1.0.101 instructions",
+        help="restore the two original 1.1.001 instructions",
     )
     args = parser.parse_args()
     patch(args.binary, args.restore)

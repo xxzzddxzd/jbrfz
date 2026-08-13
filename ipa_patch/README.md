@@ -1,10 +1,10 @@
-# CookieRunCrumble 1.0.101 内嵌补丁 IPA
+# CookieRunCrumble 1.1.001 内嵌补丁 IPA
 
 该构建把 `JBRFZBypass` 作为自包含 dylib 注入游戏主程序，并静态链接 Dobby。
 成品不依赖设备上的 Substrate/ElleKit，也不会编译请求、响应、登录凭据或 protobuf
 采集 Hook。
 
-包含的 1.0.101 固定补丁：
+包含的 1.1.001 固定补丁：
 
 - AppSealing 环境检查兼容与状态修复；
 - 打包时静态关闭主程序及 UnityFramework 的 20 个保护线程入口；
@@ -32,7 +32,7 @@ MOBILEPROVISION=/absolute/path/profile.mobileprovision \
 
 ## 通行证 UI 诊断补丁
 
-`patch_pass_ui_diagnostic.py` 仅用于 1.0.101 的客户端显示验证：它让高级奖励格按
+`patch_pass_ui_diagnostic.py` 仅用于 1.1.001 的客户端显示验证：它让高级奖励格按
 可用状态渲染，同时禁用高级奖励点击处理，因此不会提交高级奖励领取 RPC，也不会
 修改登录数据中的服务端权益字段。
 
