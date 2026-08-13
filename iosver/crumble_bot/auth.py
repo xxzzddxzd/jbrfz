@@ -28,8 +28,8 @@ LOGIN_URL = "https://account.devplay.com/v3/login"
 API_KEY = "wUsUkXPVSujBcOt4mDJX"
 
 # App constants from capture (CookieRun Crumble iOS)
-APP_BUILD = "19"
-APP_VERSION = "1.0.101"
+APP_BUILD = "2026081018"
+APP_VERSION = "1.1.001"
 SDK_VERSION = "1.6.3-hotfix1"
 BUNDLE_ID = "com.devsisters.cc"
 UNITY_VERSION = "6000.3.15f1"

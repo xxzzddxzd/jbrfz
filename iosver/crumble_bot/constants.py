@@ -11,8 +11,8 @@ TO_STAGE = 30
 # Server echoes `crumble-resource-key` on gRPC responses; we adopt it dynamically.
 DEFAULT_RESOURCE_KEY = "dev-0000000000"
 # Last known live key used as warm start (updated from responses when present).
-# Captured from the game after the 10101 update/restart on 2026-08-06.
-FALLBACK_RESOURCE_KEY = "game-data-9db3ba-0ca6ad"
+# Captured from game 1.1.001 and verified through metadata/manifest on 2026-08-13.
+FALLBACK_RESOURCE_KEY = "game-data-185237-02fbe8"
 
 # Resource keys are global for the live game server.  These values were
 # persisted by older account databases and must never override provisioning.
@@ -21,6 +21,8 @@ LEGACY_RESOURCE_KEYS = frozenset(
         "",
         "dev-0000000000",
         "game-data-8319a6-a64b0c",
+        "game-data-9db3ba-0ca6ad",
+        "game-data-9db3ba-a069b0",
     }
 )
 
