@@ -273,6 +273,8 @@ using PageOpenMethod = void (*)(void *self, void *methodInfo);
 // Cookie/Pet gacha 十连: HandleOnClickPurchase(buttonIndex)
 // buttons are 0=单抽, 1=十连, 2=30连.
 using GachaPurchaseMethod = void (*)(void *self, int buttonIndex, void *methodInfo);
+using SimpleActionMethod = void (*)(void *self, void *methodInfo);
+using IntActionMethod = void (*)(void *self, int value, void *methodInfo);
 // Oven guide action uses OvenAutoDrawService.StartAuto(preset, nonstop).
 // Cookie/Pet gacha guide action uses HandleOnClickPurchase(buttonIndex=1).
 
@@ -308,6 +310,14 @@ static PageOpenMethod gOriginalCookieGachaOnPageOpen = nullptr;
 static PageOpenMethod gOriginalPetGachaOnPageOpen = nullptr;
 static PageOpenMethod gOriginalInventoryOnPopupOpen = nullptr;
 static PageOpenMethod gOriginalInventoryItemInfoOnPopupOpen = nullptr;
+static PageOpenMethod gOriginalRouletteRefreshView = nullptr;
+static PageOpenMethod gOriginalRouletteBecameHidden = nullptr;
+static PageOpenMethod gOriginalSugarRuneOnPopupOpen = nullptr;
+static PageOpenMethod gOriginalStellarLinkOnPageOpen = nullptr;
+static PageOpenMethod gOriginalCrumbleDungeonOnPageOpen = nullptr;
+static PageOpenMethod gOriginalDailyDungeonOnPageOpen = nullptr;
+static PageOpenMethod gOriginalArenaLobbyOnPageOpen = nullptr;
+static PageOpenMethod gOriginalArenaPreparationOnPageOpen = nullptr;
 static atomic_uintptr_t gUnityBaseForGuide = 0;
 static atomic_uintptr_t gOvenAutoDrawService = 0;
 static atomic_uintptr_t gCookieGachaPresenter = 0;
@@ -320,6 +330,25 @@ static atomic_bool gPendingUseRandomRewardBox = false;
 // Bumped to invalidate delayed auto-action blocks (manual ops / guide switch).
 static atomic_int gAutoActionGeneration = 0;
 static atomic_int gLastSkipClaimGuideId = 0;
+
+// "巧克力巨大滴露转盘" daily-mission automation. The presenter and
+// shortcut opener are captured only while this event's mission popup is alive.
+static atomic_uintptr_t gRouletteMissionPresenter = 0;
+static atomic_uintptr_t gRouletteShortcutOpener = 0;
+static atomic_int gRoulettePendingMissionId = 0;
+static atomic_int gRoulettePendingShortcut = 0;
+static atomic_llong gRoulettePendingCurrent = 0;
+static atomic_llong gRoulettePendingTarget = 0;
+static atomic_int gRouletteActionGeneration = 0;
+static atomic_bool gRouletteReopenScheduled = false;
+static atomic_int gRouletteLastActionMissionId = 0;
+static atomic_llong gRouletteLastActionCurrent = -1;
+static atomic_llong gRouletteLastActionMs = 0;
+static atomic_llong gRouletteLastClaimMs = 0;
+
+static void ScheduleRouletteReopen(const char *reason);
+static void ScheduleRouletteDestinationAction(void *presenter,
+                                               int shortcutType);
 
 static int ReturnNormalEnvironment(void) {
     return 0;
@@ -1161,7 +1190,15 @@ static bool HookedRequirementRegister(void *self, unsigned int id,
     if (gOriginalRequirementRegister == nullptr) {
         return false;
     }
-    return gOriginalRequirementRegister(self, id, values);
+    const bool registered = gOriginalRequirementRegister(self, id, values);
+    if (registered && atomic_load(&gRoulettePendingMissionId) != 0 &&
+        JbrfzAutoFeaturesEnabled()) {
+        // Destination actions update the requirement set outside the roulette
+        // popup. Reopen that event after the transaction settles so the next
+        // incomplete mission (or its reward) can be processed automatically.
+        ScheduleRouletteReopen("requirement-updated");
+    }
+    return registered;
 }
 
 static int64_t HookedCalculateCurrentValue(void *self, int64_t type,
@@ -1226,6 +1263,15 @@ static void CancelPendingAutoActions(const char *reason) {
                  reason ? reason : "unknown");
     }
     atomic_store(&gPendingUseRandomRewardBox, false);
+    if (atomic_exchange(&gRoulettePendingMissionId, 0) != 0) {
+        JbrfzLog(@"[JBRFZBypass] Cancel roulette mission chain (%s)",
+                 reason ? reason : "unknown");
+    }
+    atomic_store(&gRoulettePendingShortcut, 0);
+    atomic_store(&gRoulettePendingCurrent, 0);
+    atomic_store(&gRoulettePendingTarget, 0);
+    atomic_fetch_add(&gRouletteActionGeneration, 1);
+    atomic_store(&gRouletteReopenScheduled, false);
     BumpAutoActionGeneration();
 }
 
@@ -1316,6 +1362,7 @@ static void HookedCookieGachaOnPageOpen(void *self, void *methodInfo) {
         atomic_store(&gCookieGachaPresenter,
                      reinterpret_cast<uintptr_t>(self));
         JbrfzLog(@"[JBRFZBypass] Captured CookieGachaPresenter %p", self);
+        ScheduleRouletteDestinationAction(self, /*ShowCookieGacha=*/5);
     }
 }
 
@@ -1327,6 +1374,7 @@ static void HookedPetGachaOnPageOpen(void *self, void *methodInfo) {
         atomic_store(&gPetGachaPresenter,
                      reinterpret_cast<uintptr_t>(self));
         JbrfzLog(@"[JBRFZBypass] Captured PetGachaPresenter %p", self);
+        ScheduleRouletteDestinationAction(self, /*ShowPetGacha=*/6);
     }
 }
 
@@ -1583,6 +1631,540 @@ static void StartOvenAutoDraw(void *service, uintptr_t base) {
     JbrfzLog(@"[JBRFZBypass] Oven StartAuto nonstop preset=%d", preset);
 }
 
+// ---------------------------------------------------------------------------
+// Chocolate giant-drop roulette daily missions
+// ---------------------------------------------------------------------------
+// EventInfo 1958922653 (patch resource game-data-185237-02fbe8).
+// Mission cells are CommonMissionCellData structs stored inline in
+// List<CommonMissionCellData>: Key is a boxed EventMissionId and cell state is
+// InProgress=0 / Claimable=1 / Claimed=2.
+static constexpr int kChocolateRouletteEventId = 1958922653;
+static constexpr int kShortcutShowCookieGacha = 5;
+static constexpr int kShortcutShowPetGacha = 6;
+static constexpr int kShortcutShowDailyDungeonList = 13;
+static constexpr int kShortcutShowCrumbleDungeon = 14;
+static constexpr int kShortcutShowArena = 16;
+static constexpr int kShortcutShowOven = 22;
+static constexpr int kShortcutShowSugarRune = 31;
+static constexpr int kShortcutShowStageBoss = 38;
+static constexpr int kShortcutShowEvent = 40;
+static constexpr int kShortcutShowStellarLink = 43;
+
+static constexpr int kChocolateRouletteMissionOrder[] = {
+    1738159960, // cookie gacha 120
+    1874810035, // pet gacha 120
+    1533923569, // equipment gacha 300
+    2070285466, // equipment gacha 500
+    1525422349, // stage clear 3
+    1612059411, // stage clear 5
+    1478774844, // daily dungeon 5
+    1267351076, // daily dungeon 10
+    2014128264, // daily dungeon 15
+    1687145871, // crumble dungeon 1
+    1861610408, // arena 1
+    1774374610, // arena 3
+    1501039162, // arena 5
+    1980624810, // sugar rune engrave 1
+    1685706773, // stellar link shuffle 1
+};
+
+struct RouletteMissionSnapshot {
+    int missionId;
+    int64_t current;
+    int64_t target;
+    int shortcutType;
+    int state;
+};
+
+static const char *RouletteShortcutName(int shortcutType) {
+    switch (shortcutType) {
+    case kShortcutShowCookieGacha:
+        return "cookie-gacha";
+    case kShortcutShowPetGacha:
+        return "pet-gacha";
+    case kShortcutShowDailyDungeonList:
+        return "daily-dungeon";
+    case kShortcutShowCrumbleDungeon:
+        return "crumble-dungeon";
+    case kShortcutShowArena:
+        return "arena";
+    case kShortcutShowOven:
+        return "oven";
+    case kShortcutShowSugarRune:
+        return "sugar-rune";
+    case kShortcutShowStageBoss:
+        return "stage-boss";
+    case kShortcutShowStellarLink:
+        return "stellar-link";
+    default:
+        return "unknown";
+    }
+}
+
+static bool IsRoulettePendingShortcut(int shortcutType, int generation) {
+    return JbrfzAutoFeaturesEnabled() &&
+           atomic_load(&gRoulettePendingMissionId) != 0 &&
+           atomic_load(&gRoulettePendingShortcut) == shortcutType &&
+           atomic_load(&gRouletteActionGeneration) == generation;
+}
+
+static void StopRouletteOvenIfActive(const char *reason) {
+    void *service = reinterpret_cast<void *>(
+        atomic_load(&gOvenAutoDrawService));
+    const uintptr_t base = atomic_load(&gUnityBaseForGuide);
+    if (!IsOvenAutoActive(service) || base == 0) {
+        return;
+    }
+    // OvenAutoDrawService.StopAuto(AutoStopReason.UserStopped)
+    auto stop = reinterpret_cast<IntActionMethod>(base + 0x0424C640);
+    stop(service, /*UserStopped=*/1, nullptr);
+    JbrfzLog(@"[JBRFZBypass] Roulette oven auto stopped (%s)",
+             reason ? reason : "mission-state");
+}
+
+static int ReadRouletteMissions(void *presenter,
+                                RouletteMissionSnapshot *out,
+                                int capacity) {
+    if (presenter == nullptr || out == nullptr || capacity <= 0) {
+        return 0;
+    }
+    auto *bytes = reinterpret_cast<uint8_t *>(presenter);
+    void *list = *reinterpret_cast<void **>(bytes + 0xA0);
+    if (list == nullptr) {
+        return 0;
+    }
+    auto *listBytes = reinterpret_cast<uint8_t *>(list);
+    void *items = *reinterpret_cast<void **>(listBytes + 0x10);
+    int size = *reinterpret_cast<int *>(listBytes + 0x18);
+    if (items == nullptr || size <= 0 || size > 64) {
+        return 0;
+    }
+    if (size > capacity) {
+        size = capacity;
+    }
+    auto *arrayBytes = reinterpret_cast<uint8_t *>(items);
+    int written = 0;
+    for (int i = 0; i < size; ++i) {
+        auto *cell = arrayBytes + 0x20 + static_cast<size_t>(i) * 0x40;
+        void *boxedMissionId = *reinterpret_cast<void **>(cell);
+        if (boxedMissionId == nullptr) {
+            continue;
+        }
+        RouletteMissionSnapshot snapshot{};
+        snapshot.missionId = *reinterpret_cast<int *>(
+            reinterpret_cast<uint8_t *>(boxedMissionId) + 0x10);
+        snapshot.current = *reinterpret_cast<int64_t *>(cell + 0x10);
+        snapshot.target = *reinterpret_cast<int64_t *>(cell + 0x18);
+        snapshot.shortcutType = *reinterpret_cast<int *>(cell + 0x28);
+        snapshot.state = *reinterpret_cast<int *>(cell + 0x38);
+        out[written++] = snapshot;
+    }
+    return written;
+}
+
+static const RouletteMissionSnapshot *FindRouletteMission(
+    const RouletteMissionSnapshot *items, int size, int missionId) {
+    for (int i = 0; i < size; ++i) {
+        if (items[i].missionId == missionId) {
+            return &items[i];
+        }
+    }
+    return nullptr;
+}
+
+static void *CreateManagedSingleIntArray(int value) {
+    using GetCorlibMethod = void *(*)();
+    using ClassFromNameMethod = void *(*)(void *, const char *, const char *);
+    using ArrayNewMethod = void *(*)(void *, uintptr_t);
+
+    auto getCorlib = reinterpret_cast<GetCorlibMethod>(
+        dlsym(RTLD_DEFAULT, "il2cpp_get_corlib"));
+    auto classFromName = reinterpret_cast<ClassFromNameMethod>(
+        dlsym(RTLD_DEFAULT, "il2cpp_class_from_name"));
+    auto arrayNew = reinterpret_cast<ArrayNewMethod>(
+        dlsym(RTLD_DEFAULT, "il2cpp_array_new"));
+    if (getCorlib == nullptr || classFromName == nullptr || arrayNew == nullptr) {
+        JbrfzLog(@"[JBRFZBypass] Roulette reopen: IL2CPP array exports missing");
+        return nullptr;
+    }
+    void *corlib = getCorlib();
+    void *intClass = corlib != nullptr
+                         ? classFromName(corlib, "System", "Int32")
+                         : nullptr;
+    void *array = intClass != nullptr ? arrayNew(intClass, 1) : nullptr;
+    if (array != nullptr) {
+        *reinterpret_cast<int *>(reinterpret_cast<uint8_t *>(array) + 0x20) =
+            value;
+    }
+    return array;
+}
+
+static void ScheduleRouletteReopen(const char *reason) {
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&gRouletteReopenScheduled, &expected,
+                                        true)) {
+        return;
+    }
+    NSString *reasonString = reason != nullptr
+                                 ? [NSString stringWithUTF8String:reason]
+                                 : @"unknown";
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.15 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+          atomic_store(&gRouletteReopenScheduled, false);
+          if (!JbrfzAutoFeaturesEnabled() ||
+              atomic_load(&gRoulettePendingMissionId) == 0) {
+              return;
+          }
+
+          void *presenter = reinterpret_cast<void *>(
+              atomic_load(&gRouletteMissionPresenter));
+          const uintptr_t base = atomic_load(&gUnityBaseForGuide);
+          if (presenter != nullptr && base != 0 &&
+              *reinterpret_cast<uint8_t *>(
+                  reinterpret_cast<uint8_t *>(presenter) + 0xC0) != 0) {
+              auto refresh = reinterpret_cast<SimpleActionMethod>(
+                  base + 0x04AD73FC);
+              refresh(presenter, nullptr);
+              return;
+          }
+
+          void *opener = reinterpret_cast<void *>(
+              atomic_load(&gRouletteShortcutOpener));
+          if (opener == nullptr || base == 0) {
+              JbrfzLog(@"[JBRFZBypass] Roulette reopen skipped: opener missing");
+              return;
+          }
+          void *parameters =
+              CreateManagedSingleIntArray(kChocolateRouletteEventId);
+          if (parameters == nullptr) {
+              return;
+          }
+          // ShortcutOpener.OpenAsync(ShowEvent, [eventId]). Its UniTask return
+          // is intentionally ignored; the async state machine starts inline.
+          using ShortcutOpenMethod =
+              uint64_t (*)(void *, int, void *, void *);
+          auto open = reinterpret_cast<ShortcutOpenMethod>(base + 0x042ED5AC);
+          (void)open(opener, kShortcutShowEvent, parameters, nullptr);
+          JbrfzLog(@"[JBRFZBypass] Roulette mission popup reopened (%@)",
+                   reasonString);
+        });
+}
+
+static void ScheduleRouletteDestinationAction(void *presenter,
+                                               int shortcutType) {
+    if (presenter == nullptr ||
+        atomic_load(&gRoulettePendingShortcut) != shortcutType) {
+        return;
+    }
+    const int generation = atomic_load(&gRouletteActionGeneration);
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.85 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+          if (!IsRoulettePendingShortcut(shortcutType, generation)) {
+              return;
+          }
+          const uintptr_t base = atomic_load(&gUnityBaseForGuide);
+          if (base == 0) {
+              return;
+          }
+
+          switch (shortcutType) {
+          case kShortcutShowCookieGacha:
+              ClickGachaTenPull(presenter, base, /*isCookie=*/true);
+              break;
+          case kShortcutShowPetGacha:
+              ClickGachaTenPull(presenter, base, /*isCookie=*/false);
+              break;
+          case kShortcutShowCrumbleDungeon: {
+              auto start = reinterpret_cast<SimpleActionMethod>(
+                  base + 0x04049A00);
+              start(presenter, nullptr);
+              break;
+          }
+          case kShortcutShowDailyDungeonList: {
+              // Enable the built-in repeat switch, then start the highest
+              // challengeable level. Reopening the event after each result
+              // keeps progress/claim handling deterministic.
+              using PrefBoolGetMethod = bool (*)(void *, void *);
+              auto getPref = reinterpret_cast<PrefBoolGetMethod>(
+                  base + 0x03DF2C50);
+              void *pref = reinterpret_cast<uint8_t *>(presenter) + 0x118;
+              if (!getPref(pref, nullptr)) {
+                  auto toggle = reinterpret_cast<SimpleActionMethod>(
+                      base + 0x04064988);
+                  toggle(presenter, nullptr);
+              }
+              const int level = *reinterpret_cast<int *>(
+                  reinterpret_cast<uint8_t *>(presenter) + 0x108);
+              auto start = reinterpret_cast<IntActionMethod>(
+                  base + 0x040642C8);
+              start(presenter, level, nullptr);
+              break;
+          }
+          case kShortcutShowArena: {
+              // Lobby -> preparation -> battle. The preparation page hook
+              // performs the second step.
+              auto openPreparation = reinterpret_cast<SimpleActionMethod>(
+                  base + 0x04024F30);
+              openPreparation(presenter, nullptr);
+              break;
+          }
+          case kShortcutShowSugarRune: {
+              auto engrave = reinterpret_cast<SimpleActionMethod>(
+                  base + 0x03F4B07C);
+              engrave(presenter, nullptr);
+              break;
+          }
+          case kShortcutShowStellarLink: {
+              auto shuffle = reinterpret_cast<SimpleActionMethod>(
+                  base + 0x04314770);
+              shuffle(presenter, nullptr);
+              break;
+          }
+          default:
+              return;
+          }
+          JbrfzLog(@"[JBRFZBypass] Roulette destination action: %s",
+                   RouletteShortcutName(shortcutType));
+        });
+}
+
+static void HookedSugarRuneOnPopupOpen(void *self, void *methodInfo) {
+    if (gOriginalSugarRuneOnPopupOpen != nullptr) {
+        gOriginalSugarRuneOnPopupOpen(self, methodInfo);
+    }
+    ScheduleRouletteDestinationAction(self, kShortcutShowSugarRune);
+}
+
+static void HookedStellarLinkOnPageOpen(void *self, void *methodInfo) {
+    if (gOriginalStellarLinkOnPageOpen != nullptr) {
+        gOriginalStellarLinkOnPageOpen(self, methodInfo);
+    }
+    ScheduleRouletteDestinationAction(self, kShortcutShowStellarLink);
+}
+
+static void HookedCrumbleDungeonOnPageOpen(void *self, void *methodInfo) {
+    if (gOriginalCrumbleDungeonOnPageOpen != nullptr) {
+        gOriginalCrumbleDungeonOnPageOpen(self, methodInfo);
+    }
+    ScheduleRouletteDestinationAction(self, kShortcutShowCrumbleDungeon);
+}
+
+static void HookedDailyDungeonOnPageOpen(void *self, void *methodInfo) {
+    if (gOriginalDailyDungeonOnPageOpen != nullptr) {
+        gOriginalDailyDungeonOnPageOpen(self, methodInfo);
+    }
+    ScheduleRouletteDestinationAction(self, kShortcutShowDailyDungeonList);
+}
+
+static void HookedArenaLobbyOnPageOpen(void *self, void *methodInfo) {
+    if (gOriginalArenaLobbyOnPageOpen != nullptr) {
+        gOriginalArenaLobbyOnPageOpen(self, methodInfo);
+    }
+    ScheduleRouletteDestinationAction(self, kShortcutShowArena);
+}
+
+static void HookedArenaPreparationOnPageOpen(void *self, void *methodInfo) {
+    if (gOriginalArenaPreparationOnPageOpen != nullptr) {
+        gOriginalArenaPreparationOnPageOpen(self, methodInfo);
+    }
+    if (self == nullptr ||
+        atomic_load(&gRoulettePendingShortcut) != kShortcutShowArena) {
+        return;
+    }
+    const int generation = atomic_load(&gRouletteActionGeneration);
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+          if (!IsRoulettePendingShortcut(kShortcutShowArena, generation)) {
+              return;
+          }
+          const uintptr_t base = atomic_load(&gUnityBaseForGuide);
+          if (base == 0) {
+              return;
+          }
+          auto start = reinterpret_cast<SimpleActionMethod>(
+              base + 0x04035048);
+          start(self, nullptr);
+          JbrfzLog(@"[JBRFZBypass] Roulette arena battle started");
+        });
+}
+
+static void TryHandleChocolateRoulette(void *presenter) {
+    if (presenter == nullptr) {
+        return;
+    }
+    auto *bytes = reinterpret_cast<uint8_t *>(presenter);
+    if (*reinterpret_cast<int *>(bytes + 0x18) !=
+        kChocolateRouletteEventId) {
+        return;
+    }
+    atomic_store(&gRouletteMissionPresenter,
+                 reinterpret_cast<uintptr_t>(presenter));
+    void *opener = *reinterpret_cast<void **>(bytes + 0x78);
+    if (opener != nullptr) {
+        atomic_store(&gRouletteShortcutOpener,
+                     reinterpret_cast<uintptr_t>(opener));
+    }
+    if (!JbrfzAutoFeaturesEnabled() || bytes[0xC0] == 0) {
+        return;
+    }
+
+    RouletteMissionSnapshot snapshots[32]{};
+    const int size =
+        ReadRouletteMissions(presenter, snapshots, 32);
+    if (size <= 0) {
+        return;
+    }
+
+    bool hasClaimable = false;
+    bool ovenClaimable = false;
+    for (int i = 0; i < size; ++i) {
+        if (snapshots[i].state == 1) {
+            hasClaimable = true;
+            if (snapshots[i].shortcutType == kShortcutShowOven) {
+                ovenClaimable = true;
+            }
+        }
+    }
+    if (ovenClaimable) {
+        StopRouletteOvenIfActive("equipment mission claimable");
+    }
+
+    const long long nowMs =
+        static_cast<long long>([[NSDate date] timeIntervalSince1970] * 1000.0);
+    if (hasClaimable) {
+        if (nowMs - atomic_load(&gRouletteLastClaimMs) < 2500) {
+            return;
+        }
+        atomic_store(&gRouletteLastClaimMs, nowMs);
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{
+              void *current = reinterpret_cast<void *>(
+                  atomic_load(&gRouletteMissionPresenter));
+              if (!JbrfzAutoFeaturesEnabled() || current != presenter ||
+                  reinterpret_cast<uint8_t *>(presenter)[0xC0] == 0) {
+                  return;
+              }
+              const uintptr_t base = atomic_load(&gUnityBaseForGuide);
+              if (base == 0) {
+                  return;
+              }
+              auto claimAll = reinterpret_cast<SimpleActionMethod>(
+                  base + 0x04AD8BF8);
+              claimAll(presenter, nullptr);
+              JbrfzLog(@"[JBRFZBypass] Roulette claim-all requested");
+            });
+        return;
+    }
+
+    const RouletteMissionSnapshot *next = nullptr;
+    for (int missionId : kChocolateRouletteMissionOrder) {
+        const RouletteMissionSnapshot *candidate =
+            FindRouletteMission(snapshots, size, missionId);
+        if (candidate != nullptr && candidate->state == 0 &&
+            candidate->current < candidate->target) {
+            next = candidate;
+            break;
+        }
+    }
+
+    if (next == nullptr) {
+        StopRouletteOvenIfActive("daily mission list complete");
+        atomic_store(&gRoulettePendingMissionId, 0);
+        atomic_store(&gRoulettePendingShortcut, 0);
+        if (atomic_exchange(&gRouletteLastActionMissionId, -1) != -1) {
+            JbrfzLog(@"[JBRFZBypass] Chocolate roulette daily missions complete");
+        }
+        return;
+    }
+
+    // If the oven is already drawing, progress updates will refresh this
+    // presenter. Do not reopen the oven or start a second draw loop.
+    if (next->shortcutType == kShortcutShowOven &&
+        IsOvenAutoActive(reinterpret_cast<void *>(
+            atomic_load(&gOvenAutoDrawService)))) {
+        atomic_store(&gRoulettePendingMissionId, next->missionId);
+        atomic_store(&gRoulettePendingShortcut, next->shortcutType);
+        atomic_store(&gRoulettePendingCurrent, next->current);
+        atomic_store(&gRoulettePendingTarget, next->target);
+        return;
+    }
+
+    if (atomic_load(&gRouletteLastActionMissionId) == next->missionId &&
+        atomic_load(&gRouletteLastActionCurrent) == next->current &&
+        nowMs - atomic_load(&gRouletteLastActionMs) < 4000) {
+        return;
+    }
+    atomic_store(&gRouletteLastActionMissionId, next->missionId);
+    atomic_store(&gRouletteLastActionCurrent, next->current);
+    atomic_store(&gRouletteLastActionMs, nowMs);
+    atomic_store(&gRoulettePendingMissionId, next->missionId);
+    atomic_store(&gRoulettePendingShortcut, next->shortcutType);
+    atomic_store(&gRoulettePendingCurrent, next->current);
+    atomic_store(&gRoulettePendingTarget, next->target);
+    const int generation =
+        atomic_fetch_add(&gRouletteActionGeneration, 1) + 1;
+    const int missionId = next->missionId;
+    const int shortcutType = next->shortcutType;
+    const int64_t current = next->current;
+    const int64_t target = next->target;
+
+    JbrfzLog(@"[JBRFZBypass] Roulette next mission=%d action=%s "
+             @"progress=%lld/%lld",
+             missionId, RouletteShortcutName(shortcutType),
+             static_cast<long long>(current), static_cast<long long>(target));
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+          if (!IsRoulettePendingShortcut(shortcutType, generation) ||
+              atomic_load(&gRouletteMissionPresenter) !=
+                  reinterpret_cast<uintptr_t>(presenter) ||
+              reinterpret_cast<uint8_t *>(presenter)[0xC0] == 0) {
+              return;
+          }
+          const uintptr_t base = atomic_load(&gUnityBaseForGuide);
+          if (base == 0) {
+              return;
+          }
+          auto shortcut = reinterpret_cast<IntActionMethod>(
+              base + 0x04AD923C);
+          shortcut(presenter, shortcutType, nullptr);
+
+          if (shortcutType == kShortcutShowOven) {
+              dispatch_after(
+                  dispatch_time(DISPATCH_TIME_NOW,
+                                (int64_t)(1.2 * NSEC_PER_SEC)),
+                  dispatch_get_main_queue(), ^{
+                    if (!IsRoulettePendingShortcut(shortcutType,
+                                                   generation)) {
+                        return;
+                    }
+                    void *service = reinterpret_cast<void *>(
+                        atomic_load(&gOvenAutoDrawService));
+                    StartOvenAutoDraw(service, base);
+                  });
+          }
+        });
+}
+
+static void HookedRouletteRefreshView(void *self, void *methodInfo) {
+    if (gOriginalRouletteRefreshView != nullptr) {
+        gOriginalRouletteRefreshView(self, methodInfo);
+    }
+    TryHandleChocolateRoulette(self);
+}
+
+static void HookedRouletteBecameHidden(void *self, void *methodInfo) {
+    if (gOriginalRouletteBecameHidden != nullptr) {
+        gOriginalRouletteBecameHidden(self, methodInfo);
+    }
+    uintptr_t expected = reinterpret_cast<uintptr_t>(self);
+    atomic_compare_exchange_strong(&gRouletteMissionPresenter, &expected, 0);
+}
+
 static void RunOvenStartAutoAction(void *presenter, uintptr_t base, int guideId,
                                    int64_t current, int64_t target) {
     void *service =
@@ -1698,6 +2280,13 @@ static void TryHandleCurrentGuide(void *presenter) {
         if (atomic_load(&gPendingUseRandomRewardBox)) {
             CancelPendingAutoActions("auto-disabled");
         }
+        return;
+    }
+
+    // The guide and roulette automations share destination presenters (gacha,
+    // oven, inventory). Give an active roulette chain exclusive ownership so
+    // two independent navigations/actions cannot race each other.
+    if (atomic_load(&gRoulettePendingMissionId) != 0) {
         return;
     }
 
@@ -2223,6 +2812,69 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
         reinterpret_cast<void *>(&HookedInventoryItemInfoOnPopupOpen),
         reinterpret_cast<void **>(&gOriginalInventoryItemInfoOnPopupOpen));
 
+    // Chocolate giant-drop roulette daily mission chain. RefreshView exposes
+    // the authoritative server-backed cells; destination page hooks execute
+    // the same action as each mission card's "Go" button.
+    static constexpr uintptr_t rouletteRefreshViewRVA = 0x04AD73FC;
+    MSHookFunction(
+        reinterpret_cast<void *>(base + rouletteRefreshViewRVA),
+        reinterpret_cast<void *>(&HookedRouletteRefreshView),
+        reinterpret_cast<void **>(&gOriginalRouletteRefreshView));
+
+    static constexpr uintptr_t rouletteBecameHiddenRVA = 0x04AD783C;
+    MSHookFunction(
+        reinterpret_cast<void *>(base + rouletteBecameHiddenRVA),
+        reinterpret_cast<void *>(&HookedRouletteBecameHidden),
+        reinterpret_cast<void **>(&gOriginalRouletteBecameHidden));
+
+    static constexpr uintptr_t sugarRuneOnPopupOpenRVA = 0x03F4D610;
+    MSHookFunction(
+        reinterpret_cast<void *>(base + sugarRuneOnPopupOpenRVA),
+        reinterpret_cast<void *>(&HookedSugarRuneOnPopupOpen),
+        reinterpret_cast<void **>(&gOriginalSugarRuneOnPopupOpen));
+
+    static constexpr uintptr_t stellarLinkOnPageOpenRVA = 0x043138A8;
+    MSHookFunction(
+        reinterpret_cast<void *>(base + stellarLinkOnPageOpenRVA),
+        reinterpret_cast<void *>(&HookedStellarLinkOnPageOpen),
+        reinterpret_cast<void **>(&gOriginalStellarLinkOnPageOpen));
+
+    static constexpr uintptr_t crumbleDungeonOnPageOpenRVA = 0x04047C80;
+    MSHookFunction(
+        reinterpret_cast<void *>(base + crumbleDungeonOnPageOpenRVA),
+        reinterpret_cast<void *>(&HookedCrumbleDungeonOnPageOpen),
+        reinterpret_cast<void **>(&gOriginalCrumbleDungeonOnPageOpen));
+
+    static constexpr uintptr_t dailyDungeonOnPageOpenRVA = 0x040616B4;
+    MSHookFunction(
+        reinterpret_cast<void *>(base + dailyDungeonOnPageOpenRVA),
+        reinterpret_cast<void *>(&HookedDailyDungeonOnPageOpen),
+        reinterpret_cast<void **>(&gOriginalDailyDungeonOnPageOpen));
+
+    static constexpr uintptr_t arenaLobbyOnPageOpenRVA = 0x04023CD4;
+    MSHookFunction(
+        reinterpret_cast<void *>(base + arenaLobbyOnPageOpenRVA),
+        reinterpret_cast<void *>(&HookedArenaLobbyOnPageOpen),
+        reinterpret_cast<void **>(&gOriginalArenaLobbyOnPageOpen));
+
+    static constexpr uintptr_t arenaPreparationOnPageOpenRVA = 0x040343CC;
+    MSHookFunction(
+        reinterpret_cast<void *>(base + arenaPreparationOnPageOpenRVA),
+        reinterpret_cast<void *>(&HookedArenaPreparationOnPageOpen),
+        reinterpret_cast<void **>(&gOriginalArenaPreparationOnPageOpen));
+
+    JbrfzLog(@"[JBRFZBypass] Chocolate roulette automation armed "
+             @"(Refresh @ 0x%lx, Hidden @ 0x%lx, Sugar @ 0x%lx, Stellar @ 0x%lx, "
+             @"Crumble @ 0x%lx, Daily @ 0x%lx, Arena @ 0x%lx/0x%lx)",
+             static_cast<unsigned long>(rouletteRefreshViewRVA),
+             static_cast<unsigned long>(rouletteBecameHiddenRVA),
+             static_cast<unsigned long>(sugarRuneOnPopupOpenRVA),
+             static_cast<unsigned long>(stellarLinkOnPageOpenRVA),
+             static_cast<unsigned long>(crumbleDungeonOnPageOpenRVA),
+             static_cast<unsigned long>(dailyDungeonOnPageOpenRVA),
+             static_cast<unsigned long>(arenaLobbyOnPageOpenRVA),
+             static_cast<unsigned long>(arenaPreparationOnPageOpenRVA));
+
     // Requirement residual-record fix (always on; not gated by auto panel).
     MSHookFunction(
         reinterpret_cast<void *>(base + kRequirementRegisterRVA),
@@ -2401,7 +3053,7 @@ static void InstallAppSealingHooks(const struct mach_header *header,
 __attribute__((constructor))
 static void JBRFZBypassInitialize(void) {
     @autoreleasepool {
-        JbrfzLog(@"[JBRFZBypass] dylib loaded home=%@ version=0.3.25 auto=%d",
+        JbrfzLog(@"[JBRFZBypass] dylib loaded home=%@ version=0.3.27 auto=%d",
                  NSHomeDirectory() ?: @"(nil)",
                  JbrfzAutoFeaturesEnabled() ? 1 : 0);
         _dyld_register_func_for_add_image(&InstallAppSealingHooks);
