@@ -30,7 +30,8 @@ MOBILEPROVISION=/absolute/path/profile.mobileprovision \
 ```
 
 可通过 `SOURCE_IPA`、`MAIN_BINARY`、`UNITY_BINARY`、`OUTPUT_IPA` 和
-`DOBBY_LIB` 覆盖默认路径。构建会校验游戏版本、外部 Hook 依赖以及请求采集特征串。
+`DOBBY_LIB` 覆盖默认路径；使用 `BUNDLE_ID=com.example.app` 可替换应用的
+Bundle ID。构建会校验游戏版本、外部 Hook 依赖以及请求采集特征串。
 
 ## 通行证 UI 诊断补丁
 

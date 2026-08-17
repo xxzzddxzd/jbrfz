@@ -7,6 +7,7 @@ SOURCE_IPA="${SOURCE_IPA:-$REPO_ROOT/11001/1.zip}"
 MAIN_BINARY="${MAIN_BINARY:-$REPO_ROOT/11001/main/CookieRunCrumble}"
 UNITY_BINARY="${UNITY_BINARY:-$REPO_ROOT/11001/UnityFramework}"
 OUTPUT_IPA="${OUTPUT_IPA:-$SCRIPT_DIR/dist/CookieRunCrumble-1.1.001-JBRFZ.ipa}"
+BUNDLE_ID_OVERRIDE="${BUNDLE_ID:-}"
 PATCH_INSTALL_NAME="@executable_path/Frameworks/JBRFZPatch.dylib"
 MARKETPLACE_SYSTEM_PATH="/System/Library/Frameworks/MarketplaceKit.framework/MarketplaceKit"
 MARKETPLACE_INSTALL_NAME="@rpath/MarketplaceKit.framework/MarketplaceKit"
@@ -56,6 +57,16 @@ BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_DIR/Info.plis
 if [[ "$VERSION" != "1.1.001" || "$BUILD" != "2026081018" ]]; then
     echo "版本不匹配：需要 1.1.001 (2026081018)，实际 $VERSION ($BUILD)。" >&2
     exit 2
+fi
+
+SOURCE_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_DIR/Info.plist")"
+TARGET_BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-$SOURCE_BUNDLE_ID}"
+if [[ ! "$TARGET_BUNDLE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; then
+    echo "Bundle ID 格式无效：$TARGET_BUNDLE_ID" >&2
+    exit 2
+fi
+if [[ "$TARGET_BUNDLE_ID" != "$SOURCE_BUNDLE_ID" ]]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $TARGET_BUNDLE_ID" "$APP_DIR/Info.plist"
 fi
 
 SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
@@ -180,5 +191,6 @@ rm -f "$OUTPUT_IPA"
 
 echo "IPA：$OUTPUT_IPA"
 echo "版本：$VERSION ($BUILD)"
+echo "Bundle ID：$TARGET_BUNDLE_ID"
 echo "签名：$SIGNING_MODE"
 echo "补丁：面板/兼容/自动功能 + Unity 3× + MarketplaceKit Mac 兼容；不含请求记录"
