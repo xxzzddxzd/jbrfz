@@ -88,8 +88,12 @@ static void JbrfzLoadAutoFeaturesDefault(void) {
 }
 
 bool JbrfzAutoFeaturesEnabled(void) {
+#if defined(JBRFZ_NO_INLINE_HOOKS)
+    return false;
+#else
     JbrfzLoadAutoFeaturesDefault();
     return gAutoFeaturesEnabled;
+#endif
 }
 
 static void JbrfzLoadUnitySpeedDefault(void) {
@@ -121,6 +125,13 @@ static void JbrfzSetUnitySpeedPreference(bool enabled) {
 }
 
 static void JbrfzSetAutoFeaturesEnabled(bool enabled, bool persist) {
+#if defined(JBRFZ_NO_INLINE_HOOKS)
+    (void)enabled;
+    (void)persist;
+    gAutoFeaturesEnabled = false;
+    JbrfzPanelLog(@"[JBRFZBypass] Auto features unavailable in iOS safe mode");
+    return;
+#else
     JbrfzLoadAutoFeaturesDefault();
     const bool previous = gAutoFeaturesEnabled;
     gAutoFeaturesEnabled = enabled;
@@ -134,6 +145,7 @@ static void JbrfzSetAutoFeaturesEnabled(bool enabled, bool persist) {
     }
     JbrfzPanelLog(@"[JBRFZBypass] Auto features %@",
                   enabled ? @"ENABLED" : @"DISABLED");
+#endif
 }
 
 // MARK: - Passthrough window (Unity-safe overlay)
@@ -462,15 +474,23 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
 
     UILabel *autoLabel =
         [[UILabel alloc] initWithFrame:CGRectMake(18, 58, 210, 28)];
+#if defined(JBRFZ_NO_INLINE_HOOKS)
+    autoLabel.text = @"自动功能（安全模式不可用）";
+#else
     autoLabel.text = @"启用自动功能";
+#endif
     autoLabel.textColor = UIColor.whiteColor;
     autoLabel.font = [UIFont systemFontOfSize:16.0 weight:UIFontWeightMedium];
     [panel addSubview:autoLabel];
 
     UILabel *autoDetail =
         [[UILabel alloc] initWithFrame:CGRectMake(18, 88, 230, 54)];
+#if defined(JBRFZ_NO_INLINE_HOOKS)
+    autoDetail.text = @"iOS 27 会拦截运行时内联 Hook，当前仅启用可安全运行的功能。";
+#else
     autoDetail.text = @"关闭时：不自动领任务、不自动烤箱/抽卡/开箱。\n"
                       @"新手号请保持关闭。";
+#endif
     autoDetail.textColor = [UIColor colorWithWhite:0.78 alpha:1.0];
     autoDetail.font = [UIFont systemFontOfSize:12.0];
     autoDetail.numberOfLines = 0;
@@ -478,6 +498,9 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
 
     UISwitch *autoSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
     autoSwitch.on = JbrfzAutoFeaturesEnabled();
+#if defined(JBRFZ_NO_INLINE_HOOKS)
+    autoSwitch.enabled = NO;
+#endif
     autoSwitch.onTintColor =
         [UIColor colorWithRed:0.19 green:0.68 blue:1.0 alpha:1.0];
     [autoSwitch addTarget:self
@@ -821,10 +844,16 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
     const bool speedEnabled = JbrfzUnitySpeedEnabled();
     self.autoSwitch.on = enabled;
     self.speedSwitch.on = speedEnabled;
+#if defined(JBRFZ_NO_INLINE_HOOKS)
+    self.statusLabel.text = [NSString
+        stringWithFormat:@"状态：iOS 安全模式；Unity %@",
+                         speedEnabled ? @"3×" : @"1×"];
+#else
     self.statusLabel.text = [NSString
         stringWithFormat:@"状态：自动%@；Unity %@",
                          enabled ? @"开启" : @"关闭",
                          speedEnabled ? @"3×" : @"1×"];
+#endif
     self.floatingButton.accessibilityValue =
         enabled ? @"自动已开启" : @"自动已关闭";
     self.floatingButton.backgroundColor =

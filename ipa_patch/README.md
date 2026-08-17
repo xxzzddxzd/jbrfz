@@ -33,6 +33,12 @@ MOBILEPROVISION=/absolute/path/profile.mobileprovision \
 `DOBBY_LIB` 覆盖默认路径；使用 `BUNDLE_ID=com.example.app` 可替换应用的
 Bundle ID。构建会校验游戏版本、外部 Hook 依赖以及请求采集特征串。
 
+iOS 27 等会对运行时改写签名代码页执行严格复核的系统，可设置
+`IOS_SAFE_MODE=1`。该模式不安装 Dobby 内联 Hook，避免系统以
+`codesigning/invalid-page` 终止进程；静态保护补丁、浮动面板和不依赖内联
+Hook 的功能仍会打包。面板会明确标注安全模式并禁用自动功能开关；Unity 倍速
+仍可使用。
+
 ## 通行证 UI 诊断补丁
 
 `patch_pass_ui_diagnostic.py` 仅用于 1.1.001 的客户端显示验证：它让高级奖励格按

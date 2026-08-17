@@ -8,6 +8,7 @@ MAIN_BINARY="${MAIN_BINARY:-$REPO_ROOT/11001/main/CookieRunCrumble}"
 UNITY_BINARY="${UNITY_BINARY:-$REPO_ROOT/11001/UnityFramework}"
 OUTPUT_IPA="${OUTPUT_IPA:-$SCRIPT_DIR/dist/CookieRunCrumble-1.1.001-JBRFZ.ipa}"
 BUNDLE_ID_OVERRIDE="${BUNDLE_ID:-}"
+IOS_SAFE_MODE="${IOS_SAFE_MODE:-0}"
 PATCH_INSTALL_NAME="@executable_path/Frameworks/JBRFZPatch.dylib"
 MARKETPLACE_SYSTEM_PATH="/System/Library/Frameworks/MarketplaceKit.framework/MarketplaceKit"
 MARKETPLACE_INSTALL_NAME="@rpath/MarketplaceKit.framework/MarketplaceKit"
@@ -71,6 +72,10 @@ fi
 
 SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
 CLANGXX="$(xcrun --sdk iphoneos --find clang++)"
+PATCH_DEFINES=("-DJBRFZ_INLINE_HOOKS=1")
+if [[ "$IOS_SAFE_MODE" == "1" ]]; then
+    PATCH_DEFINES=("-DJBRFZ_NO_INLINE_HOOKS=1")
+fi
 "$CLANGXX" \
     -arch arm64 \
     -isysroot "$SDKROOT" \
@@ -80,6 +85,7 @@ CLANGXX="$(xcrun --sdk iphoneos --find clang++)"
     -fvisibility=hidden \
     -DJBRFZ_EMBEDDED=1 \
     -DJBRFZ_NO_CAPTURE=1 \
+    "${PATCH_DEFINES[@]}" \
     -I"$REPO_ROOT/JBRFZBypass" \
     -dynamiclib \
     -Wl,-dead_strip \
@@ -145,7 +151,14 @@ python3 "$SCRIPT_DIR/redirect_weak_dylib.py" "$APP_UNITY" \
 python3 "$SCRIPT_DIR/inject_load_dylib.py" "$APP_MAIN" "$PATCH_INSTALL_NAME"
 
 /usr/libexec/PlistBuddy -c 'Delete :JBRFZPatch' "$APP_DIR/Info.plist" 2>/dev/null || true
-/usr/libexec/PlistBuddy -c 'Add :JBRFZPatch string 1.1.001-embedded-no-capture-speed3x-icall-marketplace-compat' "$APP_DIR/Info.plist"
+if [[ "$IOS_SAFE_MODE" == "1" ]]; then
+    PATCH_TAG='1.1.001-embedded-ios-safe-no-capture-speed3x-marketplace-compat'
+    PATCH_SUMMARY='静态保护补丁 + 浮动面板 + Unity 3× + MarketplaceKit Mac 兼容；内联自动功能已禁用；不含请求记录'
+else
+    PATCH_TAG='1.1.001-embedded-no-capture-speed3x-icall-marketplace-compat'
+    PATCH_SUMMARY='面板/兼容/自动功能 + Unity 3× + MarketplaceKit Mac 兼容；不含请求记录'
+fi
+/usr/libexec/PlistBuddy -c "Add :JBRFZPatch string $PATCH_TAG" "$APP_DIR/Info.plist"
 rm -rf "$APP_DIR/_CodeSignature"
 
 SIGNING_MODE=adhoc
@@ -193,4 +206,5 @@ echo "IPA：$OUTPUT_IPA"
 echo "版本：$VERSION ($BUILD)"
 echo "Bundle ID：$TARGET_BUNDLE_ID"
 echo "签名：$SIGNING_MODE"
-echo "补丁：面板/兼容/自动功能 + Unity 3× + MarketplaceKit Mac 兼容；不含请求记录"
+echo "iOS 安全模式：$IOS_SAFE_MODE"
+echo "补丁：$PATCH_SUMMARY"

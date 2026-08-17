@@ -3018,6 +3018,15 @@ static void InstallAppSealingHooks(const struct mach_header *header,
                      reinterpret_cast<uintptr_t>(resolveICall));
     }
 
+#if defined(JBRFZ_NO_INLINE_HOOKS)
+    atomic_store(&gUnityFrameworkBase,
+                 reinterpret_cast<uintptr_t>(header));
+    ScheduleNormalState();
+    JbrfzLog(@"[JBRFZBypass] iOS safe mode active; inline hooks skipped");
+    dlclose(image);
+    return;
+#endif
+
     bool expected = false;
     if (!atomic_compare_exchange_strong(&gInstalled, &expected, true)) {
         dlclose(image);
