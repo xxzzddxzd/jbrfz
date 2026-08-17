@@ -8,6 +8,8 @@ MAIN_BINARY="${MAIN_BINARY:-$REPO_ROOT/11001/main/CookieRunCrumble}"
 UNITY_BINARY="${UNITY_BINARY:-$REPO_ROOT/11001/UnityFramework}"
 OUTPUT_IPA="${OUTPUT_IPA:-$SCRIPT_DIR/dist/CookieRunCrumble-1.1.001-JBRFZ.ipa}"
 PATCH_INSTALL_NAME="@executable_path/Frameworks/JBRFZPatch.dylib"
+MARKETPLACE_SYSTEM_PATH="/System/Library/Frameworks/MarketplaceKit.framework/MarketplaceKit"
+MARKETPLACE_INSTALL_NAME="@rpath/MarketplaceKit.framework/MarketplaceKit"
 
 if [[ -n "${DOBBY_LIB:-}" ]]; then
     DOBBY_ARCHIVE="$DOBBY_LIB"
@@ -41,6 +43,8 @@ APP_DIR="$WORK_DIR/Payload/CookieRunCrumble.app"
 APP_MAIN="$APP_DIR/CookieRunCrumble"
 APP_UNITY="$APP_DIR/Frameworks/UnityFramework.framework/UnityFramework"
 PATCH_DYLIB="$SCRIPT_DIR/build/JBRFZPatch.dylib"
+MARKETPLACE_FRAMEWORK="$APP_DIR/Frameworks/MarketplaceKit.framework"
+MARKETPLACE_BINARY="$MARKETPLACE_FRAMEWORK/MarketplaceKit"
 
 if [[ ! -d "$APP_DIR" || ! -f "$APP_UNITY" ]]; then
     echo "源归档不是预期的 CookieRunCrumble 1.1.001 IPA。" >&2
@@ -86,6 +90,31 @@ if strings "$PATCH_DYLIB" | grep -Eq 'jbrfz_capture|REQ-RAW|GUEST_SECRET|LOGIN_M
     exit 3
 fi
 
+# The 1.1.001 ad SDK resolves MarketplaceKit.AppDistributor even when its weak
+# system framework is unavailable under PlayCover. Build the exact Swift API
+# surface used by the SDK and make this one dependency bundle-local.
+mkdir -p "$MARKETPLACE_FRAMEWORK/Modules/MarketplaceKit.swiftmodule"
+xcrun --sdk iphoneos swiftc \
+    -target arm64-apple-ios15.0 \
+    -parse-as-library \
+    -emit-library \
+    -emit-module \
+    -emit-module-path "$MARKETPLACE_FRAMEWORK/Modules/MarketplaceKit.swiftmodule/arm64-apple-ios.swiftmodule" \
+    -module-name MarketplaceKit \
+    -enable-library-evolution \
+    -Xlinker -install_name \
+    -Xlinker "$MARKETPLACE_INSTALL_NAME" \
+    "$SCRIPT_DIR/MarketplaceKitStub.swift" \
+    -o "$MARKETPLACE_BINARY"
+/usr/libexec/PlistBuddy -c 'Add :CFBundleExecutable string MarketplaceKit' "$MARKETPLACE_FRAMEWORK/Info.plist"
+/usr/libexec/PlistBuddy -c 'Add :CFBundleIdentifier string com.xzd.jbrfz.marketplacekit' "$MARKETPLACE_FRAMEWORK/Info.plist"
+/usr/libexec/PlistBuddy -c 'Add :CFBundleInfoDictionaryVersion string 6.0' "$MARKETPLACE_FRAMEWORK/Info.plist"
+/usr/libexec/PlistBuddy -c 'Add :CFBundleName string MarketplaceKit' "$MARKETPLACE_FRAMEWORK/Info.plist"
+/usr/libexec/PlistBuddy -c 'Add :CFBundlePackageType string FMWK' "$MARKETPLACE_FRAMEWORK/Info.plist"
+/usr/libexec/PlistBuddy -c 'Add :CFBundleShortVersionString string 1.0' "$MARKETPLACE_FRAMEWORK/Info.plist"
+/usr/libexec/PlistBuddy -c 'Add :CFBundleVersion string 1' "$MARKETPLACE_FRAMEWORK/Info.plist"
+/usr/libexec/PlistBuddy -c 'Add :MinimumOSVersion string 15.0' "$MARKETPLACE_FRAMEWORK/Info.plist"
+
 cp "$MAIN_BINARY" "$APP_MAIN"
 cp "$UNITY_BINARY" "$APP_UNITY"
 cp "$PATCH_DYLIB" "$APP_DIR/Frameworks/JBRFZPatch.dylib"
@@ -100,10 +129,12 @@ python3 "$SCRIPT_DIR/patch_arm64_rvas.py" "$APP_MAIN" \
 python3 "$SCRIPT_DIR/patch_arm64_rvas.py" "$APP_UNITY" \
     0x000F0028 0x000F00F4 0x000F0250 0x000F0274 0x000F0450 \
     0x000F0548 0x000F06D8 0x000F0838 0x000F0934 0x000F0958
+python3 "$SCRIPT_DIR/redirect_weak_dylib.py" "$APP_UNITY" \
+    "$MARKETPLACE_SYSTEM_PATH" "$MARKETPLACE_INSTALL_NAME"
 python3 "$SCRIPT_DIR/inject_load_dylib.py" "$APP_MAIN" "$PATCH_INSTALL_NAME"
 
 /usr/libexec/PlistBuddy -c 'Delete :JBRFZPatch' "$APP_DIR/Info.plist" 2>/dev/null || true
-/usr/libexec/PlistBuddy -c 'Add :JBRFZPatch string 1.1.001-embedded-no-capture-speed3x-icall' "$APP_DIR/Info.plist"
+/usr/libexec/PlistBuddy -c 'Add :JBRFZPatch string 1.1.001-embedded-no-capture-speed3x-icall-marketplace-compat' "$APP_DIR/Info.plist"
 rm -rf "$APP_DIR/_CodeSignature"
 
 SIGNING_MODE=adhoc
@@ -150,4 +181,4 @@ rm -f "$OUTPUT_IPA"
 echo "IPA：$OUTPUT_IPA"
 echo "版本：$VERSION ($BUILD)"
 echo "签名：$SIGNING_MODE"
-echo "补丁：面板/兼容/自动功能 + Unity 3×；不含请求记录"
+echo "补丁：面板/兼容/自动功能 + Unity 3× + MarketplaceKit Mac 兼容；不含请求记录"

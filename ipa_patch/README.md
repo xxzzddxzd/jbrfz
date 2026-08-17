@@ -11,6 +11,8 @@
 - 免广告路径、RPC 错误 loading 修复；
 - 任务自动领取、烤箱/十连/宝箱动作及需求记录修复；
 - 浮动面板；
+- 内置 `MarketplaceKit.AppDistributor` 兼容框架，避免 1.1.001 广告 SDK 在
+  PlayCover/macOS 缺少该弱链接框架时触发 Swift `fatalError`；
 - 通过该版本导出的 `il2cpp_resolve_icall` 解析 `UnityEngine.Time::set_timeScale(System.Single)`，面板可切换 3×/1×；开启后每 500 ms 重申一次倍率。
 
 默认构建并做 ad-hoc 签名（适合 TrollStore/已允许自签包的设备）：
