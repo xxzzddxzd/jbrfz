@@ -1,10 +1,10 @@
-# CookieRunCrumble 1.1.001 内嵌补丁 IPA
+# CookieRunCrumble 1.1.101 内嵌补丁 IPA
 
 该构建把 `JBRFZBypass` 作为自包含 dylib 注入游戏主程序，并静态链接 Dobby。
 成品不依赖设备上的 Substrate/ElleKit，也不会编译请求、响应、登录凭据或 protobuf
 采集 Hook。
 
-包含的 1.1.001 固定补丁：
+包含的 1.1.101 固定补丁：
 
 - AppSealing 环境检查兼容与状态修复；
 - 打包时静态关闭主程序及 UnityFramework 的 20 个保护线程入口、4 个托管
@@ -13,7 +13,7 @@
 - 签名前静态固定免广告判断为开启；RPC 错误 loading 修复；
 - 任务自动领取、烤箱/十连/宝箱动作及需求记录修复；
 - 浮动面板；
-- 内置 `MarketplaceKit.AppDistributor` 兼容框架，避免 1.1.001 广告 SDK 在
+- 内置 `MarketplaceKit.AppDistributor` 兼容框架，避免 1.1.101 广告 SDK 在
   PlayCover/macOS 缺少该弱链接框架时触发 Swift `fatalError`；
 - 通过该版本导出的 `il2cpp_resolve_icall` 解析 `UnityEngine.Time::set_timeScale(System.Single)`，面板可切换 3×/1×；开启后每 500 ms 重申一次倍率。
 
@@ -44,7 +44,7 @@ PlayCover/macOS 构建仍默认使用本地兼容框架，也可通过 `MARKETPL
 
 ## 通行证 UI 诊断补丁
 
-`patch_pass_ui_diagnostic.py` 仅用于 1.1.001 的客户端显示验证：它让高级奖励格按
+`patch_pass_ui_diagnostic.py` 仅用于 1.1.101 的客户端显示验证：它让高级奖励格按
 可用状态渲染，同时禁用高级奖励点击处理，因此不会提交高级奖励领取 RPC，也不会
 修改登录数据中的服务端权益字段。
 

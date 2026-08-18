@@ -3,10 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SOURCE_IPA="${SOURCE_IPA:-$REPO_ROOT/11001/1.zip}"
-MAIN_BINARY="${MAIN_BINARY:-$REPO_ROOT/11001/main/CookieRunCrumble}"
-UNITY_BINARY="${UNITY_BINARY:-$REPO_ROOT/11001/UnityFramework}"
-OUTPUT_IPA="${OUTPUT_IPA:-$SCRIPT_DIR/dist/CookieRunCrumble-1.1.001-JBRFZ.ipa}"
+SOURCE_IPA="${SOURCE_IPA:-$REPO_ROOT/11101/1.zip}"
+MAIN_BINARY="${MAIN_BINARY:-$REPO_ROOT/11101/main/CookieRunCrumble}"
+UNITY_BINARY="${UNITY_BINARY:-$REPO_ROOT/11101/UnityFramework}"
+OUTPUT_IPA="${OUTPUT_IPA:-$SCRIPT_DIR/dist/CookieRunCrumble-1.1.101-JBRFZ.ipa}"
 BUNDLE_ID_OVERRIDE="${BUNDLE_ID:-}"
 IOS_SAFE_MODE="${IOS_SAFE_MODE:-0}"
 MARKETPLACE_STUB="${MARKETPLACE_STUB:-}"
@@ -57,14 +57,14 @@ MARKETPLACE_FRAMEWORK="$APP_DIR/Frameworks/MarketplaceKit.framework"
 MARKETPLACE_BINARY="$MARKETPLACE_FRAMEWORK/MarketplaceKit"
 
 if [[ ! -d "$APP_DIR" || ! -f "$APP_UNITY" ]]; then
-    echo "源归档不是预期的 CookieRunCrumble 1.1.001 IPA。" >&2
+    echo "源归档不是预期的 CookieRunCrumble 1.1.101 IPA。" >&2
     exit 2
 fi
 
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_DIR/Info.plist")"
 BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_DIR/Info.plist")"
-if [[ "$VERSION" != "1.1.001" || "$BUILD" != "2026081018" ]]; then
-    echo "版本不匹配：需要 1.1.001 (2026081018)，实际 $VERSION ($BUILD)。" >&2
+if [[ "$VERSION" != "1.1.101" || "$BUILD" != "2026081413" ]]; then
+    echo "版本不匹配：需要 1.1.101 (2026081413)，实际 $VERSION ($BUILD)。" >&2
     exit 2
 fi
 
@@ -161,8 +161,8 @@ python3 "$SCRIPT_DIR/patch_arm64_rvas.py" "$APP_MAIN" \
     0x000837FC 0x000838C8 0x00083A24 0x00083A48 0x00083C24 \
     0x00083D1C 0x00083EAC 0x0008400C 0x00084108 0x0008412C
 python3 "$SCRIPT_DIR/patch_arm64_rvas.py" "$APP_UNITY" \
-    0x000F0028 0x000F00F4 0x000F0250 0x000F0274 0x000F0450 \
-    0x000F0548 0x000F06D8 0x000F0838 0x000F0934 0x000F0958
+    0x000EEC38 0x000EED04 0x000EEE60 0x000EEE84 0x000EF060 \
+    0x000EF158 0x000EF2E8 0x000EF448 0x000EF544 0x000EF568
 if [[ "$IOS_SAFE_MODE" == "1" ]]; then
     if [[ "$TARGET_BUNDLE_ID" != "$SOURCE_BUNDLE_ID" ]]; then
         # AppSealing 1.14 compares the native main-bundle identifier before
@@ -172,25 +172,25 @@ if [[ "$IOS_SAFE_MODE" == "1" ]]; then
         python3 "$SCRIPT_DIR/patch_arm64_rvas.py" --branch-to 0x00096FB8 \
             "$APP_MAIN" \
             0x00096D30 0x00096FFC
-        python3 "$SCRIPT_DIR/patch_arm64_rvas.py" --branch-to 0x00103BC0 \
+        python3 "$SCRIPT_DIR/patch_arm64_rvas.py" --branch-to 0x001027D0 \
             "$APP_UNITY" \
-            0x00103938 0x00103C04
+            0x00102548 0x00102814
     fi
     # These three exported checks previously required Dobby. Their signed
     # static return stubs and all managed hook bridges are installed before
     # the nested framework and app signatures are generated.
     python3 "$SCRIPT_DIR/patch_arm64_rvas.py" --return-false "$APP_UNITY" \
-        0x00083B20 0x000843A8 0x00084538
+        0x00082920 0x000831A8 0x00083338
     # Managed AppSealing wrappers previously redirected to
     # ReturnWithoutAction by Dobby. The signed build can replace them directly.
     python3 "$SCRIPT_DIR/patch_arm64_rvas.py" "$APP_UNITY" \
-        0x03A400CC 0x03A401C4 0x03A40290 0x03A40AB8
+        0x03A1E678 0x03A1E770 0x03A1E83C 0x03A1F064
     python3 "$SCRIPT_DIR/patch_arm64_static_hooks.py" "$APP_UNITY"
 fi
 # Crumble.AdRemoveGameBoostCalculator.IsAdRemoveActive. This is patched on
 # disk, before signing, so stock iOS never has to modify a signed __TEXT page.
 python3 "$SCRIPT_DIR/patch_arm64_rvas.py" --return-true "$APP_UNITY" \
-    0x03DD44A0
+    0x03DB865C
 if [[ "$MARKETPLACE_STUB" == "1" ]]; then
     python3 "$SCRIPT_DIR/redirect_weak_dylib.py" "$APP_UNITY" \
         "$MARKETPLACE_SYSTEM_PATH" "$MARKETPLACE_INSTALL_NAME"
@@ -199,10 +199,10 @@ python3 "$SCRIPT_DIR/inject_load_dylib.py" "$APP_MAIN" "$PATCH_INSTALL_NAME"
 
 /usr/libexec/PlistBuddy -c 'Delete :JBRFZPatch' "$APP_DIR/Info.plist" 2>/dev/null || true
 if [[ "$IOS_SAFE_MODE" == "1" ]]; then
-    PATCH_TAG='1.1.001-embedded-ios-signed-static-auto-ad-no-capture-speed3x'
+    PATCH_TAG='1.1.101-embedded-ios-signed-static-auto-ad-no-capture-speed3x'
     PATCH_SUMMARY='静态保护/免广告/自动功能 + 浮动面板 + Unity 3×；无运行时内联 Hook；不含请求记录'
 else
-    PATCH_TAG='1.1.001-embedded-static-ad-no-capture-speed3x-icall-marketplace-compat'
+    PATCH_TAG='1.1.101-embedded-static-ad-no-capture-speed3x-icall-marketplace-compat'
     PATCH_SUMMARY='静态免广告 + 面板/兼容/自动功能 + Unity 3× + MarketplaceKit Mac 兼容；不含请求记录'
 fi
 /usr/libexec/PlistBuddy -c "Add :JBRFZPatch string $PATCH_TAG" "$APP_DIR/Info.plist"

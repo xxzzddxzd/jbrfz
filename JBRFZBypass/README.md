@@ -7,7 +7,7 @@ Rootless Theos tweak for `com.devsisters.cc` (CookieRun: Crumble).
 The app's `AppSealingSDK` starts a background integrity loop and treats a
 non-zero result from its exported environment checks as an abnormal device.
 The tweak resolves those exports from `UnityFramework` at runtime and makes
-them report the normal value (`0`). For app version 1.1.001 (2026081018), it also
+them report the normal value (`0`). For app version 1.1.101 (2026081413), it also
 disables the SDK's delayed managed monitor and exit callback after verifying
 the exact main-executable and `UnityFramework` UUIDs.
 
@@ -26,7 +26,7 @@ has `GameBoostType.AdRemove` (`1`). Callers include:
 - currency package cells
 
 For the UUID-matched UnityFramework build, the tweak hooks
-`IsAdRemoveActive` at RVA `0x03DD44A0` and always returns `true`.
+`IsAdRemoveActive` at RVA `0x03DB865C` and always returns `true`.
 
 This is a client-side gate only. Server-owned inventory/boost records and
 anti-cheat validation are unchanged.
@@ -40,7 +40,7 @@ anti-cheat validation are unchanged.
 `AfterError`：未识别错误码或 `AfterActionType.Restart` 会调用
 `GameSceneLoader.RestartApp()` 重载登录场景。
 
-tweak 将 `AfterError`（RVA `0x03A85C10`）置空：弹框仍可关闭，
+tweak 将 `AfterError`（RVA `0x03A6435C`）置空：弹框仍可关闭，
 不再强制返回登录页。背景业务可继续跑。
 
 
@@ -66,18 +66,18 @@ UI 可能提前显示 completed，点领取被服务器拒绝。
 
 tweak（始终生效，不依赖自动任务开关）：
 
-- hook `Register`（RVA `0x03E64F28`）：注册前若已有同 id record，先调
-  `RemoveRecordByType`（`0x03E64AFC`）清 `RecordsByType`
-- hook `CalculateCurrentValue`（RVA `0x03E694C8`）：type `129`/`130` 返回 0，
+- hook `Register`（RVA `0x03E497D4`）：注册前若已有同 id record，先调
+  `RemoveRecordByType`（`0x03E49398`）清 `RecordsByType`
+- hook `CalculateCurrentValue`（RVA `0x03E4DDB4`）：type `129`/`130` 返回 0，
   避免注册失败
 
 领取请求仍只带 guideId/类型，服务器独立校验；本补丁只修客户端显示与本地计数一致性。
 
 ## API 请求捕获
 
-1.1.001 的生产流量不再经过保留在包内的 `ExchangeLogger`。插件改为
+1.1.101 的生产流量不再经过保留在包内的 `ExchangeLogger`。插件改为
 hook 活跃的 `MainSceneExchangeEventListener.BeforeRequest` / 成功响应入口
-（RVA `0x03A855EC` / `0x03A856BC`），在
+（RVA `0x03A63D38` / `0x03A63E08`），在
 `Documents/jbrfz_capture.log` 记录通用 RPC 请求、响应和错误。公会接口被
 列为高价值数据，请求/响应 protobuf 同时写入 `Documents/jbrfz_capture/`。
 日志时间使用设备本地时区。

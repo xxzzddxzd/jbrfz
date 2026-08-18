@@ -1,6 +1,6 @@
 Package: com.xzd.jbrfz-bypass
 Name: JBRFZ Bypass
-Version: 0.3.31
+Version: 0.3.32
 Architecture: iphoneos-arm64
 Description: AppSealing environment compatibility patch for CookieRun: Crumble.
 Maintainer: xzd
