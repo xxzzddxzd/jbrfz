@@ -5,6 +5,7 @@
 #include <dispatch/dispatch.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
+#include <objc/runtime.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdarg.h>
@@ -109,6 +110,92 @@ extern "C" void JbrfzSetUnitySpeedEnabled(bool enabled) {
 }
 
 namespace {
+
+#if defined(JBRFZ_BUNDLE_ID_COMPAT)
+// A development-signed build may use a different install bundle identifier,
+// while AppSealing 1.14 still validates the identifier registered for the
+// original game. Keep the custom identifier in Info.plist/signing so iOS can
+// install both apps, but present the registered identifier to runtime queries
+// for the main bundle. This only changes Objective-C runtime data and does not
+// write to any executable page.
+static NSString *const kJbrfzRegisteredBundleIdentifier = @"com.devsisters.cc";
+using NSBundleIdentifierMethod = NSString *(*)(NSBundle *, SEL);
+using NSBundleInfoDictionaryMethod = NSDictionary *(*)(NSBundle *, SEL);
+using NSBundleInfoValueMethod = id (*)(NSBundle *, SEL, NSString *);
+static NSBundleIdentifierMethod gOriginalNSBundleIdentifier = nullptr;
+static NSBundleInfoDictionaryMethod gOriginalNSBundleInfoDictionary = nullptr;
+static NSBundleInfoValueMethod gOriginalNSBundleInfoValue = nullptr;
+
+static bool JbrfzIsMainBundle(NSBundle *bundle) {
+    return bundle != nil && bundle == [NSBundle mainBundle];
+}
+
+static NSString *JbrfzNSBundleIdentifier(NSBundle *bundle, SEL selector) {
+    if (JbrfzIsMainBundle(bundle)) {
+        return kJbrfzRegisteredBundleIdentifier;
+    }
+    return gOriginalNSBundleIdentifier != nullptr
+               ? gOriginalNSBundleIdentifier(bundle, selector)
+               : nil;
+}
+
+static NSDictionary *JbrfzNSBundleInfoDictionary(NSBundle *bundle,
+                                                   SEL selector) {
+    NSDictionary *original = gOriginalNSBundleInfoDictionary != nullptr
+                                 ? gOriginalNSBundleInfoDictionary(bundle,
+                                                                  selector)
+                                 : nil;
+    if (!JbrfzIsMainBundle(bundle) || original == nil) {
+        return original;
+    }
+    NSMutableDictionary *compatible = [original mutableCopy];
+    compatible[@"CFBundleIdentifier"] = kJbrfzRegisteredBundleIdentifier;
+    return compatible;
+}
+
+static id JbrfzNSBundleInfoValue(NSBundle *bundle, SEL selector,
+                                 NSString *key) {
+    if (JbrfzIsMainBundle(bundle) &&
+        [key isEqualToString:@"CFBundleIdentifier"]) {
+        return kJbrfzRegisteredBundleIdentifier;
+    }
+    return gOriginalNSBundleInfoValue != nullptr
+               ? gOriginalNSBundleInfoValue(bundle, selector, key)
+               : nil;
+}
+
+static void InstallBundleIdentityCompatibility(void) {
+    Class bundleClass = [NSBundle class];
+    Method identifier = class_getInstanceMethod(bundleClass,
+                                                 @selector(bundleIdentifier));
+    Method infoDictionary = class_getInstanceMethod(bundleClass,
+                                                     @selector(infoDictionary));
+    Method infoValue = class_getInstanceMethod(
+        bundleClass, @selector(objectForInfoDictionaryKey:));
+    if (identifier != nullptr) {
+        gOriginalNSBundleIdentifier =
+            reinterpret_cast<NSBundleIdentifierMethod>(
+                method_setImplementation(identifier,
+                                         reinterpret_cast<IMP>(
+                                             &JbrfzNSBundleIdentifier)));
+    }
+    if (infoDictionary != nullptr) {
+        gOriginalNSBundleInfoDictionary =
+            reinterpret_cast<NSBundleInfoDictionaryMethod>(
+                method_setImplementation(infoDictionary,
+                                         reinterpret_cast<IMP>(
+                                             &JbrfzNSBundleInfoDictionary)));
+    }
+    if (infoValue != nullptr) {
+        gOriginalNSBundleInfoValue = reinterpret_cast<NSBundleInfoValueMethod>(
+            method_setImplementation(infoValue,
+                                     reinterpret_cast<IMP>(
+                                         &JbrfzNSBundleInfoValue)));
+    }
+    NSLog(@"[JBRFZBypass] main bundle runtime identity -> %@",
+          kJbrfzRegisteredBundleIdentifier);
+}
+#endif
 
 static NSString *JbrfzLocalTimestamp(void) {
     const time_t now = time(nullptr);
@@ -2044,8 +2131,8 @@ static void TryHandleChocolateRoulette(void *presenter) {
         StopRouletteOvenIfActive("equipment mission claimable");
     }
 
-    const long long nowMs =
-        static_cast<long long>([[NSDate date] timeIntervalSince1970] * 1000.0);
+    const long long nowMs = static_cast<long long>(
+        [[NSDate date] timeIntervalSince1970] * 1000.0);
     if (hasClaimable) {
         if (nowMs - atomic_load(&gRouletteLastClaimMs) < 2500) {
             return;
@@ -2685,6 +2772,120 @@ static bool IsSupportedUnityFramework(const struct mach_header *header) {
     return HasExpectedUUID(header, expectedUUID);
 }
 
+#if defined(JBRFZ_STATIC_DISPATCH_HOOKS)
+// Signed static-hook layout generated by patch_arm64_static_hooks.py. Each
+// target reads its replacement pointer from writable __DATA; original
+// prologues live in signed trampolines in unused __TEXT padding. Runtime setup
+// therefore changes data pointers only and never modifies __TEXT or the
+// AppSealing worker bodies.
+enum SignedStaticHookIndex : size_t {
+    kStaticLoadingFlagSet = 0,
+    kStaticAfterResponseError,
+    kStaticAfterError,
+    kStaticGuideClick,
+    kStaticOvenCtor,
+    kStaticCookieGachaOpen,
+    kStaticPetGachaOpen,
+    kStaticInventoryOpen,
+    kStaticInventoryItemInfoOpen,
+    kStaticRouletteRefresh,
+    kStaticSugarRuneOpen,
+    kStaticStellarLinkOpen,
+    kStaticCrumbleDungeonOpen,
+    kStaticDailyDungeonOpen,
+    kStaticArenaLobbyOpen,
+    kStaticArenaPreparationOpen,
+    kStaticRequirementRegister,
+    kStaticRequirementCalculate,
+    kStaticGuideProgress,
+    kStaticGuideUpdateUI,
+    kSignedStaticHookCount,
+};
+
+static constexpr uintptr_t kSignedStaticSlotTableRVA = 0x0F2AF000;
+static constexpr uintptr_t SignedStaticTrampolineRVA(size_t index) {
+    return 0x0DEF4200 + index * 24;
+}
+
+static void InstallSignedStaticDispatchHooks(
+    const struct mach_header *header) {
+    const uintptr_t base = reinterpret_cast<uintptr_t>(header);
+    const uintptr_t replacements[kSignedStaticHookCount] = {
+        reinterpret_cast<uintptr_t>(&HookedLoadingFlagSet),
+        reinterpret_cast<uintptr_t>(&HookedAfterResponseRpcException),
+        reinterpret_cast<uintptr_t>(&HookedAfterError),
+        reinterpret_cast<uintptr_t>(&HookedHandleOnGuideUIClick),
+        reinterpret_cast<uintptr_t>(&HookedOvenAutoDrawCtor),
+        reinterpret_cast<uintptr_t>(&HookedCookieGachaOnPageOpen),
+        reinterpret_cast<uintptr_t>(&HookedPetGachaOnPageOpen),
+        reinterpret_cast<uintptr_t>(&HookedInventoryOnPopupOpen),
+        reinterpret_cast<uintptr_t>(&HookedInventoryItemInfoOnPopupOpen),
+        reinterpret_cast<uintptr_t>(&HookedRouletteRefreshView),
+        reinterpret_cast<uintptr_t>(&HookedSugarRuneOnPopupOpen),
+        reinterpret_cast<uintptr_t>(&HookedStellarLinkOnPageOpen),
+        reinterpret_cast<uintptr_t>(&HookedCrumbleDungeonOnPageOpen),
+        reinterpret_cast<uintptr_t>(&HookedDailyDungeonOnPageOpen),
+        reinterpret_cast<uintptr_t>(&HookedArenaLobbyOnPageOpen),
+        reinterpret_cast<uintptr_t>(&HookedArenaPreparationOnPageOpen),
+        reinterpret_cast<uintptr_t>(&HookedRequirementRegister),
+        reinterpret_cast<uintptr_t>(&HookedCalculateCurrentValue),
+        reinterpret_cast<uintptr_t>(&HookedHandleOnProgressUpdated),
+        reinterpret_cast<uintptr_t>(&HookedUpdateUI),
+    };
+
+    auto *slots = reinterpret_cast<uintptr_t *>(
+        base + kSignedStaticSlotTableRVA);
+    for (size_t index = 0; index < kSignedStaticHookCount; ++index) {
+        __atomic_store_n(&slots[index], replacements[index], __ATOMIC_RELEASE);
+    }
+
+    gOriginalLoadingFlagSet = reinterpret_cast<LoadingSetMethod>(
+        base + SignedStaticTrampolineRVA(kStaticLoadingFlagSet));
+    gOriginalAfterResponseError = reinterpret_cast<void *>(
+        base + SignedStaticTrampolineRVA(kStaticAfterResponseError));
+    gOriginalAfterError = reinterpret_cast<void *>(
+        base + SignedStaticTrampolineRVA(kStaticAfterError));
+    gOriginalHandleOnGuideUIClick = reinterpret_cast<GuideClickMethod>(
+        base + SignedStaticTrampolineRVA(kStaticGuideClick));
+    gOriginalOvenAutoDrawCtor = reinterpret_cast<OvenCtorMethod>(
+        base + SignedStaticTrampolineRVA(kStaticOvenCtor));
+    gOriginalCookieGachaOnPageOpen = reinterpret_cast<PageOpenMethod>(
+        base + SignedStaticTrampolineRVA(kStaticCookieGachaOpen));
+    gOriginalPetGachaOnPageOpen = reinterpret_cast<PageOpenMethod>(
+        base + SignedStaticTrampolineRVA(kStaticPetGachaOpen));
+    gOriginalInventoryOnPopupOpen = reinterpret_cast<PageOpenMethod>(
+        base + SignedStaticTrampolineRVA(kStaticInventoryOpen));
+    gOriginalInventoryItemInfoOnPopupOpen = reinterpret_cast<PageOpenMethod>(
+        base + SignedStaticTrampolineRVA(kStaticInventoryItemInfoOpen));
+    gOriginalRouletteRefreshView = reinterpret_cast<PageOpenMethod>(
+        base + SignedStaticTrampolineRVA(kStaticRouletteRefresh));
+    gOriginalSugarRuneOnPopupOpen = reinterpret_cast<PageOpenMethod>(
+        base + SignedStaticTrampolineRVA(kStaticSugarRuneOpen));
+    gOriginalStellarLinkOnPageOpen = reinterpret_cast<PageOpenMethod>(
+        base + SignedStaticTrampolineRVA(kStaticStellarLinkOpen));
+    gOriginalCrumbleDungeonOnPageOpen = reinterpret_cast<PageOpenMethod>(
+        base + SignedStaticTrampolineRVA(kStaticCrumbleDungeonOpen));
+    gOriginalDailyDungeonOnPageOpen = reinterpret_cast<PageOpenMethod>(
+        base + SignedStaticTrampolineRVA(kStaticDailyDungeonOpen));
+    gOriginalArenaLobbyOnPageOpen = reinterpret_cast<PageOpenMethod>(
+        base + SignedStaticTrampolineRVA(kStaticArenaLobbyOpen));
+    gOriginalArenaPreparationOnPageOpen = reinterpret_cast<PageOpenMethod>(
+        base + SignedStaticTrampolineRVA(kStaticArenaPreparationOpen));
+    gOriginalRequirementRegister = reinterpret_cast<RequirementRegisterMethod>(
+        base + SignedStaticTrampolineRVA(kStaticRequirementRegister));
+    gOriginalCalculateCurrentValue =
+        reinterpret_cast<RequirementCalculateCurrentValueMethod>(
+            base + SignedStaticTrampolineRVA(kStaticRequirementCalculate));
+    gOriginalHandleOnProgressUpdated = reinterpret_cast<ProgressUpdatedMethod>(
+        base + SignedStaticTrampolineRVA(kStaticGuideProgress));
+    gOriginalUpdateUI = reinterpret_cast<UpdateUIMethod>(
+        base + SignedStaticTrampolineRVA(kStaticGuideUpdateUI));
+
+    JbrfzLog(@"[JBRFZBypass] Signed static dispatch hooks armed (%zu)",
+             static_cast<size_t>(kSignedStaticHookCount));
+}
+#endif
+
 static void InstallManagedFallbackHooks(const struct mach_header *header) {
     if (!IsSupportedUnityFramework(header)) {
         JbrfzLog(@"[JBRFZBypass] Unknown UnityFramework build; "
@@ -2721,6 +2922,11 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
     // AdService.get_IsRemovedAd, ShowRewardedAsync, red-dot updaters,
     // stage random reward claim UI, and package shop cells.
     static constexpr uintptr_t isAdRemoveActiveRVA = 0x03DD44A0;
+#if defined(JBRFZ_STATIC_AD_PATCH)
+    JbrfzLog(@"[JBRFZBypass] Ad-remove boost uses signed static patch "
+              "(IsAdRemoveActive @ 0x%lx)",
+              static_cast<unsigned long>(isAdRemoveActiveRVA));
+#else
     MSHookFunction(
         reinterpret_cast<void *>(base + isAdRemoveActiveRVA),
         reinterpret_cast<void *>(&ReturnAdRemoveActive),
@@ -2729,6 +2935,7 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
     JbrfzLog(@"[JBRFZBypass] Ad-remove boost forced active "
           "(IsAdRemoveActive @ 0x%lx)",
           static_cast<unsigned long>(isAdRemoveActiveRVA));
+#endif
 
     // Needed early so RPC-error loading dismiss can resolve Unset RVA.
     atomic_store(&gUnityBaseForGuide, base);
@@ -3062,8 +3269,18 @@ static void InstallAppSealingHooks(const struct mach_header *header,
 #if defined(JBRFZ_NO_INLINE_HOOKS)
     atomic_store(&gUnityFrameworkBase,
                  reinterpret_cast<uintptr_t>(header));
+#if defined(JBRFZ_STATIC_DISPATCH_HOOKS)
+    bool staticHooksExpected = false;
+    if (atomic_compare_exchange_strong(&gInstalled, &staticHooksExpected,
+                                       true)) {
+        atomic_store(&gUnityBaseForGuide,
+                     reinterpret_cast<uintptr_t>(header));
+        InstallSignedStaticDispatchHooks(header);
+    }
+#endif
     ScheduleNormalState();
-    JbrfzLog(@"[JBRFZBypass] iOS safe mode active; inline hooks skipped");
+    JbrfzLog(@"[JBRFZBypass] iOS signed static mode active; "
+             @"runtime inline hooks skipped");
     dlclose(image);
     return;
 #endif
@@ -3103,6 +3320,9 @@ static void InstallAppSealingHooks(const struct mach_header *header,
 __attribute__((constructor))
 static void JBRFZBypassInitialize(void) {
     @autoreleasepool {
+#if defined(JBRFZ_BUNDLE_ID_COMPAT)
+        InstallBundleIdentityCompatibility();
+#endif
         JbrfzLog(@"[JBRFZBypass] dylib loaded home=%@ version=0.3.31 auto=%d",
                  NSHomeDirectory() ?: @"(nil)",
                  JbrfzAutoFeaturesEnabled() ? 1 : 0);

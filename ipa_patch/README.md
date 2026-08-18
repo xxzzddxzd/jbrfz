@@ -7,8 +7,10 @@
 包含的 1.1.001 固定补丁：
 
 - AppSealing 环境检查兼容与状态修复；
-- 打包时静态关闭主程序及 UnityFramework 的 20 个保护线程入口；
-- 免广告路径、RPC 错误 loading 修复；
+- 打包时静态关闭主程序及 UnityFramework 的 20 个保护线程入口、4 个托管
+  AppSealing 例程；自定义 Bundle ID 构建仅把四处“未注册包名”状态写入重定向到
+  已注册包名的状态 0 路径，并让主 Bundle 的 Objective-C 运行时查询返回游戏注册标识；
+- 签名前静态固定免广告判断为开启；RPC 错误 loading 修复；
 - 任务自动领取、烤箱/十连/宝箱动作及需求记录修复；
 - 浮动面板；
 - 内置 `MarketplaceKit.AppDistributor` 兼容框架，避免 1.1.001 广告 SDK 在
@@ -34,10 +36,11 @@ MOBILEPROVISION=/absolute/path/profile.mobileprovision \
 Bundle ID。构建会校验游戏版本、外部 Hook 依赖以及请求采集特征串。
 
 iOS 27 等会对运行时改写签名代码页执行严格复核的系统，可设置
-`IOS_SAFE_MODE=1`。该模式不安装 Dobby 内联 Hook，避免系统以
-`codesigning/invalid-page` 终止进程；静态保护补丁、浮动面板和不依赖内联
-Hook 的功能仍会打包。面板会明确标注安全模式并禁用自动功能开关；Unity 倍速
-仍可使用。
+`IOS_SAFE_MODE=1`。该模式在签名前为自动任务、错误处理及免广告安装静态跳板，
+不安装 Dobby 内联 Hook，避免系统以 `codesigning/invalid-page` 终止进程。自动
+功能开关、浮动面板和 Unity 倍速均可使用。真机模式默认保留系统 MarketplaceKit；
+PlayCover/macOS 构建仍默认使用本地兼容框架，也可通过 `MARKETPLACE_STUB=0/1`
+显式选择。
 
 ## 通行证 UI 诊断补丁
 

@@ -88,7 +88,8 @@ static void JbrfzLoadAutoFeaturesDefault(void) {
 }
 
 bool JbrfzAutoFeaturesEnabled(void) {
-#if defined(JBRFZ_NO_INLINE_HOOKS)
+#if defined(JBRFZ_NO_INLINE_HOOKS) && \
+    !defined(JBRFZ_STATIC_DISPATCH_HOOKS)
     return false;
 #else
     JbrfzLoadAutoFeaturesDefault();
@@ -125,7 +126,8 @@ static void JbrfzSetUnitySpeedPreference(bool enabled) {
 }
 
 static void JbrfzSetAutoFeaturesEnabled(bool enabled, bool persist) {
-#if defined(JBRFZ_NO_INLINE_HOOKS)
+#if defined(JBRFZ_NO_INLINE_HOOKS) && \
+    !defined(JBRFZ_STATIC_DISPATCH_HOOKS)
     (void)enabled;
     (void)persist;
     gAutoFeaturesEnabled = false;
@@ -474,7 +476,9 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
 
     UILabel *autoLabel =
         [[UILabel alloc] initWithFrame:CGRectMake(18, 58, 210, 28)];
-#if defined(JBRFZ_NO_INLINE_HOOKS)
+#if defined(JBRFZ_STATIC_DISPATCH_HOOKS)
+    autoLabel.text = @"启用自动功能（静态签名）";
+#elif defined(JBRFZ_NO_INLINE_HOOKS)
     autoLabel.text = @"自动功能（安全模式不可用）";
 #else
     autoLabel.text = @"启用自动功能";
@@ -485,7 +489,10 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
 
     UILabel *autoDetail =
         [[UILabel alloc] initWithFrame:CGRectMake(18, 88, 230, 54)];
-#if defined(JBRFZ_NO_INLINE_HOOKS)
+#if defined(JBRFZ_STATIC_DISPATCH_HOOKS)
+    autoDetail.text = @"自动功能使用签名前静态跳板，不在运行时修改游戏代码页。\n"
+                      @"新手号请保持关闭。";
+#elif defined(JBRFZ_NO_INLINE_HOOKS)
     autoDetail.text = @"iOS 27 会拦截运行时内联 Hook，当前仅启用可安全运行的功能。";
 #else
     autoDetail.text = @"仅自动执行序列任务；活动任务始终保持手动。\n"
@@ -498,7 +505,8 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
 
     UISwitch *autoSwitch = [[UISwitch alloc] initWithFrame:CGRectZero];
     autoSwitch.on = JbrfzAutoFeaturesEnabled();
-#if defined(JBRFZ_NO_INLINE_HOOKS)
+#if defined(JBRFZ_NO_INLINE_HOOKS) && \
+    !defined(JBRFZ_STATIC_DISPATCH_HOOKS)
     autoSwitch.enabled = NO;
 #endif
     autoSwitch.onTintColor =
@@ -844,7 +852,12 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
     const bool speedEnabled = JbrfzUnitySpeedEnabled();
     self.autoSwitch.on = enabled;
     self.speedSwitch.on = speedEnabled;
-#if defined(JBRFZ_NO_INLINE_HOOKS)
+#if defined(JBRFZ_STATIC_DISPATCH_HOOKS)
+    self.statusLabel.text = [NSString
+        stringWithFormat:@"状态：静态自动%@；Unity %@",
+                         enabled ? @"开启" : @"关闭",
+                         speedEnabled ? @"3×" : @"1×"];
+#elif defined(JBRFZ_NO_INLINE_HOOKS)
     self.statusLabel.text = [NSString
         stringWithFormat:@"状态：iOS 安全模式；Unity %@",
                          speedEnabled ? @"3×" : @"1×"];

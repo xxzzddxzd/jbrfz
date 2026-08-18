@@ -9,6 +9,14 @@ UNITY_BINARY="${UNITY_BINARY:-$REPO_ROOT/11001/UnityFramework}"
 OUTPUT_IPA="${OUTPUT_IPA:-$SCRIPT_DIR/dist/CookieRunCrumble-1.1.001-JBRFZ.ipa}"
 BUNDLE_ID_OVERRIDE="${BUNDLE_ID:-}"
 IOS_SAFE_MODE="${IOS_SAFE_MODE:-0}"
+MARKETPLACE_STUB="${MARKETPLACE_STUB:-}"
+if [[ -z "$MARKETPLACE_STUB" ]]; then
+    if [[ "$IOS_SAFE_MODE" == "1" ]]; then
+        MARKETPLACE_STUB=0
+    else
+        MARKETPLACE_STUB=1
+    fi
+fi
 PATCH_INSTALL_NAME="@executable_path/Frameworks/JBRFZPatch.dylib"
 MARKETPLACE_SYSTEM_PATH="/System/Library/Frameworks/MarketplaceKit.framework/MarketplaceKit"
 MARKETPLACE_INSTALL_NAME="@rpath/MarketplaceKit.framework/MarketplaceKit"
@@ -74,7 +82,13 @@ SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
 CLANGXX="$(xcrun --sdk iphoneos --find clang++)"
 PATCH_DEFINES=("-DJBRFZ_INLINE_HOOKS=1")
 if [[ "$IOS_SAFE_MODE" == "1" ]]; then
-    PATCH_DEFINES=("-DJBRFZ_NO_INLINE_HOOKS=1")
+    PATCH_DEFINES=(
+        "-DJBRFZ_NO_INLINE_HOOKS=1"
+        "-DJBRFZ_STATIC_DISPATCH_HOOKS=1"
+    )
+fi
+if [[ "$TARGET_BUNDLE_ID" != "$SOURCE_BUNDLE_ID" ]]; then
+    PATCH_DEFINES+=("-DJBRFZ_BUNDLE_ID_COMPAT=1")
 fi
 "$CLANGXX" \
     -arch arm64 \
@@ -85,6 +99,7 @@ fi
     -fvisibility=hidden \
     -DJBRFZ_EMBEDDED=1 \
     -DJBRFZ_NO_CAPTURE=1 \
+    -DJBRFZ_STATIC_AD_PATCH=1 \
     "${PATCH_DEFINES[@]}" \
     -I"$REPO_ROOT/JBRFZBypass" \
     -dynamiclib \
@@ -107,30 +122,32 @@ if strings "$PATCH_DYLIB" | grep -Eq 'jbrfz_capture|REQ-RAW|GUEST_SECRET|LOGIN_M
     exit 3
 fi
 
-# The 1.1.001 ad SDK resolves MarketplaceKit.AppDistributor even when its weak
-# system framework is unavailable under PlayCover. Build the exact Swift API
-# surface used by the SDK and make this one dependency bundle-local.
-mkdir -p "$MARKETPLACE_FRAMEWORK/Modules/MarketplaceKit.swiftmodule"
-xcrun --sdk iphoneos swiftc \
-    -target arm64-apple-ios15.0 \
-    -parse-as-library \
-    -emit-library \
-    -emit-module \
-    -emit-module-path "$MARKETPLACE_FRAMEWORK/Modules/MarketplaceKit.swiftmodule/arm64-apple-ios.swiftmodule" \
-    -module-name MarketplaceKit \
-    -enable-library-evolution \
-    -Xlinker -install_name \
-    -Xlinker "$MARKETPLACE_INSTALL_NAME" \
-    "$SCRIPT_DIR/MarketplaceKitStub.swift" \
-    -o "$MARKETPLACE_BINARY"
-/usr/libexec/PlistBuddy -c 'Add :CFBundleExecutable string MarketplaceKit' "$MARKETPLACE_FRAMEWORK/Info.plist"
-/usr/libexec/PlistBuddy -c 'Add :CFBundleIdentifier string com.xzd.jbrfz.marketplacekit' "$MARKETPLACE_FRAMEWORK/Info.plist"
-/usr/libexec/PlistBuddy -c 'Add :CFBundleInfoDictionaryVersion string 6.0' "$MARKETPLACE_FRAMEWORK/Info.plist"
-/usr/libexec/PlistBuddy -c 'Add :CFBundleName string MarketplaceKit' "$MARKETPLACE_FRAMEWORK/Info.plist"
-/usr/libexec/PlistBuddy -c 'Add :CFBundlePackageType string FMWK' "$MARKETPLACE_FRAMEWORK/Info.plist"
-/usr/libexec/PlistBuddy -c 'Add :CFBundleShortVersionString string 1.0' "$MARKETPLACE_FRAMEWORK/Info.plist"
-/usr/libexec/PlistBuddy -c 'Add :CFBundleVersion string 1' "$MARKETPLACE_FRAMEWORK/Info.plist"
-/usr/libexec/PlistBuddy -c 'Add :MinimumOSVersion string 15.0' "$MARKETPLACE_FRAMEWORK/Info.plist"
+if [[ "$MARKETPLACE_STUB" == "1" ]]; then
+    # PlayCover/macOS does not provide the iOS MarketplaceKit framework used by
+    # the bundled ad SDK. A real iOS device must keep the system weak link: the
+    # local Swift stand-in is not pointer-authentication compatible with iOS 27.
+    mkdir -p "$MARKETPLACE_FRAMEWORK/Modules/MarketplaceKit.swiftmodule"
+    xcrun --sdk iphoneos swiftc \
+        -target arm64-apple-ios15.0 \
+        -parse-as-library \
+        -emit-library \
+        -emit-module \
+        -emit-module-path "$MARKETPLACE_FRAMEWORK/Modules/MarketplaceKit.swiftmodule/arm64-apple-ios.swiftmodule" \
+        -module-name MarketplaceKit \
+        -enable-library-evolution \
+        -Xlinker -install_name \
+        -Xlinker "$MARKETPLACE_INSTALL_NAME" \
+        "$SCRIPT_DIR/MarketplaceKitStub.swift" \
+        -o "$MARKETPLACE_BINARY"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleExecutable string MarketplaceKit' "$MARKETPLACE_FRAMEWORK/Info.plist"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleIdentifier string com.xzd.jbrfz.marketplacekit' "$MARKETPLACE_FRAMEWORK/Info.plist"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleInfoDictionaryVersion string 6.0' "$MARKETPLACE_FRAMEWORK/Info.plist"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleName string MarketplaceKit' "$MARKETPLACE_FRAMEWORK/Info.plist"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundlePackageType string FMWK' "$MARKETPLACE_FRAMEWORK/Info.plist"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleShortVersionString string 1.0' "$MARKETPLACE_FRAMEWORK/Info.plist"
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleVersion string 1' "$MARKETPLACE_FRAMEWORK/Info.plist"
+    /usr/libexec/PlistBuddy -c 'Add :MinimumOSVersion string 15.0' "$MARKETPLACE_FRAMEWORK/Info.plist"
+fi
 
 cp "$MAIN_BINARY" "$APP_MAIN"
 cp "$UNITY_BINARY" "$APP_UNITY"
@@ -146,17 +163,47 @@ python3 "$SCRIPT_DIR/patch_arm64_rvas.py" "$APP_MAIN" \
 python3 "$SCRIPT_DIR/patch_arm64_rvas.py" "$APP_UNITY" \
     0x000F0028 0x000F00F4 0x000F0250 0x000F0274 0x000F0450 \
     0x000F0548 0x000F06D8 0x000F0838 0x000F0934 0x000F0958
-python3 "$SCRIPT_DIR/redirect_weak_dylib.py" "$APP_UNITY" \
-    "$MARKETPLACE_SYSTEM_PATH" "$MARKETPLACE_INSTALL_NAME"
+if [[ "$IOS_SAFE_MODE" == "1" ]]; then
+    if [[ "$TARGET_BUNDLE_ID" != "$SOURCE_BUNDLE_ID" ]]; then
+        # AppSealing 1.14 compares the native main-bundle identifier before
+        # our injected dylib is initialized. For both identifier lookup
+        # failure and exhausted comparison retries, enter the exact state-zero
+        # path used by a successful comparison instead of storing state 3.
+        python3 "$SCRIPT_DIR/patch_arm64_rvas.py" --branch-to 0x00096FB8 \
+            "$APP_MAIN" \
+            0x00096D30 0x00096FFC
+        python3 "$SCRIPT_DIR/patch_arm64_rvas.py" --branch-to 0x00103BC0 \
+            "$APP_UNITY" \
+            0x00103938 0x00103C04
+    fi
+    # These three exported checks previously required Dobby. Their signed
+    # static return stubs and all managed hook bridges are installed before
+    # the nested framework and app signatures are generated.
+    python3 "$SCRIPT_DIR/patch_arm64_rvas.py" --return-false "$APP_UNITY" \
+        0x00083B20 0x000843A8 0x00084538
+    # Managed AppSealing wrappers previously redirected to
+    # ReturnWithoutAction by Dobby. The signed build can replace them directly.
+    python3 "$SCRIPT_DIR/patch_arm64_rvas.py" "$APP_UNITY" \
+        0x03A400CC 0x03A401C4 0x03A40290 0x03A40AB8
+    python3 "$SCRIPT_DIR/patch_arm64_static_hooks.py" "$APP_UNITY"
+fi
+# Crumble.AdRemoveGameBoostCalculator.IsAdRemoveActive. This is patched on
+# disk, before signing, so stock iOS never has to modify a signed __TEXT page.
+python3 "$SCRIPT_DIR/patch_arm64_rvas.py" --return-true "$APP_UNITY" \
+    0x03DD44A0
+if [[ "$MARKETPLACE_STUB" == "1" ]]; then
+    python3 "$SCRIPT_DIR/redirect_weak_dylib.py" "$APP_UNITY" \
+        "$MARKETPLACE_SYSTEM_PATH" "$MARKETPLACE_INSTALL_NAME"
+fi
 python3 "$SCRIPT_DIR/inject_load_dylib.py" "$APP_MAIN" "$PATCH_INSTALL_NAME"
 
 /usr/libexec/PlistBuddy -c 'Delete :JBRFZPatch' "$APP_DIR/Info.plist" 2>/dev/null || true
 if [[ "$IOS_SAFE_MODE" == "1" ]]; then
-    PATCH_TAG='1.1.001-embedded-ios-safe-no-capture-speed3x-marketplace-compat'
-    PATCH_SUMMARY='静态保护补丁 + 浮动面板 + Unity 3× + MarketplaceKit Mac 兼容；内联自动功能已禁用；不含请求记录'
+    PATCH_TAG='1.1.001-embedded-ios-signed-static-auto-ad-no-capture-speed3x'
+    PATCH_SUMMARY='静态保护/免广告/自动功能 + 浮动面板 + Unity 3×；无运行时内联 Hook；不含请求记录'
 else
-    PATCH_TAG='1.1.001-embedded-no-capture-speed3x-icall-marketplace-compat'
-    PATCH_SUMMARY='面板/兼容/自动功能 + Unity 3× + MarketplaceKit Mac 兼容；不含请求记录'
+    PATCH_TAG='1.1.001-embedded-static-ad-no-capture-speed3x-icall-marketplace-compat'
+    PATCH_SUMMARY='静态免广告 + 面板/兼容/自动功能 + Unity 3× + MarketplaceKit Mac 兼容；不含请求记录'
 fi
 /usr/libexec/PlistBuddy -c "Add :JBRFZPatch string $PATCH_TAG" "$APP_DIR/Info.plist"
 rm -rf "$APP_DIR/_CodeSignature"
@@ -207,4 +254,5 @@ echo "版本：$VERSION ($BUILD)"
 echo "Bundle ID：$TARGET_BUNDLE_ID"
 echo "签名：$SIGNING_MODE"
 echo "iOS 安全模式：$IOS_SAFE_MODE"
+echo "MarketplaceKit 本地兼容：$MARKETPLACE_STUB"
 echo "补丁：$PATCH_SUMMARY"
