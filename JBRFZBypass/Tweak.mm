@@ -195,6 +195,14 @@ using ProgressUpdatedMethod = void (*)(void *self,
 using UpdateUIMethod = void (*)(void *self, void *methodInfo);
 using RecordBoolMethod = bool (*)(void *self, void *methodInfo);
 using GuideClickMethod = void (*)(void *self, void *methodInfo);
+struct ManagedUniTask {
+    uintptr_t source;
+    uintptr_t token;
+};
+using GuideClaimAsyncMethod =
+    ManagedUniTask (*)(void *self, void *methodInfo);
+using UniTaskForgetMethod =
+    void (*)(ManagedUniTask task, void *methodInfo);
 using LoadingSetMethod = void *(*)(void *self, void *key, void *methodInfo);
 using LoadingUnsetMethod = void (*)(void *self, void *key, void *methodInfo);
 static GuideClickMethod gOriginalHandleOnGuideUIClick = nullptr;
@@ -310,6 +318,7 @@ static PageOpenMethod gOriginalCookieGachaOnPageOpen = nullptr;
 static PageOpenMethod gOriginalPetGachaOnPageOpen = nullptr;
 static PageOpenMethod gOriginalInventoryOnPopupOpen = nullptr;
 static PageOpenMethod gOriginalInventoryItemInfoOnPopupOpen = nullptr;
+#if defined(JBRFZ_STATIC_DISPATCH_HOOKS)
 static PageOpenMethod gOriginalRouletteRefreshView = nullptr;
 static PageOpenMethod gOriginalRouletteBecameHidden = nullptr;
 static PageOpenMethod gOriginalSugarRuneOnPopupOpen = nullptr;
@@ -318,6 +327,7 @@ static PageOpenMethod gOriginalCrumbleDungeonOnPageOpen = nullptr;
 static PageOpenMethod gOriginalDailyDungeonOnPageOpen = nullptr;
 static PageOpenMethod gOriginalArenaLobbyOnPageOpen = nullptr;
 static PageOpenMethod gOriginalArenaPreparationOnPageOpen = nullptr;
+#endif
 static atomic_uintptr_t gUnityBaseForGuide = 0;
 static atomic_uintptr_t gOvenAutoDrawService = 0;
 static atomic_uintptr_t gCookieGachaPresenter = 0;
@@ -329,10 +339,15 @@ static atomic_uintptr_t gGuidePresenter = 0;
 static atomic_bool gPendingUseRandomRewardBox = false;
 // Bumped to invalidate delayed auto-action blocks (manual ops / guide switch).
 static atomic_int gAutoActionGeneration = 0;
-static atomic_int gLastSkipClaimGuideId = 0;
+static atomic_int gPeriodicClaimGuideId = 0;
+static atomic_int gPeriodicClaimGeneration = 0;
+static atomic_llong gPeriodicClaimLastAttemptMs = 0;
+static atomic_llong gPeriodicClaimNextDueMs = 0;
 
-// "巧克力巨大滴露转盘" daily-mission automation. The presenter and
-// shortcut opener are captured only while this event's mission popup is alive.
+#if defined(JBRFZ_STATIC_DISPATCH_HOOKS)
+// Legacy IPA-only activity automation. The Theos iOS plugin deliberately does
+// not compile or register these hooks; its auto switch controls guide sequence
+// tasks only.
 static atomic_uintptr_t gRouletteMissionPresenter = 0;
 static atomic_uintptr_t gRouletteShortcutOpener = 0;
 static atomic_int gRoulettePendingMissionId = 0;
@@ -349,6 +364,7 @@ static atomic_llong gRouletteLastClaimMs = 0;
 static void ScheduleRouletteReopen(const char *reason);
 static void ScheduleRouletteDestinationAction(void *presenter,
                                                int shortcutType);
+#endif
 
 static int ReturnNormalEnvironment(void) {
     return 0;
@@ -1129,14 +1145,14 @@ static constexpr int kReqRandomRewardItemUsedFromNow = 129; // 背包使用宝�
 // Cookie/Pet gacha purchase button index: 0=单抽, 1=十连, 2=30连.
 static constexpr int kGachaTenPullButtonIndex = 1;
 
-// Only the repeating "kill 2000 monsters" guide is excluded from auto-claim.
-// Progressive monster-kill tasks (e.g. kill 30) must still auto-claim.
-// Match by target 2000 + monster-kill requirement family, not all MonsterKill.
-static bool IsAutoClaimExcluded(int requirementType, int64_t target) {
+// The repeating "kill 2000 monsters" guide is never auto-played. Its reward
+// endpoint is probed once per minute because the client-side completion flag
+// can lag behind the server. Progressive monster-kill guides remain normal.
+static bool IsPeriodicClaimGuide(int requirementType, int64_t target) {
     const bool isMonsterKill =
         requirementType == kReqMonsterKillFromNow ||
         requirementType == kReqRepeatGuideStageMonsterKillFromNow;
-    return isMonsterKill && target >= 2000;
+    return isMonsterKill && target == 2000;
 }
 
 // ---------------------------------------------------------------------------
@@ -1190,15 +1206,7 @@ static bool HookedRequirementRegister(void *self, unsigned int id,
     if (gOriginalRequirementRegister == nullptr) {
         return false;
     }
-    const bool registered = gOriginalRequirementRegister(self, id, values);
-    if (registered && atomic_load(&gRoulettePendingMissionId) != 0 &&
-        JbrfzAutoFeaturesEnabled()) {
-        // Destination actions update the requirement set outside the roulette
-        // popup. Reopen that event after the transaction settles so the next
-        // incomplete mission (or its reward) can be processed automatically.
-        ScheduleRouletteReopen("requirement-updated");
-    }
-    return registered;
+    return gOriginalRequirementRegister(self, id, values);
 }
 
 static int64_t HookedCalculateCurrentValue(void *self, int64_t type,
@@ -1263,6 +1271,7 @@ static void CancelPendingAutoActions(const char *reason) {
                  reason ? reason : "unknown");
     }
     atomic_store(&gPendingUseRandomRewardBox, false);
+#if defined(JBRFZ_STATIC_DISPATCH_HOOKS)
     if (atomic_exchange(&gRoulettePendingMissionId, 0) != 0) {
         JbrfzLog(@"[JBRFZBypass] Cancel roulette mission chain (%s)",
                  reason ? reason : "unknown");
@@ -1272,11 +1281,17 @@ static void CancelPendingAutoActions(const char *reason) {
     atomic_store(&gRoulettePendingTarget, 0);
     atomic_fetch_add(&gRouletteActionGeneration, 1);
     atomic_store(&gRouletteReopenScheduled, false);
+#endif
     BumpAutoActionGeneration();
 }
 
 static void JbrfzCancelAutoActionsImpl(const char *reason) {
     CancelPendingAutoActions(reason ? reason : "panel");
+    if (atomic_exchange(&gPeriodicClaimGuideId, 0) != 0) {
+        atomic_fetch_add(&gPeriodicClaimGeneration, 1);
+    }
+    atomic_store(&gPeriodicClaimLastAttemptMs, 0);
+    atomic_store(&gPeriodicClaimNextDueMs, 0);
 }
 
 static int gJbrfzCancelBridgeInit = []() {
@@ -1362,7 +1377,6 @@ static void HookedCookieGachaOnPageOpen(void *self, void *methodInfo) {
         atomic_store(&gCookieGachaPresenter,
                      reinterpret_cast<uintptr_t>(self));
         JbrfzLog(@"[JBRFZBypass] Captured CookieGachaPresenter %p", self);
-        ScheduleRouletteDestinationAction(self, /*ShowCookieGacha=*/5);
     }
 }
 
@@ -1374,7 +1388,6 @@ static void HookedPetGachaOnPageOpen(void *self, void *methodInfo) {
         atomic_store(&gPetGachaPresenter,
                      reinterpret_cast<uintptr_t>(self));
         JbrfzLog(@"[JBRFZBypass] Captured PetGachaPresenter %p", self);
-        ScheduleRouletteDestinationAction(self, /*ShowPetGacha=*/6);
     }
 }
 
@@ -1631,8 +1644,9 @@ static void StartOvenAutoDraw(void *service, uintptr_t base) {
     JbrfzLog(@"[JBRFZBypass] Oven StartAuto nonstop preset=%d", preset);
 }
 
+#if defined(JBRFZ_STATIC_DISPATCH_HOOKS)
 // ---------------------------------------------------------------------------
-// Chocolate giant-drop roulette daily missions
+// Legacy IPA-only Chocolate giant-drop roulette daily missions
 // ---------------------------------------------------------------------------
 // EventInfo 1958922653 (patch resource game-data-185237-02fbe8).
 // Mission cells are CommonMissionCellData structs stored inline in
@@ -2164,6 +2178,7 @@ static void HookedRouletteBecameHidden(void *self, void *methodInfo) {
     uintptr_t expected = reinterpret_cast<uintptr_t>(self);
     atomic_compare_exchange_strong(&gRouletteMissionPresenter, &expected, 0);
 }
+#endif
 
 static void RunOvenStartAutoAction(void *presenter, uintptr_t base, int guideId,
                                    int64_t current, int64_t target) {
@@ -2270,6 +2285,76 @@ static void RunPetGachaTenPullAction(void *presenter, uintptr_t base,
         });
 }
 
+static void TryHandleCurrentGuide(void *presenter);
+
+static long long CurrentGuideTimeMs() {
+    return static_cast<long long>(
+        [[NSDate date] timeIntervalSince1970] * 1000.0);
+}
+
+static void SchedulePeriodicGuideClaim(void *presenter, int guideId,
+                                       int generation, long long delayMs) {
+    const long long dueMs = CurrentGuideTimeMs() +
+                            (delayMs > 0 ? delayMs : 1);
+    long long expectedDue = 0;
+    if (!atomic_compare_exchange_strong(&gPeriodicClaimNextDueMs,
+                                        &expectedDue, dueMs)) {
+        return;
+    }
+
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW,
+                      (delayMs > 0 ? delayMs : 1) * NSEC_PER_MSEC),
+        dispatch_get_main_queue(), ^{
+          long long scheduledDue = dueMs;
+          if (!atomic_compare_exchange_strong(&gPeriodicClaimNextDueMs,
+                                              &scheduledDue, 0)) {
+              return;
+          }
+          if (!JbrfzAutoFeaturesEnabled() ||
+              atomic_load(&gPeriodicClaimGeneration) != generation ||
+              atomic_load(&gPeriodicClaimGuideId) != guideId ||
+              atomic_load(&gGuidePresenter) !=
+                  reinterpret_cast<uintptr_t>(presenter)) {
+              return;
+          }
+
+          TryHandleCurrentGuide(presenter);
+
+          // A transient presenter wait must not terminate the minute timer.
+          // A normal attempt schedules its own next tick first, making this
+          // fallback a no-op when the claim method was reached.
+          if (JbrfzAutoFeaturesEnabled() &&
+              atomic_load(&gPeriodicClaimGeneration) == generation &&
+              atomic_load(&gPeriodicClaimGuideId) == guideId) {
+              SchedulePeriodicGuideClaim(presenter, guideId, generation,
+                                         60 * 1000);
+          }
+        });
+}
+
+static void AttemptPeriodicGuideClaim(void *presenter, uintptr_t base,
+                                      int guideId, int64_t current,
+                                      int64_t target) {
+    static constexpr uintptr_t claimGuideRewardAsyncRVA = 0x0426BB54;
+    static constexpr uintptr_t uniTaskForgetRVA = 0x0B5062A4;
+
+    // Do not navigate or auto-play this task. Invoke only the same reward
+    // method used by the completed guide button; a not-complete response is
+    // handled by the managed UniTask.
+    CancelPendingAutoActions("kill-2000-periodic-claim");
+    JbrfzLog(@"[JBRFZBypass] Kill-2000 guide %d: trying reward claim "
+             @"(%lld/%lld)",
+             guideId, static_cast<long long>(current),
+             static_cast<long long>(target));
+    auto claim = reinterpret_cast<GuideClaimAsyncMethod>(
+        base + claimGuideRewardAsyncRVA);
+    auto forget = reinterpret_cast<UniTaskForgetMethod>(
+        base + uniTaskForgetRVA);
+    const ManagedUniTask task = claim(presenter, nullptr);
+    forget(task, nullptr);
+}
+
 static void TryHandleCurrentGuide(void *presenter) {
     if (presenter == nullptr) {
         return;
@@ -2280,13 +2365,11 @@ static void TryHandleCurrentGuide(void *presenter) {
         if (atomic_load(&gPendingUseRandomRewardBox)) {
             CancelPendingAutoActions("auto-disabled");
         }
-        return;
-    }
-
-    // The guide and roulette automations share destination presenters (gacha,
-    // oven, inventory). Give an active roulette chain exclusive ownership so
-    // two independent navigations/actions cannot race each other.
-    if (atomic_load(&gRoulettePendingMissionId) != 0) {
+        if (atomic_exchange(&gPeriodicClaimGuideId, 0) != 0) {
+            atomic_fetch_add(&gPeriodicClaimGeneration, 1);
+            atomic_store(&gPeriodicClaimLastAttemptMs, 0);
+            atomic_store(&gPeriodicClaimNextDueMs, 0);
+        }
         return;
     }
 
@@ -2351,8 +2434,42 @@ static void TryHandleCurrentGuide(void *presenter) {
               static_cast<long long>(target), completed ? 1 : 0);
     }
 
-    const long long nowMs =
-        static_cast<long long>([[NSDate date] timeIntervalSince1970] * 1000.0);
+    const long long nowMs = CurrentGuideTimeMs();
+
+    const bool periodicClaimGuide =
+        hasUnit && IsPeriodicClaimGuide(reqType, target);
+    if (periodicClaimGuide) {
+        int generation = atomic_load(&gPeriodicClaimGeneration);
+        if (atomic_load(&gPeriodicClaimGuideId) != guideId) {
+            generation = atomic_fetch_add(&gPeriodicClaimGeneration, 1) + 1;
+            atomic_store(&gPeriodicClaimGuideId, guideId);
+            atomic_store(&gPeriodicClaimLastAttemptMs, 0);
+            atomic_store(&gPeriodicClaimNextDueMs, 0);
+        }
+
+        const long long lastAttemptMs =
+            atomic_load(&gPeriodicClaimLastAttemptMs);
+        if (lastAttemptMs == 0 || nowMs - lastAttemptMs >= 60 * 1000) {
+            atomic_store(&gPeriodicClaimLastAttemptMs, nowMs);
+            AttemptPeriodicGuideClaim(presenter, base, guideId, current,
+                                      target);
+        }
+        const long long updatedLastAttemptMs =
+            atomic_load(&gPeriodicClaimLastAttemptMs);
+        const long long remainingMs =
+            updatedLastAttemptMs > 0
+                ? (60 * 1000 - (nowMs - updatedLastAttemptMs))
+                : 60 * 1000;
+        SchedulePeriodicGuideClaim(presenter, guideId, generation,
+                                   remainingMs > 0 ? remainingMs : 1);
+        return;
+    }
+
+    if (atomic_exchange(&gPeriodicClaimGuideId, 0) != 0) {
+        atomic_fetch_add(&gPeriodicClaimGeneration, 1);
+        atomic_store(&gPeriodicClaimLastAttemptMs, 0);
+        atomic_store(&gPeriodicClaimNextDueMs, 0);
+    }
 
     // If the active guide is no longer an incomplete open-box task, drop any
     // delayed inventory chain so manual UI ops cannot race stale blocks.
@@ -2363,19 +2480,6 @@ static void TryHandleCurrentGuide(void *presenter) {
     }
 
     if (completed) {
-        // Exclude buggy/repeat monster-kill guides from auto-claim.
-        if (hasUnit && IsAutoClaimExcluded(reqType, target)) {
-            // Progress updates every kill; log once per guide only.
-            if (atomic_load(&gLastSkipClaimGuideId) != guideId) {
-                atomic_store(&gLastSkipClaimGuideId, guideId);
-                JbrfzLog(@"[JBRFZBypass] Skip auto-claim guide %d type=%d "
-                         "(%lld/%lld) excluded kill-2000-repeat",
-                         guideId, reqType, static_cast<long long>(current),
-                         static_cast<long long>(target));
-            }
-            return;
-        }
-
         if (atomic_load(&gLastAutoClaimGuideId) == guideId &&
             nowMs - atomic_load(&gLastAutoClaimMs) < 2500) {
             return;
@@ -2812,69 +2916,6 @@ static void InstallManagedFallbackHooks(const struct mach_header *header) {
         reinterpret_cast<void *>(&HookedInventoryItemInfoOnPopupOpen),
         reinterpret_cast<void **>(&gOriginalInventoryItemInfoOnPopupOpen));
 
-    // Chocolate giant-drop roulette daily mission chain. RefreshView exposes
-    // the authoritative server-backed cells; destination page hooks execute
-    // the same action as each mission card's "Go" button.
-    static constexpr uintptr_t rouletteRefreshViewRVA = 0x04AD73FC;
-    MSHookFunction(
-        reinterpret_cast<void *>(base + rouletteRefreshViewRVA),
-        reinterpret_cast<void *>(&HookedRouletteRefreshView),
-        reinterpret_cast<void **>(&gOriginalRouletteRefreshView));
-
-    static constexpr uintptr_t rouletteBecameHiddenRVA = 0x04AD783C;
-    MSHookFunction(
-        reinterpret_cast<void *>(base + rouletteBecameHiddenRVA),
-        reinterpret_cast<void *>(&HookedRouletteBecameHidden),
-        reinterpret_cast<void **>(&gOriginalRouletteBecameHidden));
-
-    static constexpr uintptr_t sugarRuneOnPopupOpenRVA = 0x03F4D610;
-    MSHookFunction(
-        reinterpret_cast<void *>(base + sugarRuneOnPopupOpenRVA),
-        reinterpret_cast<void *>(&HookedSugarRuneOnPopupOpen),
-        reinterpret_cast<void **>(&gOriginalSugarRuneOnPopupOpen));
-
-    static constexpr uintptr_t stellarLinkOnPageOpenRVA = 0x043138A8;
-    MSHookFunction(
-        reinterpret_cast<void *>(base + stellarLinkOnPageOpenRVA),
-        reinterpret_cast<void *>(&HookedStellarLinkOnPageOpen),
-        reinterpret_cast<void **>(&gOriginalStellarLinkOnPageOpen));
-
-    static constexpr uintptr_t crumbleDungeonOnPageOpenRVA = 0x04047C80;
-    MSHookFunction(
-        reinterpret_cast<void *>(base + crumbleDungeonOnPageOpenRVA),
-        reinterpret_cast<void *>(&HookedCrumbleDungeonOnPageOpen),
-        reinterpret_cast<void **>(&gOriginalCrumbleDungeonOnPageOpen));
-
-    static constexpr uintptr_t dailyDungeonOnPageOpenRVA = 0x040616B4;
-    MSHookFunction(
-        reinterpret_cast<void *>(base + dailyDungeonOnPageOpenRVA),
-        reinterpret_cast<void *>(&HookedDailyDungeonOnPageOpen),
-        reinterpret_cast<void **>(&gOriginalDailyDungeonOnPageOpen));
-
-    static constexpr uintptr_t arenaLobbyOnPageOpenRVA = 0x04023CD4;
-    MSHookFunction(
-        reinterpret_cast<void *>(base + arenaLobbyOnPageOpenRVA),
-        reinterpret_cast<void *>(&HookedArenaLobbyOnPageOpen),
-        reinterpret_cast<void **>(&gOriginalArenaLobbyOnPageOpen));
-
-    static constexpr uintptr_t arenaPreparationOnPageOpenRVA = 0x040343CC;
-    MSHookFunction(
-        reinterpret_cast<void *>(base + arenaPreparationOnPageOpenRVA),
-        reinterpret_cast<void *>(&HookedArenaPreparationOnPageOpen),
-        reinterpret_cast<void **>(&gOriginalArenaPreparationOnPageOpen));
-
-    JbrfzLog(@"[JBRFZBypass] Chocolate roulette automation armed "
-             @"(Refresh @ 0x%lx, Hidden @ 0x%lx, Sugar @ 0x%lx, Stellar @ 0x%lx, "
-             @"Crumble @ 0x%lx, Daily @ 0x%lx, Arena @ 0x%lx/0x%lx)",
-             static_cast<unsigned long>(rouletteRefreshViewRVA),
-             static_cast<unsigned long>(rouletteBecameHiddenRVA),
-             static_cast<unsigned long>(sugarRuneOnPopupOpenRVA),
-             static_cast<unsigned long>(stellarLinkOnPageOpenRVA),
-             static_cast<unsigned long>(crumbleDungeonOnPageOpenRVA),
-             static_cast<unsigned long>(dailyDungeonOnPageOpenRVA),
-             static_cast<unsigned long>(arenaLobbyOnPageOpenRVA),
-             static_cast<unsigned long>(arenaPreparationOnPageOpenRVA));
-
     // Requirement residual-record fix (always on; not gated by auto panel).
     MSHookFunction(
         reinterpret_cast<void *>(base + kRequirementRegisterRVA),
@@ -3062,7 +3103,7 @@ static void InstallAppSealingHooks(const struct mach_header *header,
 __attribute__((constructor))
 static void JBRFZBypassInitialize(void) {
     @autoreleasepool {
-        JbrfzLog(@"[JBRFZBypass] dylib loaded home=%@ version=0.3.27 auto=%d",
+        JbrfzLog(@"[JBRFZBypass] dylib loaded home=%@ version=0.3.28 auto=%d",
                  NSHomeDirectory() ?: @"(nil)",
                  JbrfzAutoFeaturesEnabled() ? 1 : 0);
         _dyld_register_func_for_add_image(&InstallAppSealingHooks);

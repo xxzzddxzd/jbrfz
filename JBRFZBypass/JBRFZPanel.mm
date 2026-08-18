@@ -488,8 +488,8 @@ static UIInterfaceOrientationMask JbrfzMaskForInterfaceOrientation(
 #if defined(JBRFZ_NO_INLINE_HOOKS)
     autoDetail.text = @"iOS 27 会拦截运行时内联 Hook，当前仅启用可安全运行的功能。";
 #else
-    autoDetail.text = @"关闭时：不自动领任务、不自动烤箱/抽卡/开箱。\n"
-                      @"新手号请保持关闭。";
+    autoDetail.text = @"仅自动执行序列任务；活动任务始终保持手动。\n"
+                      @"关闭后序列任务也不自动执行。";
 #endif
     autoDetail.textColor = [UIColor colorWithWhite:0.78 alpha:1.0];
     autoDetail.font = [UIFont systemFontOfSize:12.0];

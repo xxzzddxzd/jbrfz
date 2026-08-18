@@ -44,15 +44,15 @@ tweak 将 `AfterError`（RVA `0x03A85C10`）置空：弹框仍可关闭，
 不再强制返回登录页。背景业务可继续跑。
 
 
-## 导航任务 880 自动提交
+## 序列任务自动执行
 
-导航任务由 `GuidePresenter` 驱动。条件完成后默认只刷新 UI，需
-玩家点击才走 `ClaimGuideRewardAsync`（RPC ClearGuideAchievement /
-ClearGuideRequirement）。
+序列任务由 `GuidePresenter` 驱动。条件完成后自动领取；未完成且在已验证
+清单中的任务，会沿游戏原生入口执行烤箱、十连或开箱动作。未列入清单的
+序列任务保持手动。
 
-tweak hook `HandleOnProgressUpdated`（RVA `0x0426BF38`）：在原逻辑
-更新完当前 guide 后，若当前是 guide `880` 且 `IsCompleted`，自动
-调用 `ClaimGuideRewardAsync` 并 `Forget`，无需手动点提交。
+“消灭 2000 敌人”不会自动刷怪。插件遇到该任务时会立即调用一次
+`ClaimGuideRewardAsync`，此后只要任务仍为当前序列任务，就每 60 秒再尝试
+领取一次；服务端未满足条件时按原错误流程处理。
 
 
 
@@ -82,16 +82,10 @@ hook 活跃的 `MainSceneExchangeEventListener.BeforeRequest` / 成功响应入�
 列为高价值数据，请求/响应 protobuf 同时写入 `Documents/jbrfz_capture/`。
 日志时间使用设备本地时区。
 
-## 巧克力巨大滴露转盘日常
+## 活动任务
 
-0.3.27 起，打开该转盘的任务清单后，插件会在“自动功能”总开关开启时：
-
-- 批量领取已完成任务的奖励；
-- 按活动表顺序处理未完成任务；
-- 自动执行饼干/宠物抽卡、烤箱、每日副本、碎屑副本、竞技场、糖晶石刻印和星图洗牌；
-- 关卡任务复用游戏原生“前往”路径，进度更新后自动回到任务清单继续。
-
-转盘链执行期间会暂停新手引导自动操作，避免两个导航流程同时抢占页面。关闭总开关会立即取消待执行链。
+插件不再 Hook 或自动执行“巧克力巨大滴露转盘”等活动任务；活动清单、领取
+及“前往”按钮均保持游戏原生手动行为。“自动功能”开关只控制序列任务。
 
 ## Build
 
