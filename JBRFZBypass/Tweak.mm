@@ -195,12 +195,6 @@ using ProgressUpdatedMethod = void (*)(void *self,
 using UpdateUIMethod = void (*)(void *self, void *methodInfo);
 using RecordBoolMethod = bool (*)(void *self, void *methodInfo);
 using GuideClickMethod = void (*)(void *self, void *methodInfo);
-struct ManagedUniTask {
-    uintptr_t source;
-    uintptr_t token;
-};
-using GuideClaimAsyncMethod =
-    ManagedUniTask (*)(void *self, void *methodInfo);
 using LoadingSetMethod = void *(*)(void *self, void *key, void *methodInfo);
 using LoadingUnsetMethod = void (*)(void *self, void *key, void *methodInfo);
 static GuideClickMethod gOriginalHandleOnGuideUIClick = nullptr;
@@ -2334,20 +2328,20 @@ static void SchedulePeriodicGuideClaim(void *presenter, int guideId,
 static void AttemptPeriodicGuideClaim(void *presenter, uintptr_t base,
                                       int guideId, int64_t current,
                                       int64_t target) {
-    static constexpr uintptr_t claimGuideRewardAsyncRVA = 0x0426BB54;
+    static constexpr uintptr_t handleOnGuideUIClickRVA = 0x0426B12C;
 
-    // Do not navigate or auto-play this task. Invoke only the same reward
-    // method used by the completed guide button. Deliberately leave the
-    // returned UniTask unobserved: calling Forget() routes a rejected claim to
-    // the game's global unobserved-exception path, which terminates the app.
+    // Reuse the presenter's normal completed-guide click path. Calling
+    // ClaimGuideRewardAsync directly from native code uses the wrong IL2CPP
+    // UniTask return ABI and corrupts a pointer-authenticated return value when
+    // the server rejects this repeatable claim.
     CancelPendingAutoActions("kill-2000-periodic-claim");
     JbrfzLog(@"[JBRFZBypass] Kill-2000 guide %d: trying reward claim "
              @"(%lld/%lld)",
              guideId, static_cast<long long>(current),
              static_cast<long long>(target));
-    auto claim = reinterpret_cast<GuideClaimAsyncMethod>(
-        base + claimGuideRewardAsyncRVA);
-    (void)claim(presenter, nullptr);
+    auto onClick = reinterpret_cast<GuideClickMethod>(
+        base + handleOnGuideUIClickRVA);
+    onClick(presenter, nullptr);
 }
 
 static void TryHandleCurrentGuide(void *presenter) {
@@ -3098,7 +3092,7 @@ static void InstallAppSealingHooks(const struct mach_header *header,
 __attribute__((constructor))
 static void JBRFZBypassInitialize(void) {
     @autoreleasepool {
-        JbrfzLog(@"[JBRFZBypass] dylib loaded home=%@ version=0.3.29 auto=%d",
+        JbrfzLog(@"[JBRFZBypass] dylib loaded home=%@ version=0.3.30 auto=%d",
                  NSHomeDirectory() ?: @"(nil)",
                  JbrfzAutoFeaturesEnabled() ? 1 : 0);
         _dyld_register_func_for_add_image(&InstallAppSealingHooks);
