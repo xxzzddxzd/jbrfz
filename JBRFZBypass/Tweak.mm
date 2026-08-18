@@ -201,8 +201,6 @@ struct ManagedUniTask {
 };
 using GuideClaimAsyncMethod =
     ManagedUniTask (*)(void *self, void *methodInfo);
-using UniTaskForgetMethod =
-    void (*)(ManagedUniTask task, void *methodInfo);
 using LoadingSetMethod = void *(*)(void *self, void *key, void *methodInfo);
 using LoadingUnsetMethod = void (*)(void *self, void *key, void *methodInfo);
 static GuideClickMethod gOriginalHandleOnGuideUIClick = nullptr;
@@ -2337,11 +2335,11 @@ static void AttemptPeriodicGuideClaim(void *presenter, uintptr_t base,
                                       int guideId, int64_t current,
                                       int64_t target) {
     static constexpr uintptr_t claimGuideRewardAsyncRVA = 0x0426BB54;
-    static constexpr uintptr_t uniTaskForgetRVA = 0x0B5062A4;
 
     // Do not navigate or auto-play this task. Invoke only the same reward
-    // method used by the completed guide button; a not-complete response is
-    // handled by the managed UniTask.
+    // method used by the completed guide button. Deliberately leave the
+    // returned UniTask unobserved: calling Forget() routes a rejected claim to
+    // the game's global unobserved-exception path, which terminates the app.
     CancelPendingAutoActions("kill-2000-periodic-claim");
     JbrfzLog(@"[JBRFZBypass] Kill-2000 guide %d: trying reward claim "
              @"(%lld/%lld)",
@@ -2349,10 +2347,7 @@ static void AttemptPeriodicGuideClaim(void *presenter, uintptr_t base,
              static_cast<long long>(target));
     auto claim = reinterpret_cast<GuideClaimAsyncMethod>(
         base + claimGuideRewardAsyncRVA);
-    auto forget = reinterpret_cast<UniTaskForgetMethod>(
-        base + uniTaskForgetRVA);
-    const ManagedUniTask task = claim(presenter, nullptr);
-    forget(task, nullptr);
+    (void)claim(presenter, nullptr);
 }
 
 static void TryHandleCurrentGuide(void *presenter) {
@@ -3103,7 +3098,7 @@ static void InstallAppSealingHooks(const struct mach_header *header,
 __attribute__((constructor))
 static void JBRFZBypassInitialize(void) {
     @autoreleasepool {
-        JbrfzLog(@"[JBRFZBypass] dylib loaded home=%@ version=0.3.28 auto=%d",
+        JbrfzLog(@"[JBRFZBypass] dylib loaded home=%@ version=0.3.29 auto=%d",
                  NSHomeDirectory() ?: @"(nil)",
                  JbrfzAutoFeaturesEnabled() ? 1 : 0);
         _dyld_register_func_for_add_image(&InstallAppSealingHooks);
