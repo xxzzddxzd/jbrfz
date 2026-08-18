@@ -195,6 +195,12 @@ using ProgressUpdatedMethod = void (*)(void *self,
 using UpdateUIMethod = void (*)(void *self, void *methodInfo);
 using RecordBoolMethod = bool (*)(void *self, void *methodInfo);
 using GuideClickMethod = void (*)(void *self, void *methodInfo);
+struct ManagedUniTask {
+    uintptr_t source;
+    uintptr_t token;
+};
+using GuideClaimAsyncMethod =
+    ManagedUniTask (*)(void *self, void *methodInfo);
 using LoadingSetMethod = void *(*)(void *self, void *key, void *methodInfo);
 using LoadingUnsetMethod = void (*)(void *self, void *key, void *methodInfo);
 static GuideClickMethod gOriginalHandleOnGuideUIClick = nullptr;
@@ -1016,8 +1022,8 @@ static void DismissLoadingAndGuideWait(const char *reason) {
     void *guide =
         reinterpret_cast<void *>(atomic_load(&gGuidePresenter));
     if (guide != nullptr) {
-        // GuidePresenter._isWaitingForResponse @ +0x80
-        reinterpret_cast<uint8_t *>(guide)[0x80] = 0;
+        // GuidePresenter._isWaitingForResponse @ +0xB8 (1.1.001).
+        reinterpret_cast<uint8_t *>(guide)[0xB8] = 0;
     }
     JbrfzLog(@"[JBRFZBypass] Dismiss loading/wait (%s)",
              reason ? reason : "rpc-error");
@@ -1067,7 +1073,7 @@ static void HookedAfterResponseRpcException(void *self, int exchangeId,
     void *guide =
         reinterpret_cast<void *>(atomic_load(&gGuidePresenter));
     if (guide != nullptr) {
-        reinterpret_cast<uint8_t *>(guide)[0x80] = 0;
+        reinterpret_cast<uint8_t *>(guide)[0xB8] = 0;
     }
     JbrfzLog(@"[JBRFZBypass] Dismiss loading/wait "
              @"(AfterResponse(RpcException) flag=%p)", flag);
@@ -2328,20 +2334,25 @@ static void SchedulePeriodicGuideClaim(void *presenter, int guideId,
 static void AttemptPeriodicGuideClaim(void *presenter, uintptr_t base,
                                       int guideId, int64_t current,
                                       int64_t target) {
-    static constexpr uintptr_t handleOnGuideUIClickRVA = 0x0426B12C;
+    static constexpr uintptr_t claimGuideRewardAsyncRVA = 0x0426BB54;
 
-    // Reuse the presenter's normal completed-guide click path. Calling
-    // ClaimGuideRewardAsync directly from native code uses the wrong IL2CPP
-    // UniTask return ABI and corrupts a pointer-authenticated return value when
-    // the server rejects this repeatable claim.
+    // Call only the reward request and deliberately do not pass the returned
+    // UniTask to Forget(). The normal button handler always calls Forget(),
+    // which publishes a rejected repeat claim as an unobserved exception.
+    // ManagedUniTask is returned in x0/x1 on arm64; declaring both fields keeps
+    // the native call ABI aligned even though the result is intentionally not
+    // observed here.
     CancelPendingAutoActions("kill-2000-periodic-claim");
     JbrfzLog(@"[JBRFZBypass] Kill-2000 guide %d: trying reward claim "
              @"(%lld/%lld)",
              guideId, static_cast<long long>(current),
              static_cast<long long>(target));
-    auto onClick = reinterpret_cast<GuideClickMethod>(
-        base + handleOnGuideUIClickRVA);
-    onClick(presenter, nullptr);
+    auto claim = reinterpret_cast<GuideClaimAsyncMethod>(
+        base + claimGuideRewardAsyncRVA);
+    const ManagedUniTask task = claim(presenter, nullptr);
+    JbrfzLog(@"[JBRFZBypass] Kill-2000 claim task source=%p token=0x%lx",
+             reinterpret_cast<void *>(task.source),
+             static_cast<unsigned long>(task.token));
 }
 
 static void TryHandleCurrentGuide(void *presenter) {
@@ -3092,7 +3103,7 @@ static void InstallAppSealingHooks(const struct mach_header *header,
 __attribute__((constructor))
 static void JBRFZBypassInitialize(void) {
     @autoreleasepool {
-        JbrfzLog(@"[JBRFZBypass] dylib loaded home=%@ version=0.3.30 auto=%d",
+        JbrfzLog(@"[JBRFZBypass] dylib loaded home=%@ version=0.3.31 auto=%d",
                  NSHomeDirectory() ?: @"(nil)",
                  JbrfzAutoFeaturesEnabled() ? 1 : 0);
         _dyld_register_func_for_add_image(&InstallAppSealingHooks);
