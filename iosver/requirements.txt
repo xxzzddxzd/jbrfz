@@ -3,6 +3,7 @@
 
 httpx[http2]>=0.27,<1
 PyYAML>=6.0,<7
+pyzipper>=0.3.6,<1
 
 # httpx[http2] pulls (pinned to known-good set from local venv):
 #   httpcore, h2, hpack, hyperframe, anyio, certifi, idna

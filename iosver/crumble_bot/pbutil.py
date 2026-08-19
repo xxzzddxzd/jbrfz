@@ -73,6 +73,34 @@ def encode_repeated_messages(field: int, messages: Iterable[bytes]) -> bytes:
     return b"".join(encode_message_field(field, m) for m in messages)
 
 
+def encode_packed_int32_field(field: int, values: Iterable[int]) -> bytes:
+    """Encode a repeated ``int32`` field using protobuf packed encoding."""
+    payload = b"".join(_varint(int(value) & 0xFFFFFFFF) for value in values)
+    return encode_bytes_field(field, payload)
+
+
+def decode_packed_varints(data: bytes) -> List[int]:
+    """Decode the payload of a packed protobuf varint field."""
+    values: List[int] = []
+    index = 0
+    while index < len(data):
+        value = 0
+        shift = 0
+        while True:
+            if index >= len(data):
+                raise ValueError("truncated packed varint")
+            byte = data[index]
+            index += 1
+            value |= (byte & 0x7F) << shift
+            if not (byte & 0x80):
+                break
+            shift += 7
+            if shift >= 70:
+                raise ValueError("packed varint is too long")
+        values.append(value)
+    return values
+
+
 def decode_fields(buf: bytes) -> List[Tuple[int, int, object]]:
     """Return list of (field_number, wire_type, value)."""
     i = 0

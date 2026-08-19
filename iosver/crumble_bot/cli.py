@@ -45,6 +45,8 @@ from .guild_private_runner import PrivateGuildRunner
 from .guild_resident_runner import ResidentGuildRunner
 from .invite import register_friend_inviter
 from .inviter import parse_inviter
+from .patch_data import fetch_patch_data
+from .red_dot import RedDotRunner
 from .social import Social, parse_get_user_social_info_response
 from .stage_runner import StageConfig, StageRunner
 
@@ -1966,6 +1968,88 @@ def cmd_daily(args: argparse.Namespace) -> int:
     return 0 if failures == 0 else 1
 
 
+def cmd_reddot(args: argparse.Namespace) -> int:
+    """Clear zero-cost, server-actionable red dots for one account."""
+    with AccountDB(args.db) as db:
+        row = db.get(args.mid) if args.mid else None
+        if args.mid and row is None:
+            raise SystemExit(f"sqlite 中没有账号 {args.mid}")
+        if row is None:
+            row = next(
+                (
+                    candidate
+                    for candidate in db.iter_all()
+                    if not candidate.invalid and candidate.guest_secret
+                ),
+                None,
+            )
+        if row is None:
+            raise SystemExit("sqlite 中没有可登录账号")
+        if row.invalid:
+            raise SystemExit(f"账号 {row.mid} 已标记 invalid")
+
+        log.info("reddot login mid=%s", row.mid)
+        state = _login_account(row)
+        session = state.to_session()
+        log.info("reddot loading live patch data")
+        patch_data = fetch_patch_data()
+        if patch_data.resource_key != session.resource_key:
+            session.resource_key = patch_data.resource_key
+            state.resource_key = patch_data.resource_key
+
+        with GrpcClient(state.endpoint or ENDPOINT) as client:
+            payload = RedDotRunner(client, session, patch_data).run()
+
+        state.resource_key = session.resource_key
+        for asset in payload.get("assets_after", []):
+            if asset.get("tag") == "ITEMHARDCODINGTAG_CRYSTAL":
+                state.diamond_balance = int(asset.get("amount") or 0)
+                break
+        db.upsert_state(
+            state,
+            used=row.used,
+            ready=row.ready,
+            invalid=row.invalid,
+            note=row.note,
+        )
+
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+    else:
+        status = "完成" if payload.get("ok") else "部分失败"
+        print(f"红点清理：{status}")
+        print(f"账号：{payload.get('name') or '-'}（{payload['mid']}）")
+        print(
+            "动作：发现 {detected}，执行 {attempted}，失败 {failed}，"
+            "剩余安全红点 {remaining}".format(
+                detected=payload.get("actions_detected", 0),
+                attempted=payload.get("actions_attempted", 0),
+                failed=payload.get("actions_failed", 0),
+                remaining=payload.get("remaining_safe_count", 0),
+            )
+        )
+        gains = payload.get("gains", [])
+        print("收益：")
+        if gains:
+            for item in gains:
+                name = item.get("name") or item.get("tag") or item.get("data_id")
+                amount = int(item.get("amount") or 0)
+                print(f"  - {name}（{item['data_id']}）：{amount:+d}")
+        else:
+            print("  - 无资产变化")
+        print("执行项：")
+        for action in payload.get("actions", []):
+            if not action.get("attempted"):
+                continue
+            marker = "成功" if action.get("ok") else "失败"
+            count = int(action.get("detected_count") or 0)
+            suffix = f"，发现 {count}" if count else ""
+            if action.get("error"):
+                suffix += f"，{action['error']}"
+            print(f"  - {action.get('key')}：{marker}{suffix}")
+    return 0 if payload.get("ok") else 1
+
+
 def cmd_guild(args: argparse.Namespace) -> int:
     """Dispatch transient public/private SOPs or resident guild management."""
     action = str(getattr(args, "guild_action", "") or "")
@@ -3210,7 +3294,7 @@ def _cmd_guild_run(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="crumble_bot",
-        description="Crumble bot: gen / inv / daily / guild / list",
+        description="Crumble bot: gen / inv / daily / reddot / guild / list",
     )
     p.add_argument("-v", "--verbose", action="store_true", help="DEBUG：每关点位 + HTTP")
     p.add_argument("-q", "--quiet", action="store_true", help="仅警告/错误 + 最终 JSON")
@@ -3232,6 +3316,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("daily", help="批量执行每日登录、邮箱领取和邮箱广告")
     sp.add_argument("--db", default=str(DEFAULT_DB), help="sqlite 路径")
     sp.set_defaults(func=cmd_daily)
+
+    sp = sub.add_parser("reddot", help="清理一个账号可安全领取的红点")
+    sp.add_argument("--mid", help="指定账号 MID；省略时选择一个有效账号")
+    sp.add_argument("--json", action="store_true", help="输出完整 JSON")
+    sp.add_argument("--db", default=str(DEFAULT_DB), help="sqlite 路径")
+    sp.set_defaults(func=cmd_reddot)
 
     sp = sub.add_parser("guild", help="公开、审批公会 SOP 或查看公会数据")
     sp.add_argument(

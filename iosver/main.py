@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""iosver 主入口：承接 gen / inv / daily / guild / list 参数。
+"""iosver 主入口：承接 gen / inv / daily / reddot / guild / list 参数。
 
 用法:
   ./main.py gen 5
   ./main.py inv GNWPX5251 -c 3
   ./main.py daily
+  ./main.py reddot --mid VBFSP5569
   ./main.py guild public --gname ahhhha --gmname absdbld --count 20 --totalcount 200
   ./main.py guild private --gname ahhhha --gmname absdbld --master-mid RTHLZ8967 --count 20 --totalcount 200
   ./main.py list --unused --ready
