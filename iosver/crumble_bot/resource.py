@@ -22,7 +22,7 @@ RESOURCE_METADATA_URL = "https://account.devplay.com/v4/metadata"
 RESOURCE_METADATA_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "*/*",
-    "User-Agent": "CookieRunCrumble/2026081018 CFNetwork/1399 Darwin/22.1.0",
+    "User-Agent": "CookieRunCrumble/2026081413 CFNetwork/1399 Darwin/22.1.0",
     "Accept-Language": "zh-CN,zh-Hans;q=0.9",
     "X-API-Key": "wUsUkXPVSujBcOt4mDJX",
     "X-Env": "prod",
@@ -35,18 +35,18 @@ RESOURCE_METADATA_HEADERS = {
     "X-Timezone": "QXNpYS9TaGFuZ2hhaQ==",
     "X-LocaleOnGame": "emgtSGFudA==",
     "X-Location-Country": "Q04=",
-    "X-App-Version": "MS4xLjAwMQ==",
-    "X-App-Build": "MjAyNjA4MTAxOA==",
+    "X-App-Version": "MS4xLjEwMQ==",
+    "X-App-Build": "MjAyNjA4MTQxMw==",
 }
 RESOURCE_METADATA_BODY = {
     "device_type": "ios",
-    "app_version": "1.1.001",
-    "app_build": "2026081018",
+    "app_version": "1.1.101",
+    "app_build": "2026081413",
 }
 RESOURCE_MANIFEST_BASE_URL = "https://cc.devscdn.com/cc/resource"
 RESOURCE_MANIFEST_HEADERS = {
     "Accept": "*/*",
-    "User-Agent": "CookieRunCrumble/2026081018 CFNetwork/1399 Darwin/22.1.0",
+    "User-Agent": "CookieRunCrumble/2026081413 CFNetwork/1399 Darwin/22.1.0",
     "Accept-Language": "zh-CN,zh-Hans;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
     "X-Unity-Version": "6000.3.15f1",
